@@ -374,6 +374,27 @@ pub async fn insert_rule(state: &Arc<CoreState>, rule: FirewallRule) -> Result<V
     Ok(rule_view(&rule, None))
 }
 
+/// Delete every rule (3.0.x `DELETE /firewall/rules`).  Returns the count.
+pub async fn clear_rules(state: &Arc<CoreState>) -> Result<Value, IpcError> {
+    let _io = state.acl_persist.lock().await;
+    let (rules, labels) = {
+        let mut net = state.net.write().await;
+        (std::mem::take(&mut net.acl_rules), std::mem::take(&mut net.acl_labels))
+    };
+    if let Err(e) = persist_rules(state).await {
+        let mut net = state.net.write().await;
+        net.acl_rules = rules;
+        net.acl_labels = labels;
+        return Err(e);
+    }
+    state.next_generation();
+    info!("acl: cleared {} rule(s)", rules.len());
+    for r in &rules {
+        state.emit_ipc_event(IpcEvent::AclChanged { rule_id: r.id.clone(), action: "deleted".into() });
+    }
+    Ok(json!({ "deleted": rules.len() }))
+}
+
 /// Update `enabled` / `comment` / `expires_at` (3.0.x `PUT /firewall/rules/:id`).
 pub async fn update_rule(state: &Arc<CoreState>, rule_id: &str, patch: Value) -> Result<Value, IpcError> {
     let patch: RulePatch = serde_json::from_value(patch).map_err(|e| ipc_err("invalid_patch", e.to_string()))?;
@@ -505,6 +526,7 @@ pub async fn create_group(state: &Arc<CoreState>, group: Value) -> Result<Value,
 
 pub async fn update_group(state: &Arc<CoreState>, group_id: &str, patch: Value) -> Result<Value, IpcError> {
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Patch {
         name: Option<String>,
         member_ids: Option<Vec<String>>,
@@ -572,6 +594,7 @@ pub async fn set_ping_enabled(state: &Arc<CoreState>, enabled: bool) -> Result<V
         .map_err(|e| ipc_err("persist_failed", format!("failed to save ping setting: {}", e)))?;
     state.net.write().await.ping_enabled = enabled;
     state.next_generation();
+    state.emit_ipc_event(IpcEvent::SettingsChanged { scope: "ping".into(), settings: json!({ "ping_enabled": enabled }) });
     info!("acl: ping (ICMP echo) {}", if enabled { "enabled" } else { "disabled" });
     Ok(json!({ "ping_enabled": enabled }))
 }

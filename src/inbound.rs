@@ -187,6 +187,7 @@ async fn on_need_auth(state: &Arc<CoreState>, src: String, proto: Protocol, pars
         (e.and_then(|e| e.user_id.clone()), e.and_then(|e| e.display_name.clone()), e.and_then(|e| e.user_display_name.clone()))
     };
     info!("inbound: interactive auth required: {} → {}:{} (request {})", src, proto_str(proto), parsed.dst_port, request_id);
+    state.next_generation();
     state.emit_ipc_event(IpcEvent::AccessRequestCreated {
         request_id,
         src_device_id: src,
@@ -238,6 +239,9 @@ pub async fn resolve_auth(state: &Arc<CoreState>, request_id: &str, decision: Au
         .lock()
         .await
         .resolve_auth(request_id, action.clone(), expires_at.is_none())
+        .inspect(|_| {
+            state.next_generation();
+        })
         .ok_or_else(|| IpcError {
             code: "not_found".into(),
             message: format!("Auth request '{}' not found or already resolved", request_id),
@@ -260,6 +264,11 @@ pub async fn resolve_auth(state: &Arc<CoreState>, request_id: &str, decision: Au
     let view = crate::acl::insert_rule(state, rule.clone()).await?;
     state.firewall.lock().await.access_log.set_rule_id(&outcome.log_entry_id, rule.id.clone());
     info!("inbound: auth decision '{}' applied for {} {}:{}", name, key.src_device_id, proto_str(key.proto), key.dst_port);
+    state.emit_ipc_event(IpcEvent::AccessRequestResolved {
+        request_id: request_id.to_string(),
+        decision,
+        rule_id: rule.id.clone(),
+    });
 
     if action == Action::Allow && !outcome.queued_packets.is_empty() {
         if let Some(tun_tx) = state.tun_tx.get() {
@@ -279,6 +288,9 @@ pub async fn expire_auth_requests(state: &CoreState, now: i64) {
         fw.resolve_timed_out_auth_log(&t);
         t
     };
+    if !timed_out.is_empty() {
+        state.next_generation();
+    }
     for (key, request_id, _) in timed_out {
         info!("inbound: auth request {} for {} {}:{} timed out", request_id, key.src_device_id, proto_str(key.proto), key.dst_port);
         state.emit_ipc_event(IpcEvent::AccessRequestTimeout { request_id });
@@ -542,6 +554,13 @@ mod tests {
 
         let out = resolve_auth(&h.state, &req, AuthDecision::AllowOnce).await.unwrap();
         assert_eq!(out["rule"]["permission_group"]["ids"], json!(["device-0000000b"]));
+        let mut resolved = false;
+        while let Ok(ev) = h.ipc_rx.try_recv() {
+            if let IpcEvent::AccessRequestResolved { request_id, rule_id, .. } = ev {
+                resolved = request_id == req && rule_id == out["rule"]["id"];
+            }
+        }
+        assert!(resolved, "AccessRequestResolved emitted with the generated rule");
         assert!(out["rule"]["expires_at"].as_i64().unwrap() > crate::runtime::current_unix());
         assert_eq!(h.tun_rx.try_recv().unwrap(), udp_v4(b"one"));
         assert_eq!(h.tun_rx.try_recv().unwrap(), udp_v4(b"two"));

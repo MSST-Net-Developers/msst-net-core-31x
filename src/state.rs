@@ -153,7 +153,13 @@ pub struct CoreState {
     pub room_cache_members: std::sync::Mutex<HashSet<String>>,
     /// Devices referenced by active rules, as last told to the peer cache.
     pub rule_ref_devices: std::sync::Mutex<HashSet<String>>,
-    /// Sender into the TUN writer (unset when running without a TUN).
+    /// Whether a TUN device is currently attached (`Health.tun_ready`).
+    pub tun_attached: std::sync::atomic::AtomicBool,
+    /// Access authentication was requested (startup check or HTTP 401) and
+    /// hasn't been completed since (`Health.access_auth_required`).
+    pub access_auth_required: std::sync::atomic::AtomicBool,
+    /// Sender into the TUN writer (always set; packets are dropped while
+    /// no TUN is attached).
     pub tun_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// The coordinator client (set once the runtime starts it).
     pub coordinator: std::sync::OnceLock<Arc<crate::coordinator::CoordinatorClient>>,
@@ -184,6 +190,8 @@ impl CoreState {
             contacts: std::sync::Mutex::new(crate::contacts::ContactList::default()),
             coordinator: std::sync::OnceLock::new(),
             tun_tx: std::sync::OnceLock::new(),
+            tun_attached: std::sync::atomic::AtomicBool::new(false),
+            access_auth_required: std::sync::atomic::AtomicBool::new(false),
             traffic: std::sync::RwLock::new(HashMap::new()),
             ping_jobs: std::sync::Mutex::new(HashMap::new()),
             room_cache_members: std::sync::Mutex::new(HashSet::new()),

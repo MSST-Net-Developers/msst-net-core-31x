@@ -435,6 +435,7 @@ async fn coordinator_event_loop(
                         }
                         drop(guard);
                         state.next_generation();
+                        crate::account::emit_identity_changed(state).await;
                     }
                 }
             }
@@ -468,17 +469,7 @@ async fn coordinator_event_loop(
                     "room_name": room_name,
                 })));
 
-                // Emit IPC event.
-                state.emit_ipc_event(msst_ipc_protocol::IpcEvent::RoomStateChanged {
-                    room_id: Some(room_id),
-                    room_name: Some(room_name),
-                    peers: peers.iter().map(|p| serde_json::json!({
-                        "device_id": p.device_id,
-                        "hostname": p.hostname,
-                        "display_name": p.device_display_name,
-                    })).collect(),
-                    relay: None,
-                });
+                crate::rooms::emit_room_state(state).await;
             }
 
             // ── Member joined ─────────────────────────────────────────────
@@ -487,6 +478,8 @@ async fn coordinator_event_loop(
                 info!("coordinator: member_joined room={} device={}", room_id, device_id);
                 crate::nodes::apply_peer(state, room_peer_data(&peer)).await;
                 crate::peer_cache::on_member_joined(state, &device_id).await;
+                state.net.write().await.room_peers.insert(device_id.clone());
+                crate::rooms::emit_room_state(state).await;
                 state.contacts.lock().unwrap_or_else(|e| e.into_inner())
                     .update_room_contact(&device_id, None, current_unix());
                 let mut net = state.net.write().await;
@@ -503,6 +496,7 @@ async fn coordinator_event_loop(
                 drop(net);
                 // Kept for the room grace period, then evicted by housekeeping.
                 crate::peer_cache::on_member_left(state, &device_id).await;
+                crate::rooms::emit_room_state(state).await;
             }
 
             // ── Node added / updated (authenticated devices) ──────────────
@@ -869,6 +863,7 @@ async fn execute_scheduler_action(
         SchedulerAction::PathModeChanged { peer_id, old_mode, new_mode } => {
             info!("P2P: {} path {} → {}", peer_id, old_mode, new_mode);
             crate::diagnostics::reset_traffic(state, peer_id);
+            state.next_generation();
             state.emit_ipc_event(msst_ipc_protocol::IpcEvent::PathChanged {
                 device_id: peer_id.clone(),
                 old_mode: old_mode.clone(),

@@ -1,0 +1,26 @@
+{
+  "request": {
+    "body": {
+      "type": "get_contacts"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "contacts": [
+          {
+            "device_id": "device-0000000b",
+            "last_communicated": null,
+            "last_room_together": 1700000000,
+            "user_id": "user-0000000b"
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

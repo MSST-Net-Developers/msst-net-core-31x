@@ -1,0 +1,23 @@
+{
+  "request": {
+    "body": {
+      "type": "get_endpoints"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "current": [
+          "203.0.113.1:21031",
+          "relay:198.51.100.1:7000"
+        ],
+        "history": []
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

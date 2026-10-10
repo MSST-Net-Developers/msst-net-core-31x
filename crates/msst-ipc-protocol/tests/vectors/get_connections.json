@@ -1,0 +1,27 @@
+{
+  "request": {
+    "body": {
+      "type": "get_connections"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "connections": [
+          {
+            "last_outbound_unix": 0,
+            "local": "172.22.144.209:40000",
+            "peer_device_id": "device-0000000b",
+            "proto": "tcp",
+            "remote": "172.22.1.1:25565"
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

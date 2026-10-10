@@ -1,0 +1,23 @@
+{
+  "request": {
+    "body": {
+      "params": {
+        "device_id": "device-ffffffff"
+      },
+      "type": "get_node"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "code": "not_found",
+        "message": "Peer device-ffffffff not found"
+      },
+      "status": "error"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

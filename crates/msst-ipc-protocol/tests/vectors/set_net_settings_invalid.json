@@ -1,0 +1,25 @@
+{
+  "request": {
+    "body": {
+      "params": {
+        "settings": {
+          "mtu_override": 70000
+        }
+      },
+      "type": "set_net_settings"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "code": "invalid_settings",
+        "message": "mtu_override must be null or an integer in 1280–1500"
+      },
+      "status": "error"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

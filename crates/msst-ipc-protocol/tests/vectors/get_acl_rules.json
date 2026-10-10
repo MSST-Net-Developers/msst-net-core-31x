@@ -1,0 +1,45 @@
+{
+  "request": {
+    "body": {
+      "type": "get_acl_rules"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "rules": [
+          {
+            "action": "allow",
+            "comment": "Minecraft for Bob",
+            "direction": "inbound",
+            "enabled": true,
+            "expires_at": null,
+            "id": "00000000000000a1",
+            "pending_migration": false,
+            "permission_group": {
+              "ids": [
+                "device-0000000b"
+              ],
+              "kind": "devices"
+            },
+            "principal_mnemonics": {
+              "device-0000000b": "pc.bob"
+            },
+            "protocol_ports": [
+              {
+                "end": 25565,
+                "proto": "tcp",
+                "start": 25565
+              }
+            ]
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

@@ -10,6 +10,9 @@ use std::path::Path;
 use tracing::warn;
 
 pub const FILE: &str = "net_settings.json";
+/// Accepted TUN MTU range: IPv6 requires ≥ 1280; 1500 is the Ethernet MTU.
+pub const MTU_RANGE: std::ops::RangeInclusive<u64> = 1280..=1500;
+
 /// Relay keepalive interval when unset.
 pub const DEFAULT_RELAY_KEEPALIVE_SECS: u64 = 25;
 /// Direct-path (P2P) keepalive ping interval when unset (3.0.x: 1 s).
@@ -104,11 +107,25 @@ impl NetworkSettings {
         if let Some(v) = obj.get("preferred_relay") {
             self.preferred_relay = v.as_str().map(str::to_string);
         }
+        if let Some(v) = obj.get("preferred_relay") {
+            if !v.is_null() && !v.is_string() {
+                return Err("preferred_relay must be a string or null".into());
+            }
+        }
         if let Some(v) = obj.get("mtu_override") {
-            self.mtu_override = v.as_u64().map(|n| n as u16);
+            self.mtu_override = match v {
+                Value::Null => None,
+                _ => match v.as_u64() {
+                    Some(n) if MTU_RANGE.contains(&n) => Some(n as u16),
+                    _ => return Err(format!("mtu_override must be null or an integer in {}–{}", MTU_RANGE.start(), MTU_RANGE.end())),
+                },
+            };
         }
         if let Some(v) = obj.get("keepalive_secs") {
-            self.keepalive_secs = v.as_u64().map(|n| n.clamp(5, 30) as u32);
+            self.keepalive_secs = match v {
+                Value::Null => None,
+                _ => Some(v.as_u64().ok_or("keepalive_secs must be null or a positive integer")?.clamp(5, 30) as u32),
+            };
         }
         if let Some(v) = obj.get("linux_dns_mode") {
             self.linux_dns_mode = match v.as_str() {
@@ -149,6 +166,12 @@ mod tests {
     fn patch_semantics() {
         let mut s = NetworkSettings::default();
         s.apply_patch(&json!({"disable_p2p": true, "preferred_relay": "r:1", "keepalive_secs": 99, "mtu_override": 1400})).unwrap();
+        // Validation (nothing applied on error — callers patch a copy).
+        for bad in [json!({"mtu_override": 70000}), json!({"mtu_override": 1279}), json!({"mtu_override": "1400"}),
+                    json!({"keepalive_secs": "x"}), json!({"preferred_relay": 5})] {
+            assert!(s.clone().apply_patch(&bad).is_err(), "{}", bad);
+        }
+        assert!(s.clone().apply_patch(&json!({"mtu_override": 1500})).is_ok());
         assert!(s.disable_p2p);
         assert_eq!(s.preferred_relay.as_deref(), Some("r:1"));
         assert_eq!(s.keepalive_secs, Some(30)); // clamped

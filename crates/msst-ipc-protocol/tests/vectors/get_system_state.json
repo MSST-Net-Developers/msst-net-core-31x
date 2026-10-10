@@ -1,0 +1,44 @@
+{
+  "request": {
+    "body": {
+      "type": "get_system_state"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "device_id": "device-00000001",
+        "generation": 0,
+        "joined_rooms": {
+          "space-1": "Test room"
+        },
+        "peers": [
+          {
+            "device_id": "device-0000000b",
+            "display_name": "Bob PC",
+            "hostname": "pc.bob.ezplay.msst.net",
+            "ipv4": "172.22.1.1",
+            "ipv6": "fd22:2222:2222:2222::b"
+          },
+          {
+            "device_id": "device-00000001",
+            "display_name": null,
+            "hostname": null,
+            "ipv4": "172.22.0.1",
+            "ipv6": "fd22:2222:2222:2222::0000:0001"
+          }
+        ],
+        "relay": "198.51.100.1:7000",
+        "room_id": "space-1",
+        "room_name": "Test room",
+        "rule_count": 1,
+        "user_id": "user-00000001"
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

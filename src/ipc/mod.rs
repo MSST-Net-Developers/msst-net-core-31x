@@ -33,7 +33,7 @@
 
 #[cfg(unix)]
 pub mod auth;
-mod handler;
+pub(crate) mod handler;
 #[cfg(windows)]
 mod windows_pipe;
 
@@ -90,30 +90,26 @@ impl IpcServer {
         });
     }
 
-    /// Run the IPC server on a Unix domain socket.
+    /// Bind the Unix socket (secure directory, permissions).  Fails if the
+    /// socket can't be created — Core must not run unmanageable.
     #[cfg(unix)]
-    pub async fn run_unix(self, socket_path: &std::path::Path) {
+    pub fn bind_unix(socket_path: &std::path::Path) -> std::io::Result<tokio::net::UnixListener> {
         if let Some(parent) = socket_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                error!("IPC: cannot create socket directory {:?}: {}", parent, e);
-                return;
-            }
+            std::fs::create_dir_all(parent)?;
             if unsafe { libc::geteuid() } == 0 {
                 auth::secure_socket_dir(parent);
             }
         }
         let _ = std::fs::remove_file(socket_path); // stale socket
-
-        let listener = match tokio::net::UnixListener::bind(socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                error!("IPC: cannot bind socket {:?}: {}", socket_path, e);
-                return;
-            }
-        };
+        let listener = tokio::net::UnixListener::bind(socket_path)?;
         auth::set_socket_permissions(socket_path);
         info!("IPC server listening on {:?}", socket_path);
+        Ok(listener)
+    }
 
+    /// Serve Controllers on a socket bound by [`IpcServer::bind_unix`].
+    #[cfg(unix)]
+    pub async fn serve_unix(self, listener: tokio::net::UnixListener) {
         Self::spawn_event_pump(self.event_tx.clone(), self.event_rx);
 
         loop {
@@ -146,17 +142,20 @@ impl IpcServer {
         }
     }
 
-    /// Run the IPC server on a Windows named pipe.
+    /// Create the first named-pipe instance.  Fails if the pipe can't be
+    /// created (e.g. the name is taken) — Core must not run unmanageable.
     #[cfg(windows)]
-    pub async fn run_named_pipe(self, pipe_name: &str) {
-        let mut server = match windows_pipe::create_instance(pipe_name, true) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("IPC: cannot create named pipe {} (already in use?): {}", pipe_name, e);
-                return;
-            }
-        };
+    pub fn bind_named_pipe(pipe_name: &str) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        let server = windows_pipe::create_instance(pipe_name, true)?;
         info!("IPC server listening on {}", pipe_name);
+        Ok(server)
+    }
+
+    /// Serve Controllers on a pipe created by [`IpcServer::bind_named_pipe`].
+    #[cfg(windows)]
+    pub async fn serve_named_pipe(self, first: tokio::net::windows::named_pipe::NamedPipeServer, pipe_name: String) {
+        let pipe_name = pipe_name.as_str();
+        let mut server = first;
         Self::spawn_event_pump(self.event_tx.clone(), self.event_rx);
         loop {
             if let Err(e) = server.connect().await {

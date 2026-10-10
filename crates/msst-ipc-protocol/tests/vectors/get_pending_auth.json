@@ -1,0 +1,31 @@
+{
+  "request": {
+    "body": {
+      "type": "get_pending_auth"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "requests": [
+          {
+            "dst_port": 19132,
+            "expires_in_secs": 60,
+            "proto": "udp",
+            "request_id": "<request_id>",
+            "service_name": "Minecraft Bedrock",
+            "src_device_display_name": "Bob PC",
+            "src_device_id": "device-0000000b",
+            "src_user_display_name": "Bob",
+            "src_user_id": "user-0000000b"
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

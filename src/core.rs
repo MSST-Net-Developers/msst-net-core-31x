@@ -82,6 +82,20 @@ impl Core {
             Err(e) => warn!("contacts: {}; starting empty", e),
         }
 
+        // IPC is bound before any task starts: a Core nobody can manage must
+        // not start at all (and must not leave tasks behind).
+        let (server, _subscriber) = IpcServer::new(state.clone(), ipc_event_rx);
+        #[cfg(unix)]
+        let listener = IpcServer::bind_unix(&ipc_socket)
+            .map_err(|e| anyhow::anyhow!("cannot bind IPC socket {:?}: {}", ipc_socket, e))?;
+        #[cfg(windows)]
+        let (pipe_name, first_pipe) = {
+            let name = ipc_socket.to_string_lossy().into_owned();
+            let first = IpcServer::bind_named_pipe(&name)
+                .map_err(|e| anyhow::anyhow!("cannot create IPC pipe {}: {}", name, e))?;
+            (name, first)
+        };
+
         // TUN plumbing (see module docs).
         let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(1024);
         let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -97,22 +111,18 @@ impl Core {
         }
 
         let mut rt = CoreRuntime::new(state.clone());
-        rt.start_inbound(udp, tun_tx);
         rt.start_outbound(outbound_rx);
         rt.start_fetcher();
         rt.start_relay_tasks();
         rt.start_scheduler_tick();
         rt.start_housekeeping();
 
-        let ipc_state = state.clone();
-        background.push(tokio::spawn(async move {
-            let (server, _subscriber) = IpcServer::new(ipc_state, ipc_event_rx);
-            #[cfg(unix)]
-            server.run_unix(&ipc_socket).await;
-            #[cfg(windows)]
-            server.run_named_pipe(&ipc_socket.to_string_lossy()).await;
-        }));
+        #[cfg(unix)]
+        background.push(tokio::spawn(server.serve_unix(listener)));
+        #[cfg(windows)]
+        background.push(tokio::spawn(server.serve_named_pipe(first_pipe, pipe_name)));
 
+        rt.start_inbound(udp, tun_tx);
         rt.start_coordinator(CoordinatorConfig { coord_url: config.coordinator_url.clone() }, config.preferred_relay.clone());
         info!("coordinator client targeting {}", config.coordinator_url);
         info!("core state initialized, generation: {}", state.generation.current());
@@ -140,6 +150,7 @@ impl Core {
     ) {
         self.detach_tun().await;
         *self.writer_slot.lock().await = Some(Box::new(writer));
+        self.state.tun_attached.store(true, std::sync::atomic::Ordering::SeqCst);
         let tx = self.outbound_tx.clone();
         self.reader = Some(tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -168,6 +179,7 @@ impl Core {
             let _ = r.await;
         }
         if self.writer_slot.lock().await.take().is_some() {
+            self.state.tun_attached.store(false, std::sync::atomic::Ordering::SeqCst);
             info!("TUN detached");
         }
     }

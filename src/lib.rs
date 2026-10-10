@@ -33,6 +33,8 @@ mod runtime;
 mod state;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod contract_tests;
 mod tun_dev;
 #[cfg(windows)]
 mod windows_service_host;

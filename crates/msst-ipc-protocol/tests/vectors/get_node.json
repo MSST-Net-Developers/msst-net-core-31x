@@ -1,0 +1,31 @@
+{
+  "request": {
+    "body": {
+      "params": {
+        "device_id": "device-0000000b"
+      },
+      "type": "get_node"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "device_handle": "pc",
+        "device_id": "device-0000000b",
+        "display_name": "Bob PC",
+        "hostname": "pc.bob.ezplay.msst.net",
+        "ipv4": "172.22.1.1",
+        "ipv6": "fd22:2222:2222:2222::b",
+        "is_authenticated": true,
+        "preferred_relay": "198.51.100.1:7000",
+        "user_handle": "bob",
+        "user_id": "user-0000000b"
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

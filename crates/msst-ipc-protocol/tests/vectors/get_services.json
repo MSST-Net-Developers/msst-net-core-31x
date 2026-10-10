@@ -1,0 +1,211 @@
+{
+  "request": {
+    "body": {
+      "type": "get_services"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "categories": [
+          {
+            "id": "game",
+            "label": "游戏",
+            "services": [
+              {
+                "id": "minecraft-java",
+                "name": "Minecraft（MCJE）",
+                "ports": [
+                  "tcp/25565"
+                ]
+              },
+              {
+                "id": "minecraft-bedrock",
+                "name": "Minecraft（MCBE）",
+                "ports": [
+                  "udp/19132"
+                ]
+              },
+              {
+                "id": "rusted-warfare",
+                "name": "铁锈战争",
+                "ports": [
+                  "tcp/5123"
+                ]
+              },
+              {
+                "id": "msst-cardgame",
+                "name": "MSST纸牌战",
+                "ports": [
+                  "tcp/9178"
+                ]
+              },
+              {
+                "id": "terraria",
+                "name": "Terraria",
+                "ports": [
+                  "tcp/7777"
+                ]
+              },
+              {
+                "id": "factorio",
+                "name": "Factorio",
+                "ports": [
+                  "udp/34197"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "web",
+            "label": "Web服务",
+            "services": [
+              {
+                "id": "http",
+                "name": "HTTP",
+                "ports": [
+                  "tcp/80"
+                ]
+              },
+              {
+                "id": "https",
+                "name": "HTTPS",
+                "ports": [
+                  "tcp/443"
+                ]
+              },
+              {
+                "id": "quic",
+                "name": "HTTP/3（QUIC）",
+                "ports": [
+                  "udp/443"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "file",
+            "label": "文件服务",
+            "services": [
+              {
+                "id": "ftp",
+                "name": "FTP",
+                "ports": [
+                  "tcp/21"
+                ]
+              },
+              {
+                "id": "ftps",
+                "name": "FTPS",
+                "ports": [
+                  "tcp/990"
+                ]
+              },
+              {
+                "id": "nfs",
+                "name": "NFS",
+                "ports": [
+                  "tcp/2049"
+                ]
+              },
+              {
+                "id": "smb",
+                "name": "SMB/CIFS",
+                "ports": [
+                  "tcp/445"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "database",
+            "label": "数据库服务",
+            "services": [
+              {
+                "id": "mysql",
+                "name": "MySQL",
+                "ports": [
+                  "tcp/3306"
+                ]
+              },
+              {
+                "id": "postgres",
+                "name": "PostgreSQL",
+                "ports": [
+                  "tcp/5432"
+                ]
+              },
+              {
+                "id": "mongodb",
+                "name": "MongoDB",
+                "ports": [
+                  "tcp/27017"
+                ]
+              },
+              {
+                "id": "redis",
+                "name": "Redis",
+                "ports": [
+                  "tcp/6379"
+                ]
+              },
+              {
+                "id": "mssql",
+                "name": "MSSQL",
+                "ports": [
+                  "tcp/1433"
+                ]
+              },
+              {
+                "id": "oracle",
+                "name": "Oracle DB",
+                "ports": [
+                  "tcp/1521"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "remote",
+            "label": "远程访问",
+            "services": [
+              {
+                "id": "ssh",
+                "name": "SSH",
+                "ports": [
+                  "tcp/22"
+                ]
+              },
+              {
+                "id": "rdp",
+                "name": "RDP",
+                "ports": [
+                  "tcp/3389"
+                ]
+              },
+              {
+                "id": "rdp-udp",
+                "name": "RDP（UDP）",
+                "ports": [
+                  "udp/3389"
+                ]
+              },
+              {
+                "id": "vnc",
+                "name": "VNC",
+                "ports": [
+                  "tcp/5900"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

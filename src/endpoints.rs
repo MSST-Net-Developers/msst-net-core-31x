@@ -45,9 +45,10 @@ pub struct EndpointHistory {
 
 impl EndpointHistory {
     /// Record a report; a changed set pushes the old one into history.
-    pub fn record(&mut self, endpoints: Vec<String>, now: i64) {
+    /// Returns whether the set changed.
+    pub fn record(&mut self, endpoints: Vec<String>, now: i64) -> bool {
         if endpoints == self.current {
-            return;
+            return false;
         }
         if !self.current.is_empty() {
             self.history.push_back(EndpointRecord { endpoints: std::mem::take(&mut self.current), reported_at: now });
@@ -56,6 +57,7 @@ impl EndpointHistory {
             }
         }
         self.current = endpoints;
+        true
     }
 
     /// `GetEndpoints` view (3.0.x `GET /net/endpoints`).
@@ -162,7 +164,10 @@ async fn detect_and_report(state: &Arc<CoreState>) -> Result<(), String> {
         .api_post("/device/endpoint", &json!({ "deviceId": device_id, "endpoints": endpoints }))
         .await?;
     info!("endpoints: reported {:?}", endpoints);
-    state.endpoint_history.lock().unwrap_or_else(|e| e.into_inner()).record(endpoints, crate::runtime::current_unix());
+    let changed = state.endpoint_history.lock().unwrap_or_else(|e| e.into_inner()).record(endpoints, crate::runtime::current_unix());
+    if changed {
+        state.next_generation();
+    }
     Ok(())
 }
 

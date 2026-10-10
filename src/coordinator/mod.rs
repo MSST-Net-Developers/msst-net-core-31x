@@ -246,6 +246,7 @@ impl CoordinatorClient {
     }
 
     fn report_auth_required(&self, core: &Arc<CoreState>) {
+        core.access_auth_required.store(true, std::sync::atomic::Ordering::SeqCst);
         core.emit_ipc_event(msst_ipc_protocol::IpcEvent::AccessAuthRequired {
             coordinator_url: self.config.coord_url.clone(),
         });
@@ -417,6 +418,7 @@ impl CoordinatorClient {
         if let Err(e) = identity::save(&core.data_dir, id) {
             warn!("failed to persist refreshed token: {}", e);
         }
+        core.access_auth_required.store(false, std::sync::atomic::Ordering::SeqCst);
         info!(
             "OIDC token refreshed; expires_at={}",
             id.auth.as_ref().map(|a| a.expires_at).unwrap_or(0)

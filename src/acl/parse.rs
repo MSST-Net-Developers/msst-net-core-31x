@@ -55,8 +55,10 @@ fn default_enabled() -> bool {
 }
 
 /// Partial update (`IpcRequest::UpdateAclRule::patch`), same fields as the
-/// 3.0.x `PUT /firewall/rules/:id`.
+/// 3.0.x `PUT /firewall/rules/:id`.  Any other field is rejected
+/// (`invalid_patch`) so a client can't silently lose edits.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RulePatch {
     pub enabled: Option<bool>,
     pub comment: Option<String>,

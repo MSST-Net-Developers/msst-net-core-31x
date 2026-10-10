@@ -97,6 +97,8 @@ pub async fn evict_expired(state: &CoreState) {
             net.peer_endpoints.remove(id);
         }
         state.traffic.write().unwrap_or_else(|e| e.into_inner()).remove(id);
+        state.next_generation();
+        state.emit_ipc_event(msst_ipc_protocol::IpcEvent::NodeRemoved { device_id: id.clone() });
     }
 }
 

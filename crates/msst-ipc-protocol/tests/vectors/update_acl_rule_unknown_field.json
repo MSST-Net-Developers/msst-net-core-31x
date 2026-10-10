@@ -1,0 +1,28 @@
+{
+  "request": {
+    "body": {
+      "params": {
+        "patch": {
+          "permission_group": {
+            "kind": "space"
+          }
+        },
+        "rule_id": "00000000000000a1"
+      },
+      "type": "update_acl_rule"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "code": "invalid_patch",
+        "message": "unknown field `permission_group`, expected one of `enabled`, `comment`, `expires_at`"
+      },
+      "status": "error"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

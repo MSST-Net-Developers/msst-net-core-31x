@@ -54,6 +54,7 @@ pub async fn handle_request(request: IpcRequest, state: &Arc<CoreState>) -> IpcR
             respond(crate::acl::update_rule(state, &rule_id, patch).await)
         }
         IpcRequest::DeleteAclRule { rule_id } => respond(crate::acl::delete_rule(state, &rule_id).await),
+        IpcRequest::ClearAclRules => respond(crate::acl::clear_rules(state).await),
         IpcRequest::CreateAclGroup { group } => respond(crate::acl::create_group(state, group).await),
         IpcRequest::UpdateAclGroup { group_id, patch } => {
             respond(crate::acl::update_group(state, &group_id, patch).await)
@@ -128,16 +129,18 @@ async fn handle_health(state: &Arc<CoreState>) -> IpcResponse {
         "generation": state.generation.current(),
         "device_id": id.map(|i| i.device.id.clone()),
         "user_id": id.map(|i| i.user.id.clone()),
-        "device_handle": id.map(|i| i.device.handle.clone()),
-        "user_handle": id.map(|i| i.user.handle.clone()),
-        "user_display_name": id.map(|i| i.user.display_name.clone()),
-        "device_display_name": id.map(|i| i.device.display_name.clone()),
+        // Unset names/handles are null, not "".
+        "device_handle": id.map(|i| i.device.handle.clone()).filter(|s| !s.is_empty()),
+        "user_handle": id.map(|i| i.user.handle.clone()).filter(|s| !s.is_empty()),
+        "user_display_name": id.map(|i| i.user.display_name.clone()).filter(|s| !s.is_empty()),
+        "device_display_name": id.map(|i| i.device.display_name.clone()).filter(|s| !s.is_empty()),
         "device_hostname": id.map(|i| i.device.hostname.clone()).filter(|h| !h.is_empty()),
         "is_authenticated": auth.is_some_and(|a| !a.access_token.is_empty() && a.expires_at > now),
         "auth_expires_at": auth.map(|a| a.expires_at),
         "ws_connected": coordinator == crate::coordinator::ConnectionState::Connected,
         "coordinator_state": format!("{:?}", coordinator),
-        "tun_ready": state.tun_tx.get().is_some(),
+        "tun_ready": state.tun_attached.load(std::sync::atomic::Ordering::SeqCst),
+        "access_auth_required": state.access_auth_required.load(std::sync::atomic::Ordering::SeqCst),
         "relay": net.relay_addr,
         "peer_count": net.peer_list.len(),
         "rule_count": net.acl_rules.len(),
@@ -225,6 +228,7 @@ async fn set_net_settings(state: &Arc<CoreState>, patch: serde_json::Value) -> R
     };
     state.apply_net_settings().await;
     state.next_generation();
+    state.emit_ipc_event(msst_ipc_protocol::IpcEvent::SettingsChanged { scope: "net".into(), settings: view.clone() });
     Ok(view)
 }
 

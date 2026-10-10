@@ -12,7 +12,7 @@
 use crate::coordinator::CoordinatorClient;
 use crate::identity::{self, AuthCredentials};
 use crate::state::CoreState;
-use msst_ipc_protocol::IpcError;
+use msst_ipc_protocol::{IpcError, IpcEvent};
 use reqwest::Method;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -83,8 +83,33 @@ async fn update_identity<R>(state: &CoreState, f: impl FnOnce(&mut identity::Ide
         net.local_user_id = user_id;
         net.local_authenticated = authenticated;
     }
+    if authenticated {
+        state.access_auth_required.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     state.next_generation();
+    emit_identity_changed(state).await;
     Ok(out)
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Tell Controllers about the current identity (`IdentityChanged`).
+pub async fn emit_identity_changed(state: &CoreState) {
+    let Some(ev) = state.identity.read().await.as_ref().map(|id| IpcEvent::IdentityChanged {
+        device_id: id.device.id.clone(),
+        user_id: id.user.id.clone(),
+        device_handle: non_empty(&id.device.handle),
+        user_handle: non_empty(&id.user.handle),
+        device_display_name: non_empty(&id.device.display_name),
+        user_display_name: non_empty(&id.user.display_name),
+        device_hostname: non_empty(&id.device.hostname),
+        is_authenticated: id.auth.is_some(),
+    }) else {
+        return;
+    };
+    state.emit_ipc_event(ev);
 }
 
 pub async fn update_display_name(state: &CoreState, user: Option<String>, device: Option<String>) -> Result<Value, IpcError> {

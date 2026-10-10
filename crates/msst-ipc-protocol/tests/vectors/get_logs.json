@@ -1,0 +1,29 @@
+{
+  "request": {
+    "body": {
+      "params": {
+        "limit": 1
+      },
+      "type": "get_logs"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "entries": [
+          {
+            "level": "info",
+            "message": "coordinator: WebSocket connected",
+            "target": "msst_net_core::coordinator",
+            "timestamp_ms": 0
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

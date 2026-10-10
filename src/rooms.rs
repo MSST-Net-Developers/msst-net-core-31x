@@ -126,9 +126,22 @@ pub async fn leave_room(state: &Arc<CoreState>, room_id: String) -> Result<Value
     if state.net.read().await.joined_rooms.is_empty() {
         crate::peer_cache::on_rooms_left(state).await;
     }
-    state.next_generation();
     info!("rooms: left {}", room_id);
+    emit_room_state(state).await;
     Ok(json!({ "ok": true }))
+}
+
+/// Emit `RoomStateChanged` with the same content as `GetSystemState`'s room
+/// view (room left → `room_id: null`, no peers but ourselves).
+pub async fn emit_room_state(state: &CoreState) {
+    let v = room_view(state).await;
+    state.next_generation();
+    state.emit_ipc_event(msst_ipc_protocol::IpcEvent::RoomStateChanged {
+        room_id: v["room_id"].as_str().map(str::to_string),
+        room_name: v["room_name"].as_str().map(str::to_string),
+        peers: v["peers"].as_array().cloned().unwrap_or_default(),
+        relay: v["relay"].as_str().map(str::to_string),
+    });
 }
 
 /// Current room, relay and visible peers (3.0.x `GET /room/state`).
@@ -168,8 +181,8 @@ pub async fn room_view(state: &CoreState) -> Value {
                 "device_id": id.device.id,
                 "ipv4": ipv4,
                 "ipv6": ipv6,
-                "hostname": id.device.hostname,
-                "display_name": id.device.display_name,
+                "hostname": Some(&id.device.hostname).filter(|s| !s.is_empty()),
+                "display_name": Some(&id.device.display_name).filter(|s| !s.is_empty()),
             }));
         }
     }

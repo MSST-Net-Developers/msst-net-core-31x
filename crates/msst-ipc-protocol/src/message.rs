@@ -110,6 +110,9 @@ pub enum IpcRequest {
     UpdateAclRule { rule_id: String, patch: serde_json::Value },
     /// Delete a firewall rule.
     DeleteAclRule { rule_id: String },
+    /// Delete every firewall rule (3.0.x `DELETE /firewall/rules`).
+    /// Response: `{"deleted": <count>}`.  Added in protocol 0.3.
+    ClearAclRules,
     /// Create a permission group.
     CreateAclGroup { group: serde_json::Value },
     /// Update a permission group.
@@ -213,6 +216,13 @@ pub enum IpcEvent {
     AccessRequestTimeout {
         request_id: String,
     },
+    /// A pending auth request was answered (`AuthDecision`); `rule_id` is
+    /// the rule created from the decision.  Added in protocol 0.3.
+    AccessRequestResolved {
+        request_id: String,
+        decision: AuthDecision,
+        rule_id: String,
+    },
 
     // ── Peer lifecycle ──────────────────────────────────────────────────────
     /// A new peer was added to the local peer list.
@@ -260,6 +270,27 @@ pub enum IpcEvent {
         room_name: Option<String>,
         peers: Vec<serde_json::Value>,
         relay: Option<String>,
+    },
+
+    // ── Identity / settings ─────────────────────────────────────────────────
+    /// The local identity changed (display names, handles, hostname,
+    /// assigned IPv4, authentication).  Carries the full new values; `null`
+    /// = unset.  Added in protocol 0.3.
+    IdentityChanged {
+        device_id: String,
+        user_id: String,
+        device_handle: Option<String>,
+        user_handle: Option<String>,
+        device_display_name: Option<String>,
+        user_display_name: Option<String>,
+        device_hostname: Option<String>,
+        is_authenticated: bool,
+    },
+    /// Settings changed.  `scope` = `"net"` (body as `GetNetSettings`) or
+    /// `"ping"` (body `{"ping_enabled": bool}`).  Added in protocol 0.3.
+    SettingsChanged {
+        scope: String,
+        settings: serde_json::Value,
     },
 
     // ── Authentication ──────────────────────────────────────────────────────

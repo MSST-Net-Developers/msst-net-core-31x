@@ -1,0 +1,39 @@
+{
+  "request": {
+    "body": {
+      "params": {
+        "limit": 10
+      },
+      "type": "get_access_log"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "entries": [
+          {
+            "count": 1,
+            "decision": "allow",
+            "dst_port": 25565,
+            "id": "00000000000000l1",
+            "proto": "tcp",
+            "reason": {
+              "comment": "Minecraft for Bob",
+              "rule_id": "00000000000000a1",
+              "type": "matched_rule"
+            },
+            "rule_id": "00000000000000a1",
+            "service_name": "Minecraft Java",
+            "src_device_id": "device-0000000b",
+            "timestamp_ms": 0
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

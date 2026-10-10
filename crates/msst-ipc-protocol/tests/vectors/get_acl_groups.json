@@ -1,0 +1,28 @@
+{
+  "request": {
+    "body": {
+      "type": "get_acl_groups"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "groups": [
+          {
+            "id": "00000000000000g1",
+            "kind": "user",
+            "member_ids": [
+              "user-0000000b"
+            ],
+            "name": "friends"
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

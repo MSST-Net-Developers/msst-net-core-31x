@@ -135,9 +135,10 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         return false;
     };
     let now = crate::runtime::current_unix();
-    let is_new = {
+    let (is_new, changed) = {
         let mut net = state.net.write().await;
-        let is_new = !net.peer_list.contains(p.device_id);
+        let before = net.peer_list.get(p.device_id).cloned();
+        let is_new = before.is_none();
         net.peer_list.upsert(
             p.device_id, ipv4, ipv6, p.user_id, p.device_handle, p.user_handle,
             p.hostname.filter(|h| !h.is_empty()), p.display_name.clone(), p.user_display_name, p.is_authenticated, now,
@@ -149,7 +150,18 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         if !candidates.is_empty() {
             net.peer_endpoints.insert(p.device_id.to_string(), candidates);
         }
-        is_new
+        // Changed in anything but its last-seen time?
+        let after = net.peer_list.get(p.device_id).cloned();
+        let changed = match (&before, &after) {
+            (Some(b), Some(a)) => {
+                let (mut b, mut a) = (b.clone(), a.clone());
+                b.last_seen_unix = 0;
+                a.last_seen_unix = 0;
+                b != a
+            }
+            _ => false,
+        };
+        (is_new, changed.then_some(after).flatten())
     };
     state.scheduler.lock().await.ensure_peer(p.device_id);
     if let (Some(dns), Some(h)) = (state.dns.get(), p.hostname.filter(|h| !h.is_empty())) {
@@ -161,7 +173,26 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         }
         state.peers.lock().await.handshakes.register_peer(p.device_id, p.public_key, now);
     }
+    if let Some(e) = changed {
+        state.next_generation();
+        state.emit_ipc_event(msst_ipc_protocol::IpcEvent::NodeStateChanged {
+            device_id: e.device_id.clone(),
+            change: serde_json::json!({
+                "ipv4": e.ipv4.to_string(),
+                "ipv6": e.ipv6.to_string(),
+                "hostname": e.hostname,
+                "display_name": e.display_name,
+                "user_display_name": e.user_display_name,
+                "user_id": e.user_id,
+                "user_handle": e.user_handle,
+                "device_handle": e.device_handle,
+                "preferred_relay": e.preferred_relay,
+                "is_authenticated": e.is_authenticated,
+            }),
+        });
+    }
     if is_new {
+        state.next_generation();
         state.emit_ipc_event(msst_ipc_protocol::IpcEvent::NodeAdded {
             device_id: p.device_id.to_string(),
             ipv4: ipv4.to_string(),

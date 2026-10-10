@@ -1,0 +1,78 @@
+[
+  {
+    "body": {
+      "data": {
+        "peers": [
+          {
+            "device_id": "device-0000000b",
+            "display_name": "Bob PC",
+            "hostname": "pc.bob.ezplay.msst.net",
+            "ipv4": "172.22.1.1",
+            "ipv6": "fd22:2222:2222:2222::b"
+          },
+          {
+            "device_id": "device-00000001",
+            "display_name": null,
+            "hostname": null,
+            "ipv4": "172.22.0.1",
+            "ipv6": "fd22:2222:2222:2222::0000:0001"
+          }
+        ],
+        "relay": "198.51.100.1:7000",
+        "room_id": "space-1",
+        "room_name": "Test room"
+      },
+      "type": "room_state_changed"
+    },
+    "kind": "event"
+  },
+  {
+    "body": {
+      "data": {
+        "device_display_name": "Laptop",
+        "device_handle": null,
+        "device_hostname": null,
+        "device_id": "device-00000001",
+        "is_authenticated": false,
+        "user_display_name": "Me",
+        "user_handle": null,
+        "user_id": "user-00000001"
+      },
+      "type": "identity_changed"
+    },
+    "kind": "event"
+  },
+  {
+    "body": {
+      "data": {
+        "scope": "ping",
+        "settings": {
+          "ping_enabled": true
+        }
+      },
+      "type": "settings_changed"
+    },
+    "kind": "event"
+  },
+  {
+    "body": {
+      "data": {
+        "change": {
+          "device_handle": "pc",
+          "display_name": "Bob's new PC",
+          "hostname": "pc.bob.ezplay.msst.net",
+          "ipv4": "172.22.1.1",
+          "ipv6": "fd22:2222:2222:2222::b",
+          "is_authenticated": true,
+          "preferred_relay": "198.51.100.1:7000",
+          "user_display_name": "Bob",
+          "user_handle": "bob",
+          "user_id": "user-0000000b"
+        },
+        "device_id": "device-0000000b"
+      },
+      "type": "node_state_changed"
+    },
+    "kind": "event"
+  }
+]

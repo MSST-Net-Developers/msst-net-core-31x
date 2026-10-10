@@ -1,0 +1,31 @@
+{
+  "request": {
+    "body": {
+      "type": "get_path_view"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "peers": [
+          {
+            "candidates": [
+              {
+                "addr": "203.0.113.7:21031",
+                "status": "idle"
+              }
+            ],
+            "chosen": "relay",
+            "device_id": "device-0000000b",
+            "display_name": "Bob PC"
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

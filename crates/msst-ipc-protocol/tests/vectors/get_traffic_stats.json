@@ -1,0 +1,27 @@
+{
+  "request": {
+    "body": {
+      "type": "get_traffic_stats"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "peers": [
+          {
+            "device_id": "device-0000000b",
+            "display_name": "Bob PC",
+            "drop": 0,
+            "rx": 0,
+            "tx": 3
+          }
+        ]
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}

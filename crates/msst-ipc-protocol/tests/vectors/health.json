@@ -1,0 +1,39 @@
+{
+  "request": {
+    "body": {
+      "type": "health"
+    },
+    "id": "1",
+    "kind": "request"
+  },
+  "response": {
+    "body": {
+      "data": {
+        "access_auth_required": false,
+        "auth_expires_at": null,
+        "coordinator_state": "Disconnected",
+        "device_display_name": null,
+        "device_handle": null,
+        "device_hostname": null,
+        "device_id": "device-00000001",
+        "generation": 0,
+        "is_authenticated": false,
+        "local_device_id": "device-00000001",
+        "local_user_id": "user-00000001",
+        "peer_count": 1,
+        "ping_enabled": false,
+        "relay": "198.51.100.1:7000",
+        "rule_count": 1,
+        "status": "ok",
+        "tun_ready": false,
+        "user_display_name": null,
+        "user_handle": null,
+        "user_id": "user-00000001",
+        "ws_connected": false
+      },
+      "status": "ok"
+    },
+    "id": "1",
+    "kind": "response"
+  }
+}
