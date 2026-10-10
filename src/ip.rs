@@ -25,7 +25,10 @@ pub fn ipv6_available() -> bool {
         0,
         0,
     ));
-    UdpSocket::bind("[::]:0").and_then(|s| s.connect(probe)).is_ok()
+    UdpSocket::bind("[::]:0")
+        .and_then(|s| crate::netsock::protect_std(&s).map(|_| s))
+        .and_then(|s| s.connect(probe))
+        .is_ok()
 }
 
 /// Returns true for addresses in the MSST virtual address space

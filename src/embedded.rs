@@ -7,7 +7,8 @@
 //! VpnService itself must do:
 //!
 //! ```text
-//! let core = EmbeddedCore::start(data_dir, ipc_socket, None)?;
+//! let core = EmbeddedCore::start(data_dir, ipc_socket, None,
+//!     Some(Arc::new(|fd| vpn_service.protect(fd))))?;
 //! let (v4, v6) = core.virtual_ips();      // → VpnService.Builder addresses
 //! core.attach_tun_fd(builder.establish().detachFd())?;
 //! core.network_changed();                 // ConnectivityManager callback
@@ -15,6 +16,13 @@
 //! core.attach_tun_fd(new_fd)?;            // VPN resumed
 //! core.stop();
 //! ```
+//!
+//! `protect` is `VpnService.protect(fd)`: every socket Core opens (UDP data
+//! plane, relay probes, DNS upstream, coordinator WebSocket and — through a
+//! loopback SOCKS5 proxy with random credentials — coordinator HTTP) is
+//! protected before use, so Core keeps working under "always-on VPN + block
+//! connections without VPN".  It must be thread-safe and must not call back
+//! into Core.
 //!
 //! On Android the VpnService routes the MSST ranges and sets 172.22.0.1 as
 //! DNS server; Core answers DNS queries arriving through the TUN.  There is
@@ -43,8 +51,14 @@ pub struct EmbeddedCore {
 
 impl EmbeddedCore {
     /// Start Core: identity and state from `data_dir`, IPC on `ipc_socket`.
-    /// `coordinator_url` overrides the default coordinator.
-    pub fn start(data_dir: &Path, ipc_socket: &Path, coordinator_url: Option<&str>) -> Result<EmbeddedCore> {
+    /// `coordinator_url` overrides the default coordinator; `protect` is the
+    /// `VpnService.protect` callback (installed once per process).
+    pub fn start(
+        data_dir: &Path,
+        ipc_socket: &Path,
+        coordinator_url: Option<&str>,
+        protect: Option<crate::netsock::Protector>,
+    ) -> Result<EmbeddedCore> {
         let mut config = CoreConfig { data_dir: Some(data_dir.to_string_lossy().into_owned()), ..CoreConfig::default() };
         if let Some(url) = coordinator_url {
             config.coordinator_url = url.to_string();
@@ -54,6 +68,10 @@ impl EmbeddedCore {
         info!("MSST-Net Core {} starting (embedded)", env!("CARGO_PKG_VERSION"));
 
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        if let Some(p) = protect {
+            crate::netsock::install_protector(p);
+            runtime.block_on(crate::netsock::start_protected_proxy()).context("start protected proxy")?;
+        }
         let core = runtime.block_on(Core::start(CoreOptions {
             config,
             data_dir: data_dir.to_path_buf(),

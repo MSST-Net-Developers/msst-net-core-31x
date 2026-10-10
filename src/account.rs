@@ -129,7 +129,7 @@ pub async fn update_display_name(state: &CoreState, user: Option<String>, device
     })
     .await?;
     info!("account: display names — user '{}', device '{}'", u, d);
-    Ok(json!({ "ok": true, "user_display_name": u, "device_display_name": d }))
+    Ok(json!({ "ok": true, "user_display_name": non_empty(&u), "device_display_name": non_empty(&d) }))
 }
 
 pub async fn update_handle(state: &Arc<CoreState>, user: Option<String>, device: Option<String>) -> Result<Value, IpcError> {
@@ -158,7 +158,7 @@ pub async fn update_handle(state: &Arc<CoreState>, user: Option<String>, device:
     if let Err(e) = re_register(state).await {
         warn!("account: re-register after handle update failed (saved locally): {}", e.message);
     }
-    Ok(json!({ "ok": true, "user_handle": u, "device_handle": d }))
+    Ok(json!({ "ok": true, "user_handle": non_empty(&u), "device_handle": non_empty(&d) }))
 }
 
 /// `POST /device/register` with the current identity, then adopt the
@@ -385,5 +385,13 @@ mod tests {
         // Coordinator-assigned IPv4 recorded for next start.
         assert_eq!(id.device.assigned_ipv4.as_deref(), Some("172.22.9.9"));
         assert_eq!(id.device.hostname, "pc.me.ezplay.msst.net");
+    }
+
+    #[tokio::test]
+    async fn unset_fields_are_null_in_replies() {
+        let (state, _ipc) = core_state("account-null").await;
+        let out = update_display_name(&state, None, Some("Laptop".into())).await.unwrap();
+        assert!(out["user_display_name"].is_null());
+        assert_eq!(out["device_display_name"], "Laptop");
     }
 }

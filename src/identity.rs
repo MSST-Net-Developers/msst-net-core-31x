@@ -82,6 +82,15 @@ impl Identity {
         STANDARD.encode(self.public_key)
     }
 
+    /// [`Identity::virtual_ips`] in canonical text form (RFC 5952), for
+    /// Controllers.  The raw form is kept for the coordinator `register`
+    /// message, which 3.0.x sends exactly as derived.
+    pub fn virtual_ips_canonical(&self) -> (String, String) {
+        let (v4, v6) = self.virtual_ips();
+        let canon = |s: String| s.parse::<std::net::IpAddr>().map(|a| a.to_string()).unwrap_or(s);
+        (canon(v4), canon(v6))
+    }
+
     /// The virtual IPv4/IPv6 addresses of this device.
     ///
     /// IPv4 is the coordinator-assigned override when present (conflict
@@ -302,6 +311,12 @@ mod tests {
         assert!(id.auth.is_some());
         // Coordinator-assigned IPv4 wins over the derived one.
         assert_eq!(id.virtual_ips(), ("172.22.9.9".into(), "fd22:2222:2222:2222::a1b2:c3d4".into()));
+        // Canonical form for Controllers; the raw derivation is unchanged.
+        let mut zero = id.clone();
+        zero.device.id = "device-00000001".into();
+        zero.device.assigned_ipv4 = None;
+        assert_eq!(zero.virtual_ips().1, "fd22:2222:2222:2222::0000:0001");
+        assert_eq!(zero.virtual_ips_canonical().1, "fd22:2222:2222:2222::1");
         // Migration was written back.
         let reloaded: IdentityFile =
             serde_json::from_str(&std::fs::read_to_string(dir.join("identity.json")).unwrap()).unwrap();

@@ -309,8 +309,7 @@ async fn forward_to_upstream(query: &[u8]) -> Option<Vec<u8>> {
     for addr in servers.iter().filter_map(|s| s.parse::<SocketAddr>().ok()) {
         let (q, tx) = (query.clone(), tx.clone());
         tokio::spawn(async move {
-            let bind = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-            let Ok(sock) = UdpSocket::bind(bind).await else { return };
+            let Ok(sock) = crate::netsock::udp_socket(crate::netsock::any_for(&addr)).await else { return };
             mark_upstream_socket(&sock);
             if sock.send_to(&q, addr).await.is_err() {
                 return;

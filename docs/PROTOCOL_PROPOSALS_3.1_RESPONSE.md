@@ -13,7 +13,7 @@ compatible (same major).
 | P5 | Deferred | Event sequence numbers — not planned for 3.1 |
 | P6 | Done (reject) | Unknown patch fields → `invalid_patch` |
 | P7 | Done | MTU 1280–1500, strict types → `invalid_settings` |
-| P8 | Open | Socket protection for embedded Core — separate work item |
+| P8 | Done | `EmbeddedCore::start(…, protect)` — every socket protected |
 | P9 | Done | `tun_ready` accurate; unset strings are `null` |
 | P10 | Done | `Health.access_auth_required` |
 | P11 | Done | IPC bind failure is a startup failure |
@@ -95,11 +95,27 @@ Ethernet MTU).  `keepalive_secs`: `null` or a positive integer (clamped to
 
 ## P8. Socket protection (embedded Core)
 
-Agreed it is needed for Android "always-on VPN + block connections without
-VPN".  It requires routing every socket Core creates (data-plane UDP,
-discovery UDP, coordinator HTTP and WebSocket) through a protect callback,
-including custom connectors for the HTTP/WebSocket clients.  Tracked as a
-separate work item; `EmbeddedCore` is unchanged for now.
+`EmbeddedCore::start(data_dir, ipc_socket, coordinator_url, protect)` —
+`protect: Option<Arc<dyn Fn(RawFd) -> bool + Send + Sync>>`, i.e.
+`VpnService.protect(fd)`.  It is installed once per process and called for
+every socket Core opens, before use:
+
+| Socket | How |
+|--------|-----|
+| UDP data plane, relay probes, DNS upstream, diagnostic ping, IPv6 probe | created via `netsock`, protected |
+| Coordinator WebSocket | TCP connected and protected by Core, then TLS + WS handshake on it |
+| Coordinator HTTP (`reqwest`) | through an in-process SOCKS5 proxy on 127.0.0.1 (`socks5h`, proxy-side DNS) whose upstream connections are protected; random per-process username/password so other apps can't use it to bypass the VPN |
+
+If `protect` returns `false` the socket is not created (the operation
+fails) rather than leaking traffic into the VPN.  The callback must be
+thread-safe and must not call back into Core.  JNI glue: pass a closure
+that calls `VpnService.protect(int)` on the service instance (attach the
+calling thread to the JVM).  Desktop is unchanged (no callback, no proxy).
+
+Verified on Linux with a recording callback (every UDP/TCP socket and every
+proxy upstream connection protected, failing callback fails the socket,
+proxy refuses missing/wrong credentials); lockdown mode itself needs an
+Android device.
 
 ## P9. `Health`
 
@@ -128,6 +144,15 @@ startup: the daemon exits non-zero, `EmbeddedCore::start` returns an error.
 (`errors::ALL`).  A Core test fails if a handler uses an undocumented code.
 `message` stays diagnostic text — map codes to user messages, show
 `message` only as detail.
+
+## Follow-up (Controller feedback on 0.3)
+
+- `UpdateDisplayName` / `UpdateHandle` replies: unset fields are now `null`
+  (as in `Health` / `IdentityChanged`).
+- The own device's IPv6 in room views (`GetSystemState`, `RoomStateChanged`)
+  and `EmbeddedCore::virtual_ips` is canonical (`fd22:2222:2222:2222::1`).
+  The coordinator `register` message keeps the 3.0.x derived text
+  (`…::0000:0001`) for compatibility.
 
 ## Observed: stale binary
 

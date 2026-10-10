@@ -211,7 +211,7 @@ pub async fn start_ping(state: &Arc<CoreState>, device_id: String) -> Result<Val
 
 async fn run_ping(state: Arc<CoreState>, job_id: String, local_id: String, target: String, endpoint: Option<std::net::SocketAddr>) {
     let sock = match endpoint {
-        Some(ep) => tokio::net::UdpSocket::bind(if ep.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }).await.ok(),
+        Some(ep) => crate::netsock::udp_socket(crate::netsock::any_for(&ep)).await.ok(),
         None => None,
     };
     let mut buf = [0u8; 512];

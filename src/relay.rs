@@ -11,7 +11,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 const PING_COUNT: usize = 5;
@@ -179,11 +178,10 @@ fn pick_family(results: &[(SocketAddr, f64)]) -> Option<(SocketAddr, f64)> {
 /// Ping `target` `PING_COUNT` times from a throwaway socket; average RTT in
 /// ms, or `None` if every ping timed out.
 async fn ping_target(target: SocketAddr, src_id: [u8; 8]) -> Option<f64> {
-    let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-    let sock = match UdpSocket::bind(bind).await {
+    let sock = match crate::netsock::udp_socket(crate::netsock::any_for(&target)).await {
         Ok(s) => s,
         Err(e) => {
-            warn!("relay: failed to bind ping socket {}: {}", bind, e);
+            warn!("relay: failed to create ping socket: {}", e);
             return None;
         }
     };

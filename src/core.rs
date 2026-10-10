@@ -132,7 +132,7 @@ impl Core {
 
     /// The device's virtual IPv4 / IPv6 (for TUN / VpnService setup).
     pub async fn virtual_ips(&self) -> (String, String) {
-        self.state.identity.read().await.as_ref().map(|i| i.virtual_ips()).unwrap_or_default()
+        self.state.identity.read().await.as_ref().map(|i| i.virtual_ips_canonical()).unwrap_or_default()
     }
 
     /// Start using `dev` as the TUN (replacing any attached one).

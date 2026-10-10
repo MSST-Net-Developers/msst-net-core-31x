@@ -176,7 +176,7 @@ impl CoordinatorClient {
     pub fn new(config: CoordinatorConfig, event_tx: mpsc::Sender<CoordinatorEvent>) -> Self {
         CoordinatorClient {
             config,
-            http: reqwest::Client::new(),
+            http: crate::netsock::http_client(),
             conn_tx: RwLock::new(None),
             event_tx,
             state: RwLock::new(ConnectionState::Disconnected),
@@ -361,8 +361,14 @@ impl CoordinatorClient {
         tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
         tokio_tungstenite::tungstenite::Error,
     > {
+        // Connect the TCP stream ourselves so it can be protected from the
+        // device's VPN (embedded Core), then do TLS + the WS handshake on it.
         let req = build_ws_request(ws_url, token)?;
-        tokio_tungstenite::connect_async(req).await.map(|(s, _)| s)
+        let uri = req.uri().clone();
+        let host = uri.host().unwrap_or_default().trim_matches(|c| c == '[' || c == ']').to_string();
+        let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+        let tcp = crate::netsock::connect_host(&host, port).await.map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+        tokio_tungstenite::client_async_tls(req, tcp).await.map(|(s, _)| s)
     }
 
     /// Refresh the OIDC access token with the stored refresh token.

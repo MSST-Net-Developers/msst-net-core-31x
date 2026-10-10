@@ -176,7 +176,7 @@ pub async fn room_view(state: &CoreState) -> Value {
     drop(net);
     if let Some(id) = state.identity.read().await.as_ref() {
         if !peers.iter().any(|p| p["device_id"] == local_id) {
-            let (ipv4, ipv6) = id.virtual_ips();
+            let (ipv4, ipv6) = id.virtual_ips_canonical();
             peers.push(json!({
                 "device_id": id.device.id,
                 "ipv4": ipv4,

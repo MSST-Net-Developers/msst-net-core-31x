@@ -20,6 +20,7 @@ mod ippkt;
 mod endpoints;
 mod contacts;
 mod net_settings;
+pub mod netsock;
 mod nodes;
 mod coordinator;
 mod identity;
@@ -88,6 +89,7 @@ pub(crate) fn make_udp_socket(port: u16) -> Result<tokio::net::UdpSocket> {
 
     let try_dual = || -> std::io::Result<tokio::net::UdpSocket> {
         let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        netsock::protect_socket2(&sock)?;
         sock.set_only_v6(false)?;
         tune_socket_buffers(&sock);
         sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
@@ -100,6 +102,7 @@ pub(crate) fn make_udp_socket(port: u16) -> Result<tokio::net::UdpSocket> {
         Err(e) => {
             warn!("dual-stack UDP socket failed ({}), falling back to IPv4-only", e);
             let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            netsock::protect_socket2(&sock)?;
             tune_socket_buffers(&sock);
             sock.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
             sock.set_nonblocking(true)?;
