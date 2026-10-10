@@ -532,12 +532,11 @@ Designed for:
 - temporary networking
 - Minecraft/game sessions
 
-Unauthenticated users may use room mode with limitations.
+Unauthenticated users may use room mode, but not Large LAN mode.
 
-Current intended limitation:
-- unauthenticated room: maximum 5 participants
-
-Authenticated users can use larger/unlimited room mode.
+Rooms have no participant limit in 3.1.x, whether created by an
+authenticated or an unauthenticated user (3.0.x limited unauthenticated
+rooms to 5 participants; the limit was enforced by the coordinator).
 
 Room mode supports interactive authorization and game discovery mechanisms.
 
