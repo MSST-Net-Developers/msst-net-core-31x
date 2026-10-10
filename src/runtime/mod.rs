@@ -1,0 +1,1154 @@
+//! Core runtime — orchestrates all background tasks.
+//!
+//! The `CoreRuntime` owns the lifecycle of every background task the Core
+//! daemon needs: inbound packet processing, scheduler tick, housekeeping,
+//! and more.
+
+mod task_handle;
+
+use crate::coordinator::{CoordinatorClient, CoordinatorConfig, CoordinatorEvent};
+use crate::state::CoreState;
+pub use task_handle::{TaskHandle, cancel_all};
+
+use msst_core_state::nat::stun;
+use msst_core_state::net::msst_packet;
+use msst_core_state::net::relay::{self, classify_packet};
+use msst_core_state::packet::{self, PipelineVerdict, StaticPingPolicy};
+use msst_core_state::scheduler::actions::SchedulerAction;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, trace, warn};
+
+// ---------------------------------------------------------------------------
+// CoreRuntime
+// ---------------------------------------------------------------------------
+
+/// The Core runtime — owns all background tasks and the shared state.
+pub struct CoreRuntime {
+    pub state: Arc<CoreState>,
+    tasks: Vec<TaskHandle>,
+}
+
+impl CoreRuntime {
+    pub fn new(state: Arc<CoreState>) -> Self {
+        CoreRuntime {
+            state,
+            tasks: Vec::new(),
+        }
+    }
+
+    pub fn spawn(&mut self, name: &'static str, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(future);
+        self.tasks.push(TaskHandle::new(name, handle));
+        debug!("spawned task: {}", name);
+    }
+
+    /// Start the inbound packet processing loop.
+    pub fn start_inbound(
+        &mut self,
+        udp: Arc<tokio::net::UdpSocket>,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+    ) {
+        let state = self.state.clone();
+        self.spawn("inbound", async move {
+            inbound_loop(udp, state, tun_tx).await;
+        });
+    }
+
+    /// Start the P2P scheduler tick (1-second cycle).
+    pub fn start_scheduler_tick(&mut self) {
+        let state = self.state.clone();
+        self.spawn("scheduler-tick", async move {
+            scheduler_tick_loop(state).await;
+        });
+    }
+
+    /// Start the housekeeping loop (periodic cleanup).
+    pub fn start_housekeeping(&mut self) {
+        let state = self.state.clone();
+        self.spawn("housekeeping", async move {
+            housekeeping_loop(state).await;
+        });
+    }
+
+    /// Start the Coordinator WebSocket client and event handler.
+    ///
+    /// Connects to the Coordinator, registers the device, and dispatches
+    /// incoming events to the P2P scheduler and Core state.
+    pub fn start_coordinator(&mut self, config: CoordinatorConfig, preferred_relay: Option<String>) {
+        let state = self.state.clone();
+
+        // Create the coordinator client and event channel.
+        let (event_tx, mut event_rx) = mpsc::channel::<CoordinatorEvent>(64);
+        let client = Arc::new(CoordinatorClient::new(config.clone(), event_tx));
+        let _ = state.coordinator.set(client.clone());
+
+        // Spawn the WS connection loop.
+        let client_for_ws = client.clone();
+        let state_for_ws = state.clone();
+        self.spawn("coordinator-ws", async move {
+            client_for_ws.run(state_for_ws).await;
+        });
+
+        // Spawn the event handler (dispatches coordinator events to Core).
+        let client_for_handler = client.clone();
+        self.spawn("coordinator-events", async move {
+            coordinator_event_loop(client_for_handler, &mut event_rx, &state, preferred_relay).await;
+        });
+    }
+
+    /// Start the on-demand node fetcher.
+    pub fn start_fetcher(&mut self) {
+        let handle = crate::nodes::spawn_fetcher(self.state.clone());
+        self.tasks.push(TaskHandle::new("node-fetcher", handle));
+    }
+
+    /// Start the local DNS resolver (+ system split-DNS) and the game
+    /// discovery proxy.  Requires the TUN (`iface`).
+    pub async fn start_dns_and_discovery(&mut self, iface: &str, tun_tx: mpsc::Sender<Vec<u8>>) {
+        let resolver = crate::dns::DnsResolver::new(&self.state);
+        let _ = self.state.dns.set(resolver.clone());
+        let mode = self.state.net_settings.read().await.linux_dns_mode;
+        let (fell_back, handle) = crate::dns::start(resolver, iface, mode).await;
+        if let Some(h) = handle {
+            self.tasks.push(TaskHandle::new("dns", h));
+        }
+        if fell_back {
+            // Remember the fallback (3.0.x): resolvectl isn't available.
+            let mut s = self.state.net_settings.write().await;
+            s.linux_dns_mode = crate::net_settings::LinuxDnsMode::IptablesOnly;
+            if let Err(e) = s.save(&self.state.data_dir) {
+                warn!("dns: failed to persist iptables fallback: {}", e);
+            }
+        }
+        let (disc_tx, handles) = crate::discovery::start(self.state.clone(), tun_tx).await;
+        let _ = self.state.discovery_tx.set(disc_tx);
+        for h in handles {
+            self.tasks.push(TaskHandle::new("discovery", h));
+        }
+    }
+
+    /// Start the outbound loop (TUN → route → UDP).
+    pub fn start_outbound(&mut self, tun_rx: mpsc::Receiver<Vec<u8>>) {
+        let state = self.state.clone();
+        self.spawn("outbound", async move {
+            outbound_loop(tun_rx, state).await;
+        });
+    }
+
+    /// Start relay keepalive (network setting `keepalive_secs`) and relay RTT pings
+    /// (every 5 s).
+    pub fn start_relay_tasks(&mut self) {
+        let state = self.state.clone();
+        self.spawn("relay-keepalive", async move {
+            relay_keepalive_loop(state).await;
+        });
+        let state = self.state.clone();
+        self.spawn("relay-rtt", async move {
+            relay_rtt_loop(state).await;
+        });
+    }
+
+    /// Cancel all background tasks in reverse spawn order.
+    pub async fn shutdown(self) {
+        info!("shutting down {} background task(s)", self.tasks.len());
+        cancel_all(self.tasks).await;
+        info!("all background tasks stopped");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound loop — packet classification + ACL pipeline
+// ---------------------------------------------------------------------------
+
+async fn inbound_loop(
+    udp: Arc<tokio::net::UdpSocket>,
+    state: Arc<CoreState>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+) {
+    let mut buf = vec![0u8; 65536];
+    info!("inbound loop started");
+
+    loop {
+        let (len, src) = match udp.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+            Err(e) => {
+                error!("UDP recv error: {}", e);
+                continue;
+            }
+        };
+
+        let data = &buf[..len];
+        let now = current_unix();
+
+        match classify_packet(data) {
+            // ── MSST protocol packet ──────────────────────────────────────
+            relay::ReceivedPacket::Msst(pkt) => {
+                match pkt.packet_type {
+                    msst_packet::TYPE_DATA => {
+                        // Inbound data from a peer (direct or via relay).
+                        // Unknown sender → learn about it for the next packet.
+                        let src_id = msst_packet::decode_id(pkt.src_id);
+                        if !src_id.is_empty() && !state.net.read().await.peer_list.contains(&src_id) {
+                            crate::nodes::demand(&state, crate::nodes::FetchDemand::ByDevice(src_id));
+                        }
+                        crate::inbound::deliver_inbound(&state, &tun_tx, pkt.payload).await;
+                    }
+                    msst_packet::TYPE_P2P_PING => {
+                        // Echo the payload back as a pong so the sender can
+                        // measure RTT (direct, or relay-forwarded).
+                        if pkt.payload.len() < msst_packet::PING_PAYLOAD_LEN { continue; }
+                        let local_id = state.net.read().await.local_device_id.clone();
+                        if local_id.is_empty() { continue; }
+                        let pong = msst_packet::build_p2p_pong(&local_id, &msst_packet::decode_id(pkt.src_id), &pkt.payload);
+                        let _ = udp.send_to(&pong, relay::map_send_addr(src)).await;
+                    }
+                    msst_packet::TYPE_P2P_PONG => {
+                        // Process pong for path upgrade.
+                        let peer_id = msst_packet::decode_id(pkt.src_id);
+                        let (seq, sent_ms) = match msst_packet::decode_ping_payload(&pkt.payload) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let rtt_ms = (current_time_ms().saturating_sub(sent_ms)) as f64;
+                        let src_addr = msst_core_state::net::relay::unmap_addr(src);
+                        let relay_rtt = {
+                            let net = state.net.read().await;
+                            let peer_relay = net.peer_list.get(&peer_id)
+                                .and_then(|e| e.preferred_relay.as_deref());
+                            net.relay_rtt.for_peer(peer_relay, net.relay_addr.as_deref())
+                        };
+                        let mut sched = state.scheduler.lock().await;
+                        let actions = sched.handle_pong(&peer_id, src_addr, seq, rtt_ms, relay_rtt, now);
+                        drop(sched);
+                        for action in actions {
+                            execute_scheduler_action(&action, &state, &udp).await;
+                        }
+                    }
+                    msst_packet::TYPE_DISCOVERY_DATA => {
+                        // Room discovery broadcast forwarded by the relay.
+                        if let Some(ip) = crate::discovery::inbound_discovery_payload(&pkt.payload) {
+                            let _ = tun_tx.send(ip).await;
+                        }
+                    }
+                    msst_packet::TYPE_RELAY_PING => {
+                        // The relay echoed one of our RTT pings; match by source.
+                        let src = msst_core_state::net::relay::unmap_addr(src);
+                        let mut net = state.net.write().await;
+                        if let Some((addr, ewma)) = net.relay_rtt.on_reply(src, std::time::Instant::now()) {
+                            debug!("relay RTT {} EWMA {:.1}ms", addr, ewma);
+                        }
+                    }
+                    _ => {
+                        debug!("inbound: unhandled MSST type 0x{:02x}", pkt.packet_type);
+                    }
+                }
+            }
+
+            relay::ReceivedPacket::Raw(data) => {
+                if stun::is_stun_response(data) {
+                    // STUN response — hand it to the waiting endpoint detector.
+                    crate::endpoints::on_stun_response(&state, data);
+                } else if is_raw_ip_packet(data) {
+                    // Raw IP datagram — still subject to the firewall.
+                    crate::inbound::deliver_inbound(&state, &tun_tx, data.to_vec()).await;
+                } else {
+                    // Non-MSST, non-STUN, non-IP — try WireGuard decapsulation.
+                    let wg_result = {
+                        let mut enc = state.encryption.lock().await;
+                        enc.decapsulate_any(data)
+                    };
+                    match wg_result {
+                        Some((peer_id, plaintext, handshake_resp)) => {
+                            debug!("WG: decapsulated {} bytes from {}", plaintext.len(), peer_id);
+                            // Send handshake response back if needed.
+                            if let Some(resp) = handshake_resp {
+                                let _ = udp.send_to(&resp, src).await;
+                            }
+                            // Decrypted IP packet — through the firewall like any other.
+                            if !plaintext.is_empty() {
+                                crate::inbound::deliver_inbound(&state, &tun_tx, plaintext).await;
+                            }
+                        }
+                        None => {
+                            trace!("inbound: unrecognized non-MSST packet ({} bytes)", data.len());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler tick loop (1-second cycle)
+// ---------------------------------------------------------------------------
+
+async fn scheduler_tick_loop(state: Arc<CoreState>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    info!("scheduler tick loop started");
+
+    loop {
+        ticker.tick().await;
+
+        let now = current_unix();
+        let now_ms = current_time_ms();
+
+        // Collect peer endpoints and relay info from NetState.
+        // The scheduler tracks endpoints internally via punch_request events.
+        // Here we only collect relay info for routing decisions.
+        let (endpoints, relays, device_id, relay_rtt) = {
+            let net = state.net.read().await;
+            let ep = net.peer_endpoints.clone();
+            let mut rl = std::collections::HashMap::new();
+            let own_relay = net.relay_addr.as_deref();
+            for dev_id in net.peer_list.device_ids() {
+                // The relay path to a peer goes through the peer's relay,
+                // falling back to our own (same choice as outbound routing).
+                let relay = net.peer_list.get(dev_id)
+                    .and_then(|e| e.preferred_relay.as_deref())
+                    .filter(|r| net.relay_rtt.get(r).is_some())
+                    .or(own_relay);
+                if let Some(addr) = relay.and_then(|r| r.parse::<std::net::SocketAddr>().ok()) {
+                    rl.insert(dev_id.to_string(), addr);
+                }
+            }
+            (ep, rl, net.local_device_id.clone(), net.relay_rtt.all().clone())
+        };
+
+        if device_id.is_empty() { continue; }
+
+        // Run the scheduler tick.
+        let actions = {
+            let mut sched = state.scheduler.lock().await;
+            sched.tick(now, now_ms, &endpoints, &relays, &relay_rtt)
+        };
+
+        // Execute all returned actions.
+        let udp = &state.udp_socket;
+        for action in &actions {
+            execute_scheduler_action(action, &state, udp).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Housekeeping loop (60-second cycle)
+// ---------------------------------------------------------------------------
+
+async fn housekeeping_loop(state: Arc<CoreState>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut ticks: u64 = 0;
+    info!("housekeeping loop started");
+
+    loop {
+        ticker.tick().await;
+        let now = current_unix();
+
+        // 1. Peer cache: refresh rule references, evict expired peers,
+        //    persist every 5 minutes.
+        crate::peer_cache::sync_rule_refs(&state).await;
+        crate::peer_cache::evict_expired(&state).await;
+        ticks += 1;
+        if ticks % 5 == 0 {
+            crate::peer_cache::save(&state).await;
+        }
+
+        // 2. Handshake timeouts.
+        {
+            let mut peers = state.peers.lock().await;
+            let actions = peers.check_handshake_timeouts(now);
+            for action in &actions {
+                match action {
+                    msst_core_state::peer_mgmt::handshake::HandshakeAction::RetryHandshake { device_id } => {
+                        debug!("housekeeping: retry WG handshake for {}", device_id);
+                    }
+                    msst_core_state::peer_mgmt::handshake::HandshakeAction::GiveUp { device_id } => {
+                        warn!("housekeeping: WG handshake gave up for {}", device_id);
+                        state.encryption.lock().await.remove_peer(device_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 3. Interactive-auth timeouts.
+        crate::inbound::expire_auth_requests(&state, now).await;
+
+        // 3b. ACL rule expiry (removes, persists, emits AclChanged).
+        crate::acl::expire_rules(&state, now).await;
+
+        // 4. Contacts: prune stale entries and persist changes.
+        state.contacts.lock().unwrap_or_else(|e| e.into_inner()).prune(now);
+        state.save_contacts();
+
+        // 5. Connection-tracking expiry.
+        state.conn_track.lock().unwrap_or_else(|e| e.into_inner()).cleanup(now);
+
+        debug!("housekeeping: tick complete");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator event handler
+// ---------------------------------------------------------------------------
+
+/// Dispatch coordinator events to Core state and P2P scheduler.
+async fn coordinator_event_loop(
+    client: Arc<CoordinatorClient>,
+    event_rx: &mut mpsc::Receiver<CoordinatorEvent>,
+    state: &Arc<CoreState>,
+    preferred_relay: Option<String>,
+) {
+    info!("coordinator event handler started");
+
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            // ── (Re)connected: (re)select and register a relay ────────────
+            CoordinatorEvent::Connected => {
+                spawn_relay_selection(state.clone(), client.clone(), preferred_relay.clone());
+                // Learn our own other devices and every node our rules name.
+                let uid = state.net.read().await.local_user_id.clone();
+                if !uid.is_empty() {
+                    crate::nodes::demand(state, crate::nodes::FetchDemand::ByUser(uid));
+                }
+                crate::nodes::demand_rule_targets(state).await;
+                // Retry migrating 3.0.x mnemonic rules now that the
+                // coordinator is reachable.
+                let st = state.clone();
+                tokio::spawn(async move { crate::acl::migrate_pending(&st).await });
+            }
+
+            // ── Registration confirmed ────────────────────────────────────
+            CoordinatorEvent::Registered {
+                hostname, ipv4, ipv6: _, user_handle, user_display_name,
+            } => {
+                info!("coordinator: registered hostname={} ipv4={}", hostname, ipv4);
+                let mut guard = state.identity.write().await;
+                if let Some(id) = guard.as_mut() {
+                    if crate::coordinator::apply_registered(
+                        id, &hostname, &ipv4, &user_handle, &user_display_name,
+                    ) {
+                        if let Err(e) = crate::identity::save(&state.data_dir, id) {
+                            warn!("coordinator: failed to persist identity: {}", e);
+                        }
+                        drop(guard);
+                        state.next_generation();
+                    }
+                }
+            }
+
+            // ── Room state update ─────────────────────────────────────────
+            CoordinatorEvent::RoomState { room_id, room_name, peers } => {
+                info!("coordinator: room_state room={} ({}), {} peer(s)", room_id, room_name, peers.len());
+
+                let now = current_unix();
+
+                {
+                    let mut contacts = state.contacts.lock().unwrap_or_else(|e| e.into_inner());
+                    for peer in &peers {
+                        contacts.update_room_contact(&peer.device_id, None, now);
+                    }
+                }
+
+                // Current co-members of this room.
+                let ids: Vec<String> = peers.iter().map(|p| p.device_id.clone()).collect();
+                state.net.write().await.room_peers = ids.iter().cloned().collect();
+                crate::peer_cache::on_room_members(state, &ids).await;
+
+                // Peer list, scheduler, WireGuard.
+                for peer in &peers {
+                    crate::nodes::apply_peer(state, room_peer_data(peer)).await;
+                }
+
+                // Complete a pending join.
+                crate::rooms::notify_room_waiter(state, Ok(serde_json::json!({
+                    "room_id": room_id,
+                    "room_name": room_name,
+                })));
+
+                // Emit IPC event.
+                state.emit_ipc_event(msst_ipc_protocol::IpcEvent::RoomStateChanged {
+                    room_id: Some(room_id),
+                    room_name: Some(room_name),
+                    peers: peers.iter().map(|p| serde_json::json!({
+                        "device_id": p.device_id,
+                        "hostname": p.hostname,
+                        "display_name": p.device_display_name,
+                    })).collect(),
+                    relay: None,
+                });
+            }
+
+            // ── Member joined ─────────────────────────────────────────────
+            CoordinatorEvent::MemberJoined { room_id, peer } => {
+                let device_id = peer.device_id.clone();
+                info!("coordinator: member_joined room={} device={}", room_id, device_id);
+                crate::nodes::apply_peer(state, room_peer_data(&peer)).await;
+                crate::peer_cache::on_member_joined(state, &device_id).await;
+                state.contacts.lock().unwrap_or_else(|e| e.into_inner())
+                    .update_room_contact(&device_id, None, current_unix());
+                let mut net = state.net.write().await;
+                net.room_peers.insert(device_id.clone());
+                drop(net);
+                state.scheduler.lock().await.ensure_peer(&device_id);
+            }
+
+            // ── Member left ───────────────────────────────────────────────
+            CoordinatorEvent::MemberLeft { room_id, device_id } => {
+                info!("coordinator: member_left room={} device={}", room_id, device_id);
+                let mut net = state.net.write().await;
+                net.room_peers.remove(&device_id);
+                drop(net);
+                // Kept for the room grace period, then evicted by housekeeping.
+                crate::peer_cache::on_member_left(state, &device_id).await;
+            }
+
+            // ── Node added / updated (authenticated devices) ──────────────
+            CoordinatorEvent::NodeAdded { device_id, endpoints, status, .. }
+            | CoordinatorEvent::NodeUpdated { device_id, endpoints, status, .. } => {
+                debug!("coordinator: node event {} status={}", device_id, status);
+                let (known, referenced) = {
+                    let net = state.net.read().await;
+                    let referenced = net.acl_rules.iter().any(|r| matches!(&r.permission_group,
+                        msst_acl_engine::PermissionGroup::Devices { ids } if ids.contains(&device_id)));
+                    (net.peer_list.contains(&device_id), referenced)
+                };
+                if known {
+                    let mut net = state.net.write().await;
+                    if let Some(relay) = crate::relay::extract_relay(&endpoints) {
+                        net.peer_list.update_relay(&device_id, &relay);
+                    }
+                    let candidates = crate::endpoints::direct_candidates(&endpoints);
+                    if !candidates.is_empty() {
+                        net.peer_endpoints.insert(device_id.clone(), candidates);
+                    }
+                } else if referenced {
+                    // A node we care about is online: fetch it even if a
+                    // recent lookup found nothing.
+                    let d = crate::nodes::FetchDemand::ByDevice(device_id);
+                    state.fetch_gate.lock().unwrap_or_else(|e| e.into_inner()).clear_negative(&d);
+                    crate::nodes::demand(state, d);
+                }
+            }
+
+            // ── Punch request (NAT traversal) ─────────────────────────────
+            CoordinatorEvent::PunchRequest { peer_id, endpoints } => {
+                info!("coordinator: punch_request for {} ({} endpoints)", peer_id, endpoints.len());
+                let parsed_eps: Vec<std::net::SocketAddr> = endpoints
+                    .iter()
+                    .filter_map(|ep| ep.parse().ok())
+                    .collect();
+                if parsed_eps.is_empty() {
+                    warn!("coordinator: punch_request for {} with no valid endpoints", peer_id);
+                    continue;
+                }
+
+                let now = current_unix();
+                let now_ms = current_time_ms();
+
+                // Remember the endpoints as the peer's direct candidates (3.0.x).
+                state.net.write().await.peer_endpoints.insert(peer_id.clone(), crate::endpoints::direct_candidates(&endpoints));
+
+                // Ensure the peer is tracked.
+                state.scheduler.lock().await.ensure_peer(&peer_id);
+
+                // Dispatch to scheduler.
+                let actions = {
+                    let mut sched = state.scheduler.lock().await;
+                    sched.handle_punch_request(&peer_id, &parsed_eps, now, now_ms)
+                };
+
+                // Execute scheduler actions (send punch packets).
+                let udp = &state.udp_socket;
+                for action in &actions {
+                    execute_scheduler_action(action, state, udp).await;
+                }
+            }
+
+            // ── Coordinator error ─────────────────────────────────────────
+            CoordinatorEvent::Error { message } => {
+                warn!("coordinator error: {}", message);
+                // Fail a pending join fast (e.g. wrong room password).
+                crate::rooms::notify_room_waiter(state, Err(message));
+            }
+        }
+    }
+
+    info!("coordinator event handler exited");
+}
+
+// ---------------------------------------------------------------------------
+// Outbound loop (TUN → route → UDP)
+// ---------------------------------------------------------------------------
+
+async fn outbound_loop(mut tun_rx: mpsc::Receiver<Vec<u8>>, state: Arc<CoreState>) {
+    info!("outbound loop started");
+    // Bounds concurrent TUN-intercepted DNS resolutions (3.0.x: 32).
+    let dns_sem = Arc::new(tokio::sync::Semaphore::new(32));
+    while let Some(pkt) = tun_rx.recv().await {
+        // Linux iptables DNS mode: queries DNAT'ed to 172.22.0.1:21053.
+        if crate::dns::tun_interception_enabled(&state) && crate::dns::is_tun_dns_query(&pkt) {
+            if let (Some(resolver), Some(tun_tx)) = (state.dns.get().cloned(), state.tun_tx.get().cloned()) {
+                let Ok(permit) = dns_sem.clone().acquire_owned().await else { continue };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Some(reply) = crate::dns::intercept_tun_dns(&resolver, &pkt).await {
+                        let _ = tun_tx.send(reply).await;
+                    }
+                });
+            }
+            continue;
+        }
+        // Game discovery broadcasts go to the proxy while in a room.
+        if crate::discovery::is_ipv4_discovery_packet(&pkt) {
+            if let Some(tx) = state.discovery_tx.get() {
+                if !state.net.read().await.joined_rooms.is_empty() {
+                    let _ = tx.send(pkt).await;
+                    continue;
+                }
+            }
+        }
+        route_outbound_packet(&pkt, &state).await;
+    }
+    info!("outbound loop exited (TUN reader closed)");
+}
+
+/// Route one IP packet read from the TUN to its peer (3.0.x `route_outbound`).
+///
+/// Data is sent MSST-framed and unencrypted, exactly like 3.0.x, so 3.0.x
+/// peers and relays interoperate: directly to the peer's endpoint when the
+/// path is Direct, otherwise via the peer's relay, falling back to our own.
+/// Returns the UDP target the packet was sent to.
+async fn route_outbound_packet(pkt: &[u8], state: &Arc<CoreState>) -> Option<std::net::SocketAddr> {
+    route_packet(pkt, state, true).await
+}
+
+/// Send a Core-synthesized IP packet (e.g. a TCP RST) to the peer owning
+/// its destination address.  Unlike TUN traffic it is *not* recorded in
+/// connection tracking — otherwise the rejected peer's retry would match
+/// the "related" fast path and bypass authorization.
+pub(crate) async fn send_to_peer(pkt: &[u8], state: &Arc<CoreState>) -> Option<std::net::SocketAddr> {
+    route_packet(pkt, state, false).await
+}
+
+async fn route_packet(pkt: &[u8], state: &Arc<CoreState>, track: bool) -> Option<std::net::SocketAddr> {
+    let parsed = parse_ip_packet(pkt)?;
+    let now = current_unix();
+
+    // Record the flow so replies pass the inbound firewall ("related" path).
+    if track && matches!(parsed.proto, packet::parsed::TransportProtocol::Tcp | packet::parsed::TransportProtocol::Udp) {
+        state.conn_track.lock().unwrap_or_else(|e| e.into_inner()).record_outbound(
+            parsed.src_ip, parsed.src_port,
+            parsed.dst_ip, parsed.dst_port,
+            parsed.proto.number(), now,
+        );
+    }
+
+    let (dst_device_id, peer_relay, own_relay) = {
+        let net = state.net.read().await;
+        let Some(dev) = net.peer_list.lookup_device_id_by_ip(&parsed.dst_ip) else {
+            if crate::ip::is_msst_ip(&parsed.dst_ip) {
+                debug!("outbound: no route for {} (peer unknown), fetching", parsed.dst_ip);
+                crate::nodes::demand(state, crate::nodes::FetchDemand::ByIp(parsed.dst_ip));
+            }
+            return None;
+        };
+        let peer_relay = net.peer_list.get(dev).and_then(|e| e.preferred_relay.clone());
+        (dev.to_string(), peer_relay, net.relay_addr.clone())
+    };
+
+    // Relay addresses are only needed when there is no direct path.
+    let direct = state.scheduler.lock().await.route_outbound_wg(&dst_device_id).is_some();
+    let (peer_relay, own_relay) = if direct {
+        (None, None)
+    } else {
+        let p = match &peer_relay { Some(r) => crate::relay::resolve_addr(r).await, None => None };
+        let o = match &own_relay { Some(r) => crate::relay::resolve_addr(r).await, None => None };
+        (p, o)
+    };
+
+    let routed = state.scheduler.lock().await.route_outbound(&dst_device_id, pkt, peer_relay, own_relay);
+    let Some((target, frame)) = routed else {
+        debug!("outbound: no reachable path for {} ({})", dst_device_id, parsed.dst_ip);
+        return None;
+    };
+    if let Err(e) = state.udp_socket.send_to(&frame, relay::map_send_addr(target)).await {
+        warn!("outbound: send to {} via {} failed: {}", dst_device_id, target, e);
+        return None;
+    }
+    if track {
+        crate::diagnostics::traffic(state, &dst_device_id).tx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(target)
+}
+
+// ---------------------------------------------------------------------------
+// Relay: selection, keepalive, RTT
+// ---------------------------------------------------------------------------
+
+/// Attempts per relay selection (bounded; the next reconnect starts over).
+const RELAY_SELECT_ATTEMPTS: u32 = 3;
+const RELAY_SELECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Select the best relay and register with it, in the background.
+///
+/// Runs on every coordinator (re)connect.  Uses `relay_epoch` so a slow,
+/// older selection can never overwrite the result of a newer one.
+fn spawn_relay_selection(
+    state: Arc<CoreState>,
+    client: Arc<CoordinatorClient>,
+    preferred: Option<String>,
+) {
+    use std::sync::atomic::Ordering;
+    let epoch = state.relay_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    tokio::spawn(async move {
+        // Let the register round-trip complete first.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let device_id = state.net.read().await.local_device_id.clone();
+        // The persisted network setting wins over the config file.
+        let preferred = state.net_settings.read().await.preferred_relay.clone().or(preferred);
+
+        for attempt in 1..=RELAY_SELECT_ATTEMPTS {
+            if state.relay_epoch.load(Ordering::SeqCst) != epoch {
+                debug!("relay: selection epoch {} superseded", epoch);
+                return;
+            }
+            match crate::relay::select_best_relay(client.http(), client.coord_url(), &device_id, preferred.as_deref()).await {
+                Ok(addr) => {
+                    if state.relay_epoch.load(Ordering::SeqCst) != epoch {
+                        debug!("relay: discarding result of superseded selection {}", epoch);
+                        return;
+                    }
+                    let changed = {
+                        let mut net = state.net.write().await;
+                        let changed = net.relay_addr.as_deref() != Some(addr.as_str());
+                        net.relay_addr = Some(addr.clone());
+                        changed
+                    };
+                    if changed {
+                        state.next_generation();
+                    }
+                    info!("relay: using {}", addr);
+                    register_with_relay(&state, &addr, &device_id).await;
+                    // Announce our endpoints (now including the relay).
+                    crate::endpoints::spawn_detect_and_report(state.clone());
+                    return;
+                }
+                Err(e) => {
+                    warn!("relay: selection attempt {}/{} failed: {}", attempt, RELAY_SELECT_ATTEMPTS, e);
+                    if attempt < RELAY_SELECT_ATTEMPTS {
+                        tokio::time::sleep(RELAY_SELECT_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+        warn!("relay: no relay selected; relay-routed traffic unavailable until next coordinator reconnect");
+    });
+}
+
+/// Select and register a relay right now (room create/join), superseding
+/// any background selection.  Bounded by the probe timeouts (~10 s).
+pub(crate) async fn select_relay_now(state: &Arc<CoreState>, client: &CoordinatorClient) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    let epoch = state.relay_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    let device_id = state.net.read().await.local_device_id.clone();
+    let preferred = state.net_settings.read().await.preferred_relay.clone();
+    let addr = crate::relay::select_best_relay(client.http(), client.coord_url(), &device_id, preferred.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    if state.relay_epoch.load(Ordering::SeqCst) == epoch {
+        state.net.write().await.relay_addr = Some(addr.clone());
+        state.next_generation();
+    }
+    register_with_relay(state, &addr, &device_id).await;
+    Ok(addr)
+}
+
+async fn register_with_relay(state: &Arc<CoreState>, relay_addr: &str, device_id: &str) {
+    let Some(target) = crate::relay::resolve_addr(relay_addr).await else {
+        warn!("relay: cannot resolve {}", relay_addr);
+        return;
+    };
+    let pkt = relay::build_relay_register(device_id);
+    match state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
+        Ok(_) => info!("relay: registered with {}", relay_addr),
+        Err(e) => warn!("relay: register with {} failed: {}", relay_addr, e),
+    }
+}
+
+/// Refresh the relay's address mapping for us.
+async fn relay_keepalive_loop(state: Arc<CoreState>) {
+    loop {
+        // Re-read every cycle so a settings change applies without restart.
+        let secs = state.net_settings.read().await.relay_keepalive_secs().max(1);
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        let (relay_addr, device_id) = {
+            let net = state.net.read().await;
+            (net.relay_addr.clone(), net.local_device_id.clone())
+        };
+        let Some(relay_addr) = relay_addr else { continue };
+        if let Some(target) = crate::relay::resolve_addr(&relay_addr).await {
+            let pkt = relay::build_relay_keepalive(&device_id);
+            if let Err(e) = state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
+                warn!("relay: keepalive to {} failed: {}", relay_addr, e);
+            }
+        }
+    }
+}
+
+/// Every 5 s, ping our relay and every relay our peers are registered with,
+/// so path upgrades compare against the relay path the traffic really takes.
+async fn relay_rtt_loop(state: Arc<CoreState>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let (relays, device_id) = {
+            let mut net = state.net.write().await;
+            net.relay_rtt.purge_stale(std::time::Instant::now());
+            let mut relays: Vec<String> = net.relay_addr.iter().cloned().collect();
+            for id in net.peer_list.device_ids() {
+                if let Some(r) = net.peer_list.get(id).and_then(|e| e.preferred_relay.clone()) {
+                    if !relays.contains(&r) {
+                        relays.push(r);
+                    }
+                }
+            }
+            (relays, net.local_device_id.clone())
+        };
+        if device_id.is_empty() {
+            continue;
+        }
+        let pkt = relay::build_relay_rtt_ping(&device_id);
+        for addr in relays {
+            let Some(target) = crate::relay::resolve_addr(&addr).await else { continue };
+            let target = relay::unmap_addr(target);
+            if !state.net.write().await.relay_rtt.begin(&addr, target, std::time::Instant::now()) {
+                continue;
+            }
+            if let Err(e) = state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
+                debug!("relay: RTT ping to {} failed: {}", addr, e);
+            }
+        }
+    }
+}
+
+fn room_peer_data(p: &crate::coordinator::messages::RoomStatePeer) -> crate::nodes::PeerData<'_> {
+    crate::nodes::PeerData {
+        device_id: &p.device_id,
+        ipv4: &p.ipv4,
+        ipv6: &p.ipv6,
+        hostname: Some(&p.hostname),
+        display_name: p.device_display_name.clone(),
+        user_display_name: p.user_display_name.clone(),
+        public_key: &p.public_key,
+        endpoints: &p.endpoints,
+        is_authenticated: p.is_authenticated,
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler action execution
+// ---------------------------------------------------------------------------
+
+/// Execute a single `SchedulerAction` from the P2P scheduler.
+async fn execute_scheduler_action(
+    action: &SchedulerAction,
+    state: &Arc<CoreState>,
+    udp: &Arc<tokio::net::UdpSocket>,
+) {
+    match action {
+        SchedulerAction::UdpSend { data, target } => {
+            if let Err(e) = udp.send_to(data, relay::map_send_addr(*target)).await {
+                debug!("scheduler: UDP send to {} failed: {}", target, e);
+            }
+        }
+        SchedulerAction::PathModeChanged { peer_id, old_mode, new_mode } => {
+            info!("P2P: {} path {} → {}", peer_id, old_mode, new_mode);
+            crate::diagnostics::reset_traffic(state, peer_id);
+            state.emit_ipc_event(msst_ipc_protocol::IpcEvent::PathChanged {
+                device_id: peer_id.clone(),
+                old_mode: old_mode.clone(),
+                new_mode: new_mode.clone(),
+            });
+        }
+        SchedulerAction::DetectEndpoints => {
+            // Periodic (5 min) re-detection.  Skipped until a relay exists:
+            // relay selection triggers the first report itself.
+            if state.net.read().await.relay_addr.is_some() {
+                crate::endpoints::spawn_detect_and_report(state.clone());
+            }
+        }
+        SchedulerAction::ReportEndpoints { .. } => {
+            // Superseded by `endpoints::detect_and_report`.
+        }
+        SchedulerAction::IpcEvent { event_json } => {
+            // Forward raw event JSON to IPC.
+            debug!("scheduler: IPC event: {}", event_json);
+        }
+        SchedulerAction::WgEncryptedSend { peer_id, plaintext, target } => {
+            // Encrypt via WireGuard and send the ciphertext directly.
+            let ciphertext = {
+                let mut enc = state.encryption.lock().await;
+                enc.encapsulate(peer_id, plaintext)
+            };
+            match ciphertext {
+                Ok(data) => {
+                    if let Err(e) = udp.send_to(&data, relay::map_send_addr(*target)).await {
+                        debug!("scheduler: WG send to {} failed: {}", target, e);
+                    }
+                }
+                Err(e) => {
+                    debug!("scheduler: WG encapsulate failed for {}: {}", peer_id, e);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IP packet parsing (shared by inbound loop)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn parse_ip_packet(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
+    if data.is_empty() { return None; }
+    let version = data[0] >> 4;
+    match version {
+        4 => parse_ipv4(data),
+        6 => parse_ipv6(data),
+        _ => None,
+    }
+}
+
+fn parse_ipv4(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
+    if data.len() < 20 { return None; }
+    let ihl = (data[0] & 0x0F) as usize * 4;
+    if data.len() < ihl { return None; }
+    let proto_num = data[9];
+    let src_ip = std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15]);
+    let dst_ip = std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]);
+    let (proto, src_port, dst_port, is_echo) = match proto_num {
+        6 if data.len() >= ihl + 4 => (
+            packet::parsed::TransportProtocol::Tcp,
+            u16::from_be_bytes([data[ihl], data[ihl + 1]]),
+            u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]),
+            false,
+        ),
+        17 if data.len() >= ihl + 4 => (
+            packet::parsed::TransportProtocol::Udp,
+            u16::from_be_bytes([data[ihl], data[ihl + 1]]),
+            u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]),
+            false,
+        ),
+        1 => (packet::parsed::TransportProtocol::Icmp, 0, 0, data.len() > ihl && data[ihl] == 8),
+        n => (packet::parsed::TransportProtocol::Other(n), 0, 0, false),
+    };
+    Some(packet::parsed::ParsedPacket {
+        src_ip: std::net::IpAddr::V4(src_ip), dst_ip: std::net::IpAddr::V4(dst_ip),
+        proto, src_port, dst_port, is_icmp_echo_request: is_echo,
+    })
+}
+
+fn parse_ipv6(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
+    if data.len() < 40 { return None; }
+    let next_header = data[6];
+    let src_ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&data[8..24]).ok()?);
+    let dst_ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&data[24..40]).ok()?);
+    let (proto, src_port, dst_port, is_echo) = match next_header {
+        6 if data.len() >= 44 => (
+            packet::parsed::TransportProtocol::Tcp,
+            u16::from_be_bytes([data[40], data[41]]), u16::from_be_bytes([data[42], data[43]]), false,
+        ),
+        17 if data.len() >= 44 => (
+            packet::parsed::TransportProtocol::Udp,
+            u16::from_be_bytes([data[40], data[41]]), u16::from_be_bytes([data[42], data[43]]), false,
+        ),
+        58 => (packet::parsed::TransportProtocol::Icmp, 0, 0, data.len() > 40 && data[40] == 128),
+        n => (packet::parsed::TransportProtocol::Other(n), 0, 0, false),
+    };
+    Some(packet::parsed::ParsedPacket {
+        src_ip: std::net::IpAddr::V6(src_ip), dst_ip: std::net::IpAddr::V6(dst_ip),
+        proto, src_port, dst_port, is_icmp_echo_request: is_echo,
+    })
+}
+
+fn is_raw_ip_packet(data: &[u8]) -> bool {
+    if data.is_empty() { return false; }
+    let v = data[0] >> 4;
+    v == 4 || v == 6
+}
+
+pub(crate) fn current_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub(crate) fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ipv4_tcp() {
+        let mut data = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0,
+                           1, 2, 3, 4, 5, 6, 7, 8];
+        data.extend_from_slice(&[0x30, 0x39, 0x00, 0x50]);
+        data.extend_from_slice(&[0u8; 16]);
+        let pkt = parse_ip_packet(&data).unwrap();
+        assert_eq!(pkt.proto, packet::parsed::TransportProtocol::Tcp);
+        assert_eq!(pkt.src_port, 12345);
+        assert_eq!(pkt.dst_port, 80);
+    }
+
+    #[test]
+    fn parse_ipv4_icmp_echo() {
+        let data = vec![0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0, 0,
+                        10, 0, 0, 1, 10, 0, 0, 2, 8, 0, 0, 0];
+        let pkt = parse_ip_packet(&data).unwrap();
+        assert!(pkt.is_icmp_echo_request);
+    }
+
+    #[test]
+    fn parse_too_short() {
+        assert!(parse_ip_packet(&[]).is_none());
+        assert!(parse_ip_packet(&[0x45]).is_none());
+    }
+
+    // ── Outbound routing (end-to-end over loopback UDP) ──────────────────
+
+    async fn test_state() -> Arc<CoreState> {
+        let (ipc_tx, _ipc_rx) = mpsc::channel(64);
+        let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let state = Arc::new(CoreState::new(ipc_tx, udp, std::env::temp_dir()));
+        let id = crate::identity::Identity {
+            user: crate::identity::UserInfo { id: "user-11111111".into(), handle: String::new(), display_name: String::new() },
+            device: crate::identity::DeviceInfo {
+                id: "device-11111111".into(), handle: String::new(), display_name: String::new(),
+                hostname: String::new(), assigned_ipv4: None,
+            },
+            secret_key: [1u8; 32], public_key: [2u8; 32], auth: None,
+        };
+        state.apply_identity(&id).await;
+        state
+    }
+
+    async fn add_peer(state: &Arc<CoreState>, relay: Option<&str>) {
+        let mut net = state.net.write().await;
+        net.peer_list.upsert(
+            "device-a1b2c3d4", "172.22.178.196".parse().unwrap(), "fd22:2222:2222:2222::a1b2:c3d4".parse().unwrap(),
+            None, None, None, None, None, None, false, 0,
+        );
+        if let Some(r) = relay {
+            net.peer_list.update_relay("device-a1b2c3d4", r);
+        }
+    }
+
+    /// IPv4/UDP 172.22.144.209:5000 → 172.22.178.196:25565.
+    fn udp_packet() -> Vec<u8> {
+        let mut p = vec![0x45, 0, 0, 32, 0, 0, 0, 0, 64, 17, 0, 0,
+                         172, 22, 144, 209, 172, 22, 178, 196];
+        p.extend_from_slice(&[0x13, 0x88, 0x63, 0xdd, 0, 12, 0, 0]);
+        p.extend_from_slice(b"ping");
+        p
+    }
+
+    #[tokio::test]
+    async fn outbound_goes_via_peer_relay_as_msst_data() {
+        let state = test_state().await;
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        add_peer(&state, Some(&relay.local_addr().unwrap().to_string())).await;
+
+        let pkt = udp_packet();
+        let target = route_outbound_packet(&pkt, &state).await;
+        assert_eq!(target, Some(relay.local_addr().unwrap()));
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = relay.recv_from(&mut buf).await.unwrap();
+        let frame = msst_packet::MsstPacket::decode(&buf[..n]).unwrap();
+        assert_eq!(frame.packet_type, msst_packet::TYPE_DATA);
+        assert_eq!(msst_packet::decode_id(frame.src_id), "device-11111111");
+        assert_eq!(msst_packet::decode_id(frame.dst_id), "device-a1b2c3d4");
+        assert_eq!(frame.payload, pkt); // plaintext IP, same as 3.0.x
+
+        // The flow was recorded: the reply counts as related traffic.
+        let ct = state.conn_track.lock().unwrap();
+        assert!(ct.is_related(
+            "172.22.178.196".parse().unwrap(), 25565,
+            "172.22.144.209".parse().unwrap(), 5000,
+            17, current_unix(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn outbound_falls_back_to_own_relay() {
+        let state = test_state().await;
+        let own = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        add_peer(&state, None).await;
+        state.net.write().await.relay_addr = Some(own.local_addr().unwrap().to_string());
+        assert_eq!(route_outbound_packet(&udp_packet(), &state).await, Some(own.local_addr().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn outbound_drops_unknown_peer_and_no_relay() {
+        let state = test_state().await;
+        // Unknown destination.
+        assert_eq!(route_outbound_packet(&udp_packet(), &state).await, None);
+        // Known peer, but no relay at all.
+        add_peer(&state, None).await;
+        assert_eq!(route_outbound_packet(&udp_packet(), &state).await, None);
+        // Garbage.
+        assert_eq!(route_outbound_packet(&[0x00, 0x01], &state).await, None);
+    }
+
+    // ── Relay selection against a fake coordinator + fake relay ──────────
+
+    #[tokio::test]
+    async fn relay_selection_picks_echoing_relay() {
+        // Fake relay: echoes every datagram (like the real relay for TYPE_PING).
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, src)) = relay.recv_from(&mut buf).await {
+                let _ = relay.send_to(&buf[..n], src).await;
+            }
+        });
+        // Fake coordinator: one-shot HTTP response for GET /relays, listing a
+        // dead relay and the live one.
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = http.local_addr().unwrap().port();
+        let body = format!(r#"{{"relays":[{{"addr":"127.0.0.1:9"}},{{"addr":"{}"}}]}}"#, relay_addr);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut s, _) = http.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let n = s.read(&mut req).await.unwrap();
+            assert!(String::from_utf8_lossy(&req[..n]).starts_with("GET /relays "));
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let chosen = crate::relay::select_best_relay(
+            &reqwest::Client::new(), &format!("http://127.0.0.1:{}", port), "device-11111111", None,
+        ).await.unwrap();
+        assert_eq!(chosen, relay_addr.to_string());
+    }
+}

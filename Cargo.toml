@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/msst-ipc-protocol",
+    "crates/msst-core-state",
+    "crates/msst-acl-engine",
+    # Core daemon binary — added last so library crates compile first.
+    ".",
+]
+
+[workspace.package]
+version = "3.1.0-alpha.1"
+edition = "2024"
+license = "proprietary"
+
+# ── Shared dependency versions ────────────────────────────────────────────────
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# ── Core daemon binary ───────────────────────────────────────────────────────
+[package]
+name = "msst-net-core"
+version.workspace = true
+edition.workspace = true
+description = "MSST-Net Core — the privileged networking daemon."
+
+[lib]
+name = "msst_net_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "msst-net-core"
+path = "src/main.rs"
+
+[dependencies]
+msst-ipc-protocol = { path = "crates/msst-ipc-protocol" }
+msst-core-state   = { path = "crates/msst-core-state" }
+msst-acl-engine   = { path = "crates/msst-acl-engine" }
+serde_json.workspace = true
+serde.workspace = true
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+socket2 = { version = "0.5", features = ["all"] }
+tun2 = { version = "2", features = ["async"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures-util = "0.3"
+prometheus = "0.13"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+libc = "0.2"
+# Identity (ported from 3.0.x; same versions)
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+# Interface enumeration for discovery (already used by msst-core-state).
+if-addrs = "0.13"
+# Coordinator HTTP API (token refresh; later: nodes, relays, rooms). Same as 3.0.x.
+reqwest = { version = "0.12", features = ["json", "rustls-tls-webpki-roots"], default-features = false }
+# Windows: service host (SCM) and the named-pipe IPC transport (same crates
+# and versions as 3.0.x).
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.6"
+winapi = { version = "0.3", features = [
+    "handleapi",
+    "minwinbase",
+    "namedpipeapi",
+    "sddl",
+    "securitybaseapi",
+    "winbase",
+    "winnt",
+    "winerror",
+] }

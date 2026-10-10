@@ -1,0 +1,9 @@
+[package]
+name = "msst-acl-engine"
+version.workspace = true
+edition.workspace = true
+description = "MSST-Net ACL rule matching engine with structured decisions and deterministic priority."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

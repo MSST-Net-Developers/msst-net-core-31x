@@ -1,0 +1,10 @@
+[package]
+name = "msst-ipc-protocol"
+version.workspace = true
+edition.workspace = true
+description = "MSST-Net IPC protocol definitions — transport-agnostic message types for Core ↔ Controller communication."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

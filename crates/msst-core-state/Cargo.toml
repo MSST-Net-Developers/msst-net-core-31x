@@ -1,0 +1,16 @@
+[package]
+name = "msst-core-state"
+version.workspace = true
+edition.workspace = true
+description = "MSST-Net Core state containers with generation tracking and desired/observed state separation."
+
+[dependencies]
+msst-acl-engine = { path = "../msst-acl-engine" }
+serde.workspace = true
+serde_json.workspace = true
+tracing = "0.1"
+boringtun = "0.7"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+rand = "0.8"
+if-addrs = "0.13"
