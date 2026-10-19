@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +108,7 @@ impl Identity {
     }
 }
 
-fn derive_id(pubkey: &[u8; 32], prefix: &str) -> String {
+pub(crate) fn derive_id(pubkey: &[u8; 32], prefix: &str) -> String {
     let hash = Sha256::digest(pubkey);
     // First 4 bytes (8 hex chars) as the ID suffix.
     let hex_str: String = hash[..4].iter().map(|b| format!("{:02x}", b)).collect();
@@ -181,12 +181,28 @@ pub fn load_or_create(data_dir: &Path) -> Result<Identity> {
             device.id = format!("device-{}", hex);
             migrated = true;
         }
+        // The Coordinator only accepts a device ID derived from the key
+        // (keyproof v1, client change 3).  A mismatch means identity.json is
+        // stale relative to private.key (e.g. a regenerated key): re-derive
+        // the ID and drop what the Coordinator assigned to the old ID,
+        // instead of being rejected with `invalid_device_key` forever.
+        let derived = derive_id(&public_bytes, "device");
+        if device.id != derived {
+            warn!(
+                "identity: device ID {} does not match private.key — re-deriving {} (assigned IPv4 and hostname reset)",
+                device.id, derived
+            );
+            device.id = derived;
+            device.assigned_ipv4 = None;
+            device.hostname = String::new();
+            migrated = true;
+        }
         if migrated {
             let updated = IdentityFile { user: user.clone(), device: device.clone(), auth: auth.clone() };
             std::fs::write(&identity_path, serde_json::to_string_pretty(&updated)?).inspect_err(|e| {
                 error!("Failed to write migrated identity file {:?}: {}", identity_path, e)
             })?;
-            info!("Migrated legacy ID prefixes in {:?}", identity_path);
+            info!("Migrated identity file {:?}", identity_path);
         } else {
             debug!(
                 "Loaded identity file {:?} (user={}, device={})",
@@ -295,22 +311,26 @@ mod tests {
     fn reads_3_0_x_identity_file_and_migrates_legacy_prefixes() {
         let dir = temp_dir("legacy");
         // A key + identity file as written by 3.0.x (legacy prefixes).
+        let public = PublicKey::from(&StaticSecret::from([7u8; 32]));
+        let hex = derive_id(public.as_bytes(), "device").trim_start_matches("device-").to_string();
         std::fs::write(dir.join("private.key"), STANDARD.encode([7u8; 32])).unwrap();
         std::fs::write(
             dir.join("identity.json"),
-            r#"{"user":{"id":"usr-11223344","handle":"abjust","display_name":"A"},
-                "device":{"id":"dev-a1b2c3d4","handle":"pc","display_name":"PC",
-                          "hostname":"pc.abjust.ezplay.msst.net","assigned_ipv4":"172.22.9.9"},
-                "auth":{"user_id":"user-11223344","access_token":"t","refresh_token":"r","expires_at":1}}"#,
+            format!(
+                r#"{{"user":{{"id":"usr-11223344","handle":"abjust","display_name":"A"}},
+                "device":{{"id":"dev-{hex}","handle":"pc","display_name":"PC",
+                          "hostname":"pc.abjust.ezplay.msst.net","assigned_ipv4":"172.22.9.9"}},
+                "auth":{{"user_id":"user-11223344","access_token":"t","refresh_token":"r","expires_at":1}}}}"#
+            ),
         )
         .unwrap();
         let id = load_or_create(&dir).unwrap();
         assert_eq!(id.user.id, "user-11223344");
-        assert_eq!(id.device.id, "device-a1b2c3d4");
+        assert_eq!(id.device.id, format!("device-{}", hex));
         assert_eq!(id.device.hostname, "pc.abjust.ezplay.msst.net");
         assert!(id.auth.is_some());
         // Coordinator-assigned IPv4 wins over the derived one.
-        assert_eq!(id.virtual_ips(), ("172.22.9.9".into(), "fd22:2222:2222:2222::a1b2:c3d4".into()));
+        assert_eq!(id.virtual_ips().0, "172.22.9.9");
         // Canonical form for Controllers; the raw derivation is unchanged.
         let mut zero = id.clone();
         zero.device.id = "device-00000001".into();
@@ -320,7 +340,31 @@ mod tests {
         // Migration was written back.
         let reloaded: IdentityFile =
             serde_json::from_str(&std::fs::read_to_string(dir.join("identity.json")).unwrap()).unwrap();
-        assert_eq!(reloaded.device.id, "device-a1b2c3d4");
+        assert_eq!(reloaded.device.id, format!("device-{}", hex));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_device_id_is_rederived_from_key() {
+        let dir = temp_dir("stale-id");
+        std::fs::write(dir.join("private.key"), STANDARD.encode([1u8; 32])).unwrap();
+        std::fs::write(
+            dir.join("identity.json"),
+            r#"{"user":{"id":"user-11223344","handle":"abjust","display_name":"A"},
+                "device":{"id":"device-a1b2c3d4","handle":"pc","display_name":"PC",
+                          "hostname":"pc.abjust.ezplay.msst.net","assigned_ipv4":"172.22.9.9"}}"#,
+        )
+        .unwrap();
+        let id = load_or_create(&dir).unwrap();
+        // DEVICE_KEY_PROOF.md vector: key 32 × 0x01 → device-1a92f238.
+        assert_eq!(id.device.id, "device-1a92f238");
+        assert_eq!(id.device.assigned_ipv4, None);
+        assert_eq!(id.device.hostname, "");
+        // Handles, names and the user ID are kept.
+        assert_eq!((id.device.handle.as_str(), id.user.id.as_str()), ("pc", "user-11223344"));
+        let reloaded: IdentityFile =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("identity.json")).unwrap()).unwrap();
+        assert_eq!(reloaded.device.id, "device-1a92f238");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

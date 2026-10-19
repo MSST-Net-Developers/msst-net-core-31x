@@ -48,6 +48,10 @@ pub struct NetState {
     pub ping_enabled: bool,
     /// The relay server address we're registered with (numeric `IP:port`).
     pub relay_addr: Option<String>,
+    /// The secure-discovery key `GET /relays` advertised for `relay_addr`
+    /// (sdisc v1).  `None`: the relay doesn't support it — legacy discovery.
+    /// Always set together with `relay_addr`.
+    pub relay_pub_key: Option<[u8; 32]>,
     /// Peers' announced direct endpoints (P2P candidates), from room
     /// state, node fetches and node events.
     pub peer_endpoints: HashMap<String, Vec<std::net::SocketAddr>>,
@@ -70,6 +74,7 @@ impl NetState {
             local_user_id: String::new(),
             ping_enabled: false,
             relay_addr: None,
+            relay_pub_key: None,
             relay_rtt: crate::relay::RelayRttTracker::default(),
             peer_endpoints: HashMap::new(),
             coord_url: String::new(),
@@ -145,6 +150,8 @@ pub struct CoreState {
     pub dns: std::sync::OnceLock<Arc<crate::dns::DnsResolver>>,
     /// Outbound discovery-proxy queue (set when the TUN is up).
     pub discovery_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Secure-discovery (sdisc v1) counters.
+    pub sdisc_stats: crate::discovery::SdiscStats,
     /// Per-peer traffic counters (hot path; `std` lock + atomics).
     pub traffic: crate::diagnostics::TrafficMap,
     /// Diagnostic ping jobs.
@@ -198,6 +205,7 @@ impl CoreState {
             rule_ref_devices: std::sync::Mutex::new(HashSet::new()),
             dns: std::sync::OnceLock::new(),
             discovery_tx: std::sync::OnceLock::new(),
+            sdisc_stats: Default::default(),
             room_waiter: std::sync::Mutex::new(None),
             stun_waiters: std::sync::Mutex::new(HashMap::new()),
             endpoint_history: std::sync::Mutex::new(Default::default()),

@@ -30,6 +30,7 @@ mod ipc;
 mod observability;
 mod relay;
 mod rooms;
+mod sdisc;
 mod runtime;
 mod state;
 #[cfg(test)]

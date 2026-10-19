@@ -166,6 +166,10 @@ pub async fn relays(state: &CoreState) -> Result<Value, IpcError> {
     if body.is_object() {
         body["current"] = json!(net.relay_addr);
         body["rtt_ms"] = json!(net.relay_rtt.all());
+        // Additive: secure discovery state for the current relay.
+        let mut sd = state.sdisc_stats.snapshot();
+        sd["active"] = json!(net.relay_pub_key.is_some());
+        body["secure_discovery"] = sd;
     }
     Ok(body)
 }

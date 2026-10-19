@@ -59,6 +59,9 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
 rand = "0.8"
 sha2 = "0.10"
+# Secure discovery (sdisc v1) and device key proof (keyproof v1).
+hkdf = "0.12"
+hmac = "0.12"
 # Interface enumeration for discovery (already used by msst-core-state).
 if-addrs = "0.13"
 # Coordinator HTTP API (token refresh; later: nodes, relays, rooms). Same as 3.0.x.

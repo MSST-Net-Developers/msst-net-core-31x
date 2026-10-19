@@ -173,6 +173,17 @@ pub async fn re_register(state: &Arc<CoreState>) -> Result<Value, IpcError> {
             id.auth.as_ref().map(|a| a.access_token.clone()).filter(|t| !t.is_empty()),
         )
     };
+    let mut body = body;
+    // Cloned so the identity lock isn't held across the HTTP round trip.
+    let id = state.identity.read().await.clone().ok_or_else(|| err("not_initialized", "identity not loaded"))?;
+    let proof = crate::coordinator::keyproof::obtain(&client, &id).await;
+    match proof {
+        Ok(p) => crate::coordinator::keyproof::attach(&mut body, p),
+        Err(crate::coordinator::keyproof::ProofError::KeyMismatch) => {
+            return Err(err(crate::coordinator::keyproof::CODE_KEY_MISMATCH, crate::coordinator::keyproof::mismatch_message(&id.device.id)));
+        }
+        Err(crate::coordinator::keyproof::ProofError::Other(e)) => warn!("account: no key proof ({}) — registering without one", e),
+    }
     let (status, resp) = client
         .api_request(Method::POST, "/device/register", Some(&body), bearer.as_deref())
         .await
@@ -303,6 +314,12 @@ mod tests {
 
     use crate::test_support::{core_state, eventually, FakeCoordinator};
 
+    /// `identity.json` as written (the test identity's key isn't on disk,
+    /// so `load_or_create` would re-derive the device ID).
+    fn identity_on_disk(state: &CoreState) -> identity::IdentityFile {
+        serde_json::from_str(&std::fs::read_to_string(state.data_dir.join("identity.json")).unwrap()).unwrap()
+    }
+
     async fn with_client(state: &Arc<CoreState>, url: &str) {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         std::mem::forget(rx);
@@ -347,7 +364,7 @@ mod tests {
         assert!(state.net.read().await.local_authenticated);
         assert_eq!(state.net.read().await.local_user_id, "user-0000abcd");
         // Persisted.
-        let on_disk = crate::identity::load_or_create(&state.data_dir).unwrap();
+        let on_disk = identity_on_disk(&state);
         assert_eq!(on_disk.auth.unwrap().access_token, "AT");
 
         // Re-registered with the new token; coordinator hostname adopted.
@@ -377,10 +394,12 @@ mod tests {
 
         let out = update_handle(&state, Some("me".into()), Some("pc".into())).await.unwrap();
         assert_eq!((out["user_handle"].as_str(), out["device_handle"].as_str()), (Some("me"), Some("pc")));
-        let reg = coord.http_log.lock().unwrap()[0].clone();
+        let reg = coord.http_log.lock().unwrap().iter().find(|r| r.path == "/device/register").cloned().unwrap();
         assert_eq!(reg.body["device"]["handle"], "pc");
+        // The Coordinator has no keyproof (404): registered without a proof.
+        assert!(reg.body["device"].get("key_proof").is_none());
         assert_eq!(reg.body["network"]["hostname"], "pc.me.ezplay.msst.net");
-        let id = crate::identity::load_or_create(&state.data_dir).unwrap();
+        let id = identity_on_disk(&state);
         assert_eq!(id.device.handle, "pc");
         // Coordinator-assigned IPv4 recorded for next start.
         assert_eq!(id.device.assigned_ipv4.as_deref(), Some("172.22.9.9"));

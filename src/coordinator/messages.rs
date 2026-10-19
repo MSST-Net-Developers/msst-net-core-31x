@@ -163,6 +163,9 @@ pub struct PunchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorPayload {
     pub message: String,
+    /// Machine-readable code (Coordinator keyproof v1; absent before).
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

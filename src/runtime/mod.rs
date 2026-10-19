@@ -228,6 +228,12 @@ async fn inbound_loop(
                     }
                     msst_packet::TYPE_DISCOVERY_DATA => {
                         // Room discovery broadcast forwarded by the relay.
+                        // Unauthenticated: refused once secure discovery is
+                        // in use (only verified 0x0C on UDP 21032 then).
+                        if state.net.read().await.relay_pub_key.is_some() {
+                            debug!("inbound: dropped legacy discovery data (secure discovery in use)");
+                            continue;
+                        }
                         if let Some(ip) = crate::discovery::inbound_discovery_payload(&pkt.payload) {
                             let _ = tun_tx.send(ip).await;
                         }
@@ -562,7 +568,7 @@ async fn coordinator_event_loop(
             }
 
             // ── Coordinator error ─────────────────────────────────────────
-            CoordinatorEvent::Error { message } => {
+            CoordinatorEvent::Error { message, .. } => {
                 warn!("coordinator error: {}", message);
                 // Fail a pending join fast (e.g. wrong room password).
                 crate::rooms::notify_room_waiter(state, Err(message));
@@ -710,15 +716,17 @@ fn spawn_relay_selection(
                 return;
             }
             match crate::relay::select_best_relay(client.http(), client.coord_url(), &device_id, preferred.as_deref()).await {
-                Ok(addr) => {
+                Ok(selected) => {
                     if state.relay_epoch.load(Ordering::SeqCst) != epoch {
                         debug!("relay: discarding result of superseded selection {}", epoch);
                         return;
                     }
+                    let addr = selected.addr.clone();
                     let changed = {
                         let mut net = state.net.write().await;
-                        let changed = net.relay_addr.as_deref() != Some(addr.as_str());
+                        let changed = net.relay_addr.as_deref() != Some(addr.as_str()) || net.relay_pub_key != selected.pub_key;
                         net.relay_addr = Some(addr.clone());
+                        net.relay_pub_key = selected.pub_key;
                         changed
                     };
                     if changed {
@@ -749,11 +757,15 @@ pub(crate) async fn select_relay_now(state: &Arc<CoreState>, client: &Coordinato
     let epoch = state.relay_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     let device_id = state.net.read().await.local_device_id.clone();
     let preferred = state.net_settings.read().await.preferred_relay.clone();
-    let addr = crate::relay::select_best_relay(client.http(), client.coord_url(), &device_id, preferred.as_deref())
+    let selected = crate::relay::select_best_relay(client.http(), client.coord_url(), &device_id, preferred.as_deref())
         .await
         .map_err(|e| e.to_string())?;
+    let addr = selected.addr;
     if state.relay_epoch.load(Ordering::SeqCst) == epoch {
-        state.net.write().await.relay_addr = Some(addr.clone());
+        let mut net = state.net.write().await;
+        net.relay_addr = Some(addr.clone());
+        net.relay_pub_key = selected.pub_key;
+        drop(net);
         state.next_generation();
     }
     register_with_relay(state, &addr, &device_id).await;
@@ -1144,6 +1156,7 @@ mod tests {
         let chosen = crate::relay::select_best_relay(
             &reqwest::Client::new(), &format!("http://127.0.0.1:{}", port), "device-11111111", None,
         ).await.unwrap();
-        assert_eq!(chosen, relay_addr.to_string());
+        assert_eq!(chosen.addr, relay_addr.to_string());
+        assert_eq!(chosen.pub_key, None);
     }
 }

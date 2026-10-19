@@ -27,6 +27,7 @@
 //!     disconnect → drop channel (send() now fails fast) → backoff → retry
 //! ```
 
+pub mod keyproof;
 pub mod messages;
 
 use crate::identity::{self, Identity};
@@ -158,6 +159,8 @@ pub enum CoordinatorEvent {
     /// Coordinator sent an error.
     Error {
         message: String,
+        /// Machine-readable code, when the Coordinator sends one.
+        code: Option<String>,
     },
 }
 
@@ -169,6 +172,11 @@ enum ConnectOutcome {
     Failed,
     /// HTTP 401 that token refresh could not fix.
     AuthRequired,
+    /// The Coordinator rejected our registration.  Unlike `Disconnected`,
+    /// the backoff keeps growing: reconnecting at once would fail the same way.
+    RegisterRejected,
+    /// The device ID is pinned to another key (`device_key_mismatch`).
+    KeyMismatch,
 }
 
 impl CoordinatorClient {
@@ -195,13 +203,25 @@ impl CoordinatorClient {
 
         let mut backoff = BACKOFF_MIN_SECS;
         let mut auth_required_reported = false;
+        let mut key_mismatch_reported = false;
         loop {
             match self.connect_once(&core).await {
                 ConnectOutcome::Disconnected => {
                     backoff = BACKOFF_MIN_SECS;
                     auth_required_reported = false;
+                    key_mismatch_reported = false;
                 }
-                ConnectOutcome::Failed => {}
+                ConnectOutcome::Failed | ConnectOutcome::RegisterRejected => {}
+                ConnectOutcome::KeyMismatch => {
+                    // Surface once per streak; retries stay at the backoff
+                    // ceiling (an administrator may unpin the ID).
+                    if !key_mismatch_reported {
+                        let id = core.net.read().await.local_device_id.clone();
+                        error!("{}", keyproof::mismatch_message(&id));
+                        key_mismatch_reported = true;
+                    }
+                    backoff = BACKOFF_MAX_SECS;
+                }
                 ConnectOutcome::AuthRequired => {
                     // Report once per streak so a missing login doesn't spam
                     // the Controller every backoff cycle.
@@ -299,10 +319,24 @@ impl CoordinatorClient {
         };
         info!("coordinator: WebSocket connected");
 
+        // Key proof (keyproof v1): one fresh challenge per registration,
+        // requested after the WS is open so it can't expire in between.
+        let mut register = build_register_message(&identity);
+        match keyproof::obtain(self, &identity).await {
+            Ok(proof) => keyproof::attach(&mut register["data"], proof),
+            Err(keyproof::ProofError::KeyMismatch) => {
+                self.set_state(core, ConnectionState::Disconnected).await;
+                return ConnectOutcome::KeyMismatch;
+            }
+            Err(keyproof::ProofError::Other(e)) => {
+                warn!("coordinator: no key proof ({}) — registering without one", e);
+            }
+        }
+
         // Fresh outgoing channel for this connection.  `register` goes first
         // so the coordinator knows who we are before any other message.
         let (tx, rx) = mpsc::channel::<String>(64);
-        let _ = tx.send(build_register_message(&identity).to_string()).await;
+        let _ = tx.send(register.to_string()).await;
         let rooms: Vec<String> = core.net.read().await.joined_rooms.keys().cloned().collect();
         for room_id in &rooms {
             // The coordinator ties discovery-proxy registration to the WS
@@ -319,9 +353,24 @@ impl CoordinatorClient {
         let (ws_writer, mut ws_reader) = ws_stream.split();
         let writer_task = tokio::spawn(writer_loop(ws_writer, rx, core.clone()));
 
+        let mut outcome = ConnectOutcome::Disconnected;
         while let Some(msg) = ws_reader.next().await {
             match msg {
                 Ok(Message::Text(text)) => match self.parse_incoming(&text) {
+                    Ok(Some(CoordinatorEvent::Error { code: Some(code), .. }))
+                        if [keyproof::CODE_KEY_MISMATCH, keyproof::CODE_PROOF_INVALID, keyproof::CODE_PROOF_REQUIRED]
+                            .contains(&code.as_str()) =>
+                    {
+                        // Registration refused; the connection is useless.
+                        // A proof error is retried with a fresh challenge.
+                        warn!("coordinator: registration rejected ({}), reconnecting with backoff", code);
+                        outcome = if code == keyproof::CODE_KEY_MISMATCH {
+                            ConnectOutcome::KeyMismatch
+                        } else {
+                            ConnectOutcome::RegisterRejected
+                        };
+                        break;
+                    }
                     Ok(Some(event)) => {
                         if self.event_tx.send(event).await.is_err() {
                             warn!("coordinator: event receiver dropped");
@@ -350,7 +399,7 @@ impl CoordinatorClient {
         *self.conn_tx.write().await = None;
         writer_task.abort();
         self.set_state(core, ConnectionState::Disconnected).await;
-        ConnectOutcome::Disconnected
+        outcome
     }
 
     async fn open_ws(
@@ -820,6 +869,7 @@ impl CoordinatorClient {
                 warn!("coordinator error: {}", data.message);
                 Ok(Some(CoordinatorEvent::Error {
                     message: data.message,
+                    code: data.code,
                 }))
             }
             other => {
@@ -952,7 +1002,7 @@ mod tests {
         let json = r#"{"type":"error","data":{"message":"room not found"}}"#;
         let event = client.parse_incoming(json).unwrap().unwrap();
         match event {
-            CoordinatorEvent::Error { message } => {
+            CoordinatorEvent::Error { message, .. } => {
                 assert_eq!(message, "room not found");
             }
             _ => panic!("expected Error"),
@@ -1128,8 +1178,26 @@ mod tests {
             tokio::spawn(async move { client.run(core).await })
         };
 
+        // Acceptor: WebSocket upgrades go to the test; the key-challenge
+        // POST is answered like a Coordinator without keyproof (404).
+        let (ws_conn_tx, mut ws_conns) = mpsc::channel(4);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let mut peek = [0u8; 4];
+                let n = tcp.peek(&mut peek).await.unwrap_or(0);
+                if peek[..n].starts_with(b"GET") {
+                    let _ = ws_conn_tx.send(tcp).await;
+                } else {
+                    let mut req = [0u8; 2048];
+                    let _ = tcp.read(&mut req).await;
+                    let _ = tcp.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                }
+            }
+        });
+
         for round in 0..2 {
-            let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            let tcp = tokio::time::timeout(Duration::from_secs(10), ws_conns.recv())
                 .await.expect("client did not (re)connect").unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let mut types = Vec::new();

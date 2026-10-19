@@ -162,6 +162,25 @@ pub async fn core_state(name: &str) -> (Arc<CoreState>, mpsc::Receiver<msst_ipc_
     (state, ipc_rx)
 }
 
+/// An identity whose IDs and public key are derived from `secret_key`
+/// (what the Coordinator accepts).
+pub fn identity_with_key(secret_key: [u8; 32]) -> crate::identity::Identity {
+    let public_key = *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret_key)).as_bytes();
+    crate::identity::Identity {
+        user: crate::identity::UserInfo { id: crate::identity::derive_id(&public_key, "user"), handle: String::new(), display_name: String::new() },
+        device: crate::identity::DeviceInfo {
+            id: crate::identity::derive_id(&public_key, "device"),
+            handle: String::new(),
+            display_name: String::new(),
+            hostname: String::new(),
+            assigned_ipv4: None,
+        },
+        secret_key,
+        public_key,
+        auth: None,
+    }
+}
+
 /// Poll `f` until true (2 s max).
 pub async fn eventually(mut f: impl FnMut() -> bool) -> bool {
     for _ in 0..100 {
