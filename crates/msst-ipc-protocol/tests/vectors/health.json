@@ -17,6 +17,7 @@
         "device_hostname": null,
         "device_id": "device-00000001",
         "generation": 0,
+        "ipc_role": "admin",
         "is_authenticated": false,
         "local_device_id": "device-00000001",
         "local_user_id": "user-00000001",

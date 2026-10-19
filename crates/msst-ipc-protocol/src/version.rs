@@ -21,13 +21,14 @@
 /// Bump minor when new request/response/event types are added (forward-compatible).
 /// Bump patch for non-semantic fixes (doc comments, field renames that don't
 /// affect JSON).
-pub const PROTOCOL_VERSION: u32 = make_version(0, 3, 0);
+pub const PROTOCOL_VERSION: u32 = make_version(0, 4, 0);
 
 // History:
 // 0.1 — initial 3.1 protocol.
 // 0.2 — `GetServices`.
 // 0.3 — `ClearAclRules`; events `AccessRequestResolved`, `IdentityChanged`,
 //       `SettingsChanged`; documented `generation` and error codes.
+// 0.4 — permission model (`access`, `permission_denied`, `Health.ipc_role`).
 
 /// Minimum protocol version this build can speak to.
 ///

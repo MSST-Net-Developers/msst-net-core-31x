@@ -41,10 +41,13 @@ pub const ROOM_REJECTED: &str = "room_rejected";
 /// Core could not save the change to disk (nothing was changed).
 pub const PERSIST_FAILED: &str = "persist_failed";
 
+/// The connection's role does not allow this request (0.4; see `access`).
+pub const PERMISSION_DENIED: &str = "permission_denied";
+
 /// Every code above.
 pub const ALL: &[&str] = &[
     INVALID_REQUEST, INVALID_RULE, INVALID_PATCH, INVALID_GROUP, INVALID_SETTINGS, INVALID_HANDLE,
     NOT_FOUND, MNEMONIC_NOT_FOUND, NOT_INITIALIZED, NOT_AUTHENTICATED, AUTH_FAILED,
     COORDINATOR_UNAVAILABLE, COORDINATOR_ERROR, REGISTER_FAILED, RELAY_UNAVAILABLE,
-    ROOM_CREATE_FAILED, ROOM_REJECTED, PERSIST_FAILED,
+    ROOM_CREATE_FAILED, ROOM_REJECTED, PERSIST_FAILED, PERMISSION_DENIED,
 ];

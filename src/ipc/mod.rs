@@ -6,9 +6,12 @@
 //! ## Transport
 //!
 //! - **Linux/macOS**: Unix domain socket (`/run/msst-net/ipc.sock` as root),
-//!   access checked by peer UID (`auth.rs`)
+//!   access and role from the peer UID (`auth.rs`)
 //! - **Windows**: named pipe `\\.\pipe\msst-net-ipc`, access restricted by
-//!   its ACL (`windows_pipe.rs`)
+//!   its ACL, role from the client's token (`windows_pipe.rs`)
+//!
+//! Each connection gets a role (viewer / admin, protocol 0.4); the handler
+//! refuses requests above it with `permission_denied`.
 //!
 //! The protocol layer (`serve_client`) is generic over any
 //! `AsyncRead + AsyncWrite` stream; transports only accept connections and
@@ -17,8 +20,9 @@
 //! ## Connection lifecycle
 //!
 //! ```text
-//! accept → authorize peer (Unix: SO_PEERCRED UID check)
+//! accept → authorize peer (Unix: SO_PEERCRED UID → role or refuse)
 //!        → version handshake (u32 BE both ways; incompatible → close)
+//!        → Windows: role from the impersonated client token
 //!        → frames: [len: u32 BE][JSON IpcMessage]
 //!             Controller → Core: Request{id}
 //!             Core → Controller: Response{id} (same id) | Event
@@ -40,7 +44,7 @@ mod windows_pipe;
 use crate::state::CoreState;
 use handler::handle_request;
 use msst_ipc_protocol::version::PROTOCOL_VERSION;
-use msst_ipc_protocol::{IpcEvent, IpcMessage};
+use msst_ipc_protocol::{IpcEvent, IpcMessage, Role};
 #[cfg(test)]
 use msst_ipc_protocol::{IpcRequest, IpcResponse};
 use std::sync::Arc;
@@ -127,16 +131,16 @@ impl IpcServer {
                     continue;
                 }
             };
-            if !auth::is_peer_authorized(uid) {
+            let Some(role) = auth::peer_role(uid) else {
                 warn!("IPC: rejected connection from unauthorized uid={}", uid);
                 continue; // dropping the stream closes it
-            }
-            let peer = format!("uid={}", uid);
+            };
+            let peer = format!("uid={}, role={}", uid, role.as_str());
             info!("IPC client connected ({})", peer);
             let state = self.state.clone();
             let events = self.event_tx.subscribe();
             tokio::spawn(async move {
-                serve_client(stream, state, events).await;
+                serve_client(stream, state, events, move |_| Some(role)).await;
                 info!("IPC client disconnected ({})", peer);
             });
         }
@@ -176,7 +180,7 @@ impl IpcServer {
             let state = self.state.clone();
             let events = self.event_tx.subscribe();
             tokio::spawn(async move {
-                serve_client(connected, state, events).await;
+                serve_client(connected, state, events, windows_pipe::client_role).await;
                 info!("IPC client disconnected (named pipe)");
             });
         }
@@ -187,17 +191,33 @@ impl IpcServer {
 // Per-client protocol handling (transport-independent)
 // ---------------------------------------------------------------------------
 
-/// Serve one authorized Controller connection until it closes.
-pub async fn serve_client<S>(stream: S, state: Arc<CoreState>, mut events: broadcast::Receiver<IpcEvent>)
-where
-    S: AsyncRead + AsyncWrite + Send + 'static,
-{
-    let (mut reader, mut writer) = tokio::io::split(stream);
+/// Per-connection state handlers can see.
+#[derive(Debug)]
+pub struct Session {
+    /// Permission tier, fixed for the connection's lifetime.
+    pub role: Role,
+}
 
+impl Session {
+    pub fn new(role: Role) -> Self {
+        Session { role }
+    }
+}
+
+/// Serve one Controller connection until it closes.
+///
+/// `authorize` runs after the version handshake (Windows can only
+/// impersonate a pipe client after reading from it) and returns the
+/// connection's role, or `None` to refuse it.
+pub async fn serve_client<S, A>(mut stream: S, state: Arc<CoreState>, mut events: broadcast::Receiver<IpcEvent>, authorize: A)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: FnOnce(&S) -> Option<Role>,
+{
     // ── Version handshake: both sides send first, then read ──────────────
     if let Err(e) = async {
-        writer.write_all(&PROTOCOL_VERSION.to_be_bytes()).await?;
-        writer.flush().await
+        stream.write_all(&PROTOCOL_VERSION.to_be_bytes()).await?;
+        stream.flush().await
     }
     .await
     {
@@ -205,7 +225,7 @@ where
         return;
     }
     let mut remote = [0u8; 4];
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.read_exact(&mut remote)).await {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut remote)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             warn!("IPC: failed to read Controller version: {}", e);
@@ -227,6 +247,13 @@ where
         return;
     }
     info!("IPC: Controller protocol {}.{}.{}", rmaj, rmin, rpat);
+
+    let Some(role) = authorize(&stream) else {
+        warn!("IPC: connection refused after handshake");
+        return;
+    };
+    let session = Session::new(role);
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     // ── Single writer: responses and events share one ordered queue ──────
     let (out_tx, mut out_rx) = mpsc::channel::<IpcMessage>(CLIENT_QUEUE);
@@ -311,7 +338,7 @@ where
         };
         match serde_json::from_str::<IpcMessage>(&json) {
             Ok(IpcMessage::Request { id, body }) => {
-                let response = handle_request(body, &state).await;
+                let response = handle_request(body, &state, &session).await;
                 if out_tx.send(IpcMessage::Response { id, body: response }).await.is_err() {
                     break; // writer gone
                 }
@@ -485,8 +512,17 @@ mod tests {
         events: &broadcast::Sender<IpcEvent>,
         version: u32,
     ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        connect_as(state, events, version, Role::Admin).await
+    }
+
+    async fn connect_as(
+        state: Arc<CoreState>,
+        events: &broadcast::Sender<IpcEvent>,
+        version: u32,
+        role: Role,
+    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
-        let task = tokio::spawn(serve_client(server, state, events.subscribe()));
+        let task = tokio::spawn(serve_client(server, state, events.subscribe(), move |_| Some(role)));
         let mut v = [0u8; 4];
         client.read_exact(&mut v).await.unwrap();
         assert_eq!(u32::from_be_bytes(v), PROTOCOL_VERSION);
@@ -605,5 +641,43 @@ mod tests {
             }
         }
         assert!(seen);
+    }
+
+    #[tokio::test]
+    async fn viewer_may_query_but_not_command() {
+        let (state, events) = test_state().await;
+        let (mut client, _t) = connect_as(state, &events, PROTOCOL_VERSION, Role::Viewer).await;
+        request(&mut client, "q", IpcRequest::Health).await;
+        match next(&mut client).await {
+            IpcMessage::Response { id, body: IpcResponse::Ok(v) } => {
+                assert_eq!(id, "q");
+                assert_eq!(v["ipc_role"], "viewer");
+            }
+            other => panic!("expected Health, got {:?}", other),
+        }
+        request(&mut client, "c", IpcRequest::ClearAclRules).await;
+        match next(&mut client).await {
+            IpcMessage::Response { id, body: IpcResponse::Error(e) } => {
+                assert_eq!(id, "c");
+                assert_eq!(e.code, "permission_denied");
+            }
+            other => panic!("expected permission_denied, got {:?}", other),
+        }
+        // The connection stays usable.
+        request(&mut client, "q2", IpcRequest::GetNodes).await;
+        assert!(matches!(next(&mut client).await, IpcMessage::Response { id, body: IpcResponse::Ok(_) } if id == "q2"));
+    }
+
+    #[tokio::test]
+    async fn refused_after_handshake_is_closed() {
+        let (state, events) = test_state().await;
+        let (mut client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(serve_client(server, state, events.subscribe(), |_| None));
+        let mut v = [0u8; 4];
+        client.read_exact(&mut v).await.unwrap();
+        client.write_all(&PROTOCOL_VERSION.to_be_bytes()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(client.read(&mut buf).await.unwrap(), 0);
     }
 }

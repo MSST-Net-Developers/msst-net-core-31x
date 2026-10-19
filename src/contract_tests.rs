@@ -61,7 +61,8 @@ fn check(name: &str, mut frames: Value, mismatches: &mut Vec<String>) {
 
 async fn query(state: &Arc<CoreState>, name: &str, request: IpcRequest, mismatches: &mut Vec<String>) {
     let req = IpcMessage::Request { id: "1".into(), body: request.clone() };
-    let resp = IpcMessage::Response { id: "1".into(), body: crate::ipc::handler::handle_request(request, state).await };
+    let session = crate::ipc::Session::new(msst_ipc_protocol::Role::Admin);
+    let resp = IpcMessage::Response { id: "1".into(), body: crate::ipc::handler::handle_request(request, state, &session).await };
     check(name, json!({ "request": req, "response": resp }), mismatches);
 }
 
@@ -243,7 +244,8 @@ async fn every_error_code_is_documented() {
 async fn health_reports_tun_and_auth_state_accurately() {
     let (state, _rx) = crate::test_support::core_state("health").await;
     let h = |state: Arc<CoreState>| async move {
-        match crate::ipc::handler::handle_request(IpcRequest::Health, &state).await {
+        let session = crate::ipc::Session::new(msst_ipc_protocol::Role::Admin);
+        match crate::ipc::handler::handle_request(IpcRequest::Health, &state, &session).await {
             msst_ipc_protocol::IpcResponse::Ok(v) => v,
             e => panic!("{:?}", e),
         }

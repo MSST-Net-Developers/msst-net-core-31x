@@ -74,6 +74,7 @@ winapi = { version = "0.3", features = [
     "handleapi",
     "minwinbase",
     "namedpipeapi",
+    "processthreadsapi",
     "sddl",
     "securitybaseapi",
     "winbase",

@@ -35,9 +35,11 @@
 //! [length: u32 BE] [JSON payload: `length` bytes]
 //! ```
 
+pub mod access;
 pub mod errors;
 pub mod message;
 pub mod version;
 
+pub use access::Role;
 pub use message::{IpcMessage, IpcRequest, IpcResponse, IpcEvent, IpcError, AuthDecision};
 pub use version::PROTOCOL_VERSION;

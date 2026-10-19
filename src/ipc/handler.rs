@@ -5,6 +5,7 @@
 //! a response.  No I/O, no side effects (except for Commands, which
 //! return an "accepted" response and the actual work happens async).
 
+use super::Session;
 use crate::state::CoreState;
 use msst_ipc_protocol::{IpcError, IpcRequest, IpcResponse};
 use reqwest::Method;
@@ -13,12 +14,21 @@ use tracing::{debug, info, warn};
 
 /// Handle a single IPC request and return a response.
 ///
-/// This is the main dispatch function.  It matches the request type and
+/// This is the main dispatch function.  It enforces the permission model
+/// (`msst_ipc_protocol::access`), then matches the request type and
 /// delegates to the appropriate handler.
-pub async fn handle_request(request: IpcRequest, state: &Arc<CoreState>) -> IpcResponse {
+pub async fn handle_request(request: IpcRequest, state: &Arc<CoreState>, session: &Session) -> IpcResponse {
+    let required = request.required_role();
+    if required > session.role {
+        debug!("IPC: {:?} needs {}, connection is {}", request.kind(), required.as_str(), session.role.as_str());
+        return IpcResponse::Error(IpcError {
+            code: "permission_denied".into(),
+            message: format!("this connection is {}; the request needs {}", session.role.as_str(), required.as_str()),
+        });
+    }
     match request {
         // ── Queries ────────────────────────────────────────────────────────
-        IpcRequest::Health => handle_health(state).await,
+        IpcRequest::Health => handle_health(state, session).await,
         IpcRequest::GetSystemState => handle_get_system_state(state).await,
         IpcRequest::GetNodes => handle_get_nodes(state).await,
         IpcRequest::GetNode { device_id } => handle_get_node(state, &device_id).await,
@@ -114,7 +124,7 @@ fn respond(result: Result<serde_json::Value, IpcError>) -> IpcResponse {
 // Query handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_health(state: &Arc<CoreState>) -> IpcResponse {
+async fn handle_health(state: &Arc<CoreState>, session: &Session) -> IpcResponse {
     let now = crate::runtime::current_unix();
     let coordinator = match state.coordinator.get() {
         Some(c) => c.connection_state().await,
@@ -127,6 +137,8 @@ async fn handle_health(state: &Arc<CoreState>) -> IpcResponse {
     IpcResponse::Ok(serde_json::json!({
         "status": "ok",
         "generation": state.generation.current(),
+        // This connection's permission tier (0.4).
+        "ipc_role": session.role.as_str(),
         "device_id": id.map(|i| i.device.id.clone()),
         "user_id": id.map(|i| i.user.id.clone()),
         // Unset names/handles are null, not "".
