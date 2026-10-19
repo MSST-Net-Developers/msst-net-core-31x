@@ -411,10 +411,8 @@ mod tests {
     }
 
     async fn state_with_coordinator(url: &str) -> Arc<CoreState> {
-        let (ipc_tx, _rx) = mpsc::channel(64);
-        std::mem::forget(_rx);
         let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let state = Arc::new(CoreState::new(ipc_tx, udp, std::env::temp_dir()));
+        let state = Arc::new(CoreState::new(udp, std::env::temp_dir()));
         state.net.write().await.local_user_id = "user-00000001".into();
         let (ev_tx, _ev_rx) = mpsc::channel(4);
         std::mem::forget(_ev_rx);

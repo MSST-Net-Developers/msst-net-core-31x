@@ -19,7 +19,6 @@ use msst_ipc_protocol::{IpcEvent, IpcMessage, IpcRequest};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 fn vectors_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/msst-ipc-protocol/tests/vectors")
@@ -32,6 +31,8 @@ fn normalize(v: &mut Value) {
             for (k, val) in map.iter_mut() {
                 match k.as_str() {
                     "generation" | "timestamp_ms" | "last_outbound_unix" | "reported_at" if val.is_number() => *val = json!(0),
+                    // Event stream positions depend on the fixture's history.
+                    "seq" | "event_seq" if val.is_number() => *val = json!(1),
                     "expires_in_secs" if val.is_number() => *val = json!(60),
                     "request_id" if val.is_string() => *val = json!("<request_id>"),
                     _ => normalize(val),
@@ -62,11 +63,12 @@ fn check(name: &str, mut frames: Value, mismatches: &mut Vec<String>) {
 async fn query(state: &Arc<CoreState>, name: &str, request: IpcRequest, mismatches: &mut Vec<String>) {
     let req = IpcMessage::Request { id: "1".into(), body: request.clone() };
     let session = crate::ipc::Session::new(msst_ipc_protocol::Role::Admin);
-    let resp = IpcMessage::Response { id: "1".into(), body: crate::ipc::handler::handle_request(request, state, &session).await };
+    let event_seq = Some(state.events.last_seq());
+    let resp = IpcMessage::Response { id: "1".into(), body: crate::ipc::handler::handle_request(request, state, &session).await, event_seq };
     check(name, json!({ "request": req, "response": resp }), mismatches);
 }
 
-fn drain(rx: &mut mpsc::Receiver<IpcEvent>) -> Vec<IpcEvent> {
+fn drain(rx: &mut crate::state::EventReceiver) -> Vec<IpcEvent> {
     let mut v = Vec::new();
     while let Ok(e) = rx.try_recv() {
         v.push(e);
@@ -75,13 +77,13 @@ fn drain(rx: &mut mpsc::Receiver<IpcEvent>) -> Vec<IpcEvent> {
 }
 
 fn event_frame(e: &IpcEvent) -> Value {
-    serde_json::to_value(IpcMessage::Event { body: e.clone() }).unwrap()
+    serde_json::to_value(IpcMessage::Event { body: e.clone(), seq: Some(1) }).unwrap()
 }
 
 /// The deterministic fixture: one known peer in a room, one rule, one
 /// group, one access-log entry, one pending request, a contact, traffic,
 /// an endpoint report, a path, and a log line.
-async fn fixture(name: &str) -> (Arc<CoreState>, mpsc::Receiver<IpcEvent>) {
+async fn fixture(name: &str) -> (Arc<CoreState>, crate::state::EventReceiver) {
     let (state, ipc_rx) = crate::test_support::core_state(name).await;
     crate::nodes::apply_peer(&state, crate::nodes::PeerData {
         device_id: "device-0000000b",

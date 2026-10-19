@@ -28,7 +28,9 @@ pub const PROTOCOL_VERSION: u32 = make_version(0, 4, 0);
 // 0.2 — `GetServices`.
 // 0.3 — `ClearAclRules`; events `AccessRequestResolved`, `IdentityChanged`,
 //       `SettingsChanged`; documented `generation` and error codes.
-// 0.4 — permission model (`access`, `permission_denied`, `Health.ipc_role`).
+// 0.4 — permission model (`access`, `permission_denied`, `Health.ipc_role`);
+//       event `seq` / response `event_seq`; responses may be out of order
+//       (queries run concurrently).
 
 /// Minimum protocol version this build can speak to.
 ///

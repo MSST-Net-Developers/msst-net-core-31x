@@ -52,7 +52,6 @@ impl Core {
         let CoreOptions { mut config, data_dir, ipc_socket, metrics } = opts;
         info!("data directory: {:?}", data_dir);
 
-        let (ipc_event_tx, ipc_event_rx) = mpsc::channel::<msst_ipc_protocol::IpcEvent>(64);
         let udp = Arc::new(crate::make_udp_socket(config.udp_port)?);
         info!("UDP socket listening on [::]:{}", config.udp_port);
 
@@ -71,7 +70,7 @@ impl Core {
             settings.disable_p2p, settings.lock_path, settings.keepalive_secs, config.tun_mtu
         );
 
-        let state = Arc::new(CoreState::new(ipc_event_tx, udp.clone(), data_dir.clone()));
+        let state = Arc::new(CoreState::new(udp.clone(), data_dir.clone()));
         state.apply_identity(&identity).await;
         *state.net_settings.write().await = settings;
         state.apply_net_settings().await;
@@ -84,7 +83,7 @@ impl Core {
 
         // IPC is bound before any task starts: a Core nobody can manage must
         // not start at all (and must not leave tasks behind).
-        let (server, _subscriber) = IpcServer::new(state.clone(), ipc_event_rx);
+        let server = IpcServer::new(state.clone());
         #[cfg(unix)]
         let listener = IpcServer::bind_unix(&ipc_socket)
             .map_err(|e| anyhow::anyhow!("cannot bind IPC socket {:?}: {}", ipc_socket, e))?;

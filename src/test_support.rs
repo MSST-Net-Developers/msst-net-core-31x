@@ -6,7 +6,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 /// A recorded HTTP request.
@@ -137,13 +136,13 @@ pub async fn echo_relay() -> std::net::SocketAddr {
 }
 
 /// A Core state with an identity, in its own temp data dir.
-pub async fn core_state(name: &str) -> (Arc<CoreState>, mpsc::Receiver<msst_ipc_protocol::IpcEvent>) {
+pub async fn core_state(name: &str) -> (Arc<CoreState>, crate::state::EventReceiver) {
     let dir = std::env::temp_dir().join(format!("msst-test-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let (ipc_tx, ipc_rx) = mpsc::channel(256);
     let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let state = Arc::new(CoreState::new(ipc_tx, udp, dir));
+    let state = Arc::new(CoreState::new(udp, dir));
+    let ipc_rx = state.subscribe_events();
     let id = crate::identity::Identity {
         user: crate::identity::UserInfo { id: "user-00000001".into(), handle: String::new(), display_name: String::new() },
         device: crate::identity::DeviceInfo {

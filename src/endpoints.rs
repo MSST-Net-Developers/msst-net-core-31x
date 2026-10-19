@@ -238,9 +238,8 @@ mod tests {
             let _ = body_tx.send(req);
         });
 
-        let (ipc_tx, _ipc_rx) = tokio::sync::mpsc::channel(8);
         let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let state = Arc::new(CoreState::new(ipc_tx, udp, std::env::temp_dir()));
+        let state = Arc::new(CoreState::new(udp, std::env::temp_dir()));
         {
             let mut net = state.net.write().await;
             net.local_device_id = "device-00000001".into();

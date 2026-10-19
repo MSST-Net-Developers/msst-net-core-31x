@@ -476,7 +476,7 @@ mod tests {
 
     struct Harness {
         state: Arc<CoreState>,
-        ipc_rx: mpsc::Receiver<IpcEvent>,
+        ipc_rx: crate::state::EventReceiver,
         tun_tx: mpsc::Sender<Vec<u8>>,
         tun_rx: mpsc::Receiver<Vec<u8>>,
         relay: tokio::net::UdpSocket,
@@ -488,9 +488,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("msst-inbound-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (ipc_tx, ipc_rx) = mpsc::channel(64);
         let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let state = Arc::new(CoreState::new(ipc_tx, udp, dir));
+        let state = Arc::new(CoreState::new(udp, dir));
+        let ipc_rx = state.subscribe_events();
         let id = crate::identity::Identity {
             user: crate::identity::UserInfo { id: "user-00000001".into(), handle: String::new(), display_name: String::new() },
             device: crate::identity::DeviceInfo {
@@ -526,7 +526,7 @@ mod tests {
         p
     }
 
-    fn auth_request_id(rx: &mut mpsc::Receiver<IpcEvent>) -> Option<String> {
+    fn auth_request_id(rx: &mut crate::state::EventReceiver) -> Option<String> {
         while let Ok(ev) = rx.try_recv() {
             if let IpcEvent::AccessRequestCreated { request_id, src_device_id, dst_port, service_name, src_device_display_name, .. } = ev {
                 assert_eq!(src_device_id, "device-0000000b");

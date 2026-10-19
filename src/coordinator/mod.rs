@@ -1162,9 +1162,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let (ipc_tx, mut ipc_rx) = mpsc::channel(64);
         let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let core = Arc::new(CoreState::new(ipc_tx, udp, std::env::temp_dir()));
+        let core = Arc::new(CoreState::new(udp, std::env::temp_dir()));
+        let mut ipc_rx = core.subscribe_events();
         core.apply_identity(&test_identity(false)).await;
         core.net.write().await.joined_rooms.insert("space-1".into(), "Room".into());
 

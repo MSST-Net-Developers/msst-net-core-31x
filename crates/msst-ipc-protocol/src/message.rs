@@ -26,7 +26,8 @@ pub enum IpcMessage {
     /// Controller → Core: read state or request an operation.
     Request {
         /// Unique request ID (UUID or monotonic counter).  The response echoes
-        /// this ID so the caller can correlate replies.
+        /// this ID so the caller can correlate replies.  Since 0.4 responses
+        /// may arrive in a different order than the requests were sent.
         id: String,
         body: IpcRequest,
     },
@@ -35,10 +36,23 @@ pub enum IpcMessage {
         /// The request ID this response corresponds to.
         id: String,
         body: IpcResponse,
+        /// The `seq` of the last event Core had emitted when it started
+        /// handling the request (0.4).  Every state change the response
+        /// does not reflect is reported by an event with a larger `seq`;
+        /// events with `seq <= event_seq` are already reflected and can be
+        /// skipped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_seq: Option<u64>,
     },
     /// Core → Controller: push notification (no request ID needed).
     Event {
         body: IpcEvent,
+        /// Position in Core's event stream (0.4): starts at 1 when Core
+        /// starts and increases by exactly 1 per event, so a gap means lost
+        /// events (re-snapshot).  Absent on log lines (`Diagnostic`
+        /// forwarded from the log), which are not part of the state stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
 }
 
@@ -378,6 +392,7 @@ mod tests {
     #[test]
     fn response_ok() {
         roundtrip(&IpcMessage::Response {
+            event_seq: None,
             id: "req-1".into(),
             body: IpcResponse::Ok(serde_json::json!({"status": "ok"})),
         });
@@ -386,6 +401,7 @@ mod tests {
     #[test]
     fn response_error() {
         roundtrip(&IpcMessage::Response {
+            event_seq: None,
             id: "req-2".into(),
             body: IpcResponse::Error(IpcError {
                 code: "not_found".into(),
@@ -399,6 +415,7 @@ mod tests {
     #[test]
     fn event_access_request() {
         roundtrip(&IpcMessage::Event {
+            seq: None,
             body: IpcEvent::AccessRequestCreated {
                 request_id: "r1".into(),
                 src_device_id: "device-aabbccdd".into(),
@@ -415,6 +432,7 @@ mod tests {
     #[test]
     fn event_node_added() {
         roundtrip(&IpcMessage::Event {
+            seq: None,
             body: IpcEvent::NodeAdded {
                 device_id: "device-deadbeef".into(),
                 ipv4: "172.22.1.2".into(),
@@ -428,6 +446,7 @@ mod tests {
     #[test]
     fn event_path_changed() {
         roundtrip(&IpcMessage::Event {
+            seq: None,
             body: IpcEvent::PathChanged {
                 device_id: "device-deadbeef".into(),
                 old_mode: "relay".into(),
@@ -439,6 +458,7 @@ mod tests {
     #[test]
     fn event_diagnostic() {
         roundtrip(&IpcMessage::Event {
+            seq: None,
             body: IpcEvent::Diagnostic {
                 level: "info".into(),
                 target: "net::firewall".into(),
@@ -465,6 +485,7 @@ mod tests {
     #[test]
     fn response_json_has_kind_field() {
         let msg = IpcMessage::Response {
+            event_seq: None,
             id: "test".into(),
             body: IpcResponse::Ok(serde_json::json!(true)),
         };
@@ -476,6 +497,7 @@ mod tests {
     #[test]
     fn event_json_has_kind_field() {
         let msg = IpcMessage::Event {
+            seq: None,
             body: IpcEvent::NodeRemoved {
                 device_id: "device-00000000".into(),
             },
@@ -506,5 +528,27 @@ mod tests {
     fn version_incompatibility_different_major() {
         use crate::version::{is_compatible, make_version};
         assert!(!is_compatible(make_version(1, 0, 0)));
+    }
+
+    // ── 0.4 envelope fields ─────────────────────────────────────────────────
+
+    #[test]
+    fn envelope_fields_are_optional_and_omitted_by_default() {
+        // 0.3 frames (no event_seq / seq) still decode.
+        let resp: IpcMessage = serde_json::from_str(r#"{"kind":"response","id":"1","body":{"status":"ok","data":{}}}"#).unwrap();
+        assert!(matches!(resp, IpcMessage::Response { event_seq: None, .. }));
+        let ev: IpcMessage = serde_json::from_str(r#"{"kind":"event","body":{"type":"node_removed","data":{"device_id":"d"}}}"#).unwrap();
+        assert!(matches!(ev, IpcMessage::Event { seq: None, .. }));
+        // Absent values are not serialized, so 0.3 receivers see 0.3 frames.
+        let json = serde_json::to_string(&IpcMessage::Response { id: "1".into(), body: IpcResponse::Ok(serde_json::json!({})), event_seq: None }).unwrap();
+        assert_eq!(json, r#"{"kind":"response","id":"1","body":{"status":"ok","data":{}}}"#);
+    }
+
+    #[test]
+    fn envelope_fields_round_trip() {
+        roundtrip(&IpcMessage::Response { id: "1".into(), body: IpcResponse::Ok(serde_json::json!({})), event_seq: Some(7) });
+        let ev = IpcMessage::Event { body: IpcEvent::CoordinatorConnectionChanged { connected: true }, seq: Some(8) };
+        assert!(serde_json::to_string(&ev).unwrap().contains(r#""seq":8"#));
+        roundtrip(&ev);
     }
 }

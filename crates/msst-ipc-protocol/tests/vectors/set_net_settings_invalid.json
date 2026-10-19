@@ -19,6 +19,7 @@
       },
       "status": "error"
     },
+    "event_seq": 1,
     "id": "1",
     "kind": "response"
   }

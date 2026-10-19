@@ -1039,9 +1039,8 @@ mod tests {
     // ── Outbound routing (end-to-end over loopback UDP) ──────────────────
 
     async fn test_state() -> Arc<CoreState> {
-        let (ipc_tx, _ipc_rx) = mpsc::channel(64);
         let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let state = Arc::new(CoreState::new(ipc_tx, udp, std::env::temp_dir()));
+        let state = Arc::new(CoreState::new(udp, std::env::temp_dir()));
         let id = crate::identity::Identity {
             user: crate::identity::UserInfo { id: "user-11111111".into(), handle: String::new(), display_name: String::new() },
             device: crate::identity::DeviceInfo {

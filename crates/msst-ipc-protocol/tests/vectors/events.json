@@ -24,7 +24,8 @@
       },
       "type": "room_state_changed"
     },
-    "kind": "event"
+    "kind": "event",
+    "seq": 1
   },
   {
     "body": {
@@ -40,7 +41,8 @@
       },
       "type": "identity_changed"
     },
-    "kind": "event"
+    "kind": "event",
+    "seq": 1
   },
   {
     "body": {
@@ -52,7 +54,8 @@
       },
       "type": "settings_changed"
     },
-    "kind": "event"
+    "kind": "event",
+    "seq": 1
   },
   {
     "body": {
@@ -73,6 +76,7 @@
       },
       "type": "node_state_changed"
     },
-    "kind": "event"
+    "kind": "event",
+    "seq": 1
   }
 ]

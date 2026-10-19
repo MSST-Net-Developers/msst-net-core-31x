@@ -615,9 +615,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("msst-acl-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (ipc_tx, _ipc_rx) = tokio::sync::mpsc::channel(64);
         let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let state = Arc::new(CoreState::new(ipc_tx, udp, dir));
+        let state = Arc::new(CoreState::new(udp, dir));
         let id = crate::identity::Identity {
             user: crate::identity::UserInfo { id: "user-00000001".into(), handle: "abjust".into(), display_name: String::new() },
             device: crate::identity::DeviceInfo {

@@ -116,8 +116,8 @@ pub struct CoreState {
     pub relay_epoch: std::sync::atomic::AtomicU64,
     /// Generation counter — every mutation increments this.
     pub generation: Generation,
-    /// IPC event sender — pushed to all connected Controllers.
-    pub ipc_event_tx: tokio::sync::mpsc::Sender<msst_ipc_protocol::IpcEvent>,
+    /// The IPC event stream — pushed to all connected Controllers.
+    pub events: EventBus,
     /// The main UDP socket (shared for send and receive).
     pub udp_socket: Arc<tokio::net::UdpSocket>,
     /// Local identity (keypair, IDs, auth).  `None` until `apply_identity`.
@@ -174,7 +174,6 @@ pub struct CoreState {
 
 impl CoreState {
     pub fn new(
-        ipc_event_tx: tokio::sync::mpsc::Sender<msst_ipc_protocol::IpcEvent>,
         udp_socket: Arc<tokio::net::UdpSocket>,
         data_dir: std::path::PathBuf,
     ) -> Self {
@@ -187,7 +186,7 @@ impl CoreState {
             conn_track: std::sync::Mutex::new(ConnectionTracker::new()),
             relay_epoch: std::sync::atomic::AtomicU64::new(0),
             generation: Generation::new(),
-            ipc_event_tx,
+            events: EventBus::new(),
             udp_socket,
             identity: RwLock::new(None),
             data_dir,
@@ -256,13 +255,112 @@ impl CoreState {
         self.generation.advance()
     }
 
-    /// Broadcast an IPC event to all connected Controllers.
-    ///
-    /// Non-blocking: if the IPC queue is full the event is dropped (and
-    /// logged) rather than stalling the caller.
+    /// Broadcast an IPC event to all connected Controllers (see
+    /// [`EventBus::emit`]).  Never blocks.
     pub fn emit_ipc_event(&self, event: msst_ipc_protocol::IpcEvent) {
-        if let Err(e) = self.ipc_event_tx.try_send(event) {
-            tracing::warn!("IPC event dropped: {}", e);
+        self.events.emit(event);
+    }
+
+    /// Subscribe to the event stream (tests).
+    #[cfg(test)]
+    pub fn subscribe_events(&self) -> EventReceiver {
+        EventReceiver(self.events.subscribe())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EventBus — Core's single, sequenced event stream
+// ---------------------------------------------------------------------------
+
+/// Events buffered per subscriber before it counts as lagging.
+const EVENT_BUS_CAPACITY: usize = 1024;
+
+/// An event with its position in the stream.
+#[derive(Debug, Clone)]
+pub struct SeqEvent {
+    pub seq: u64,
+    pub event: msst_ipc_protocol::IpcEvent,
+}
+
+/// The event stream every IPC connection subscribes to (protocol 0.4).
+///
+/// `seq` starts at 1 and increases by exactly 1 per event; numbering and
+/// sending happen under one lock, so every subscriber receives events in
+/// `seq` order.  Emitting never blocks and never drops silently: a
+/// subscriber that falls more than [`EVENT_BUS_CAPACITY`] behind gets
+/// `Lagged` (the IPC server then disconnects it so it re-snapshots).
+pub struct EventBus {
+    tx: tokio::sync::broadcast::Sender<SeqEvent>,
+    seq: std::sync::Mutex<u64>,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        EventBus { tx: tokio::sync::broadcast::channel(EVENT_BUS_CAPACITY).0, seq: std::sync::Mutex::new(0) }
+    }
+
+    /// Number and broadcast an event.  Returns its `seq`.
+    pub fn emit(&self, event: msst_ipc_protocol::IpcEvent) -> u64 {
+        let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
+        *seq += 1;
+        // Err = no subscribers (no Controller connected): nothing to do.
+        let _ = self.tx.send(SeqEvent { seq: *seq, event });
+        *seq
+    }
+
+    /// `seq` of the last event emitted (0 if none yet).
+    pub fn last_seq(&self) -> u64 {
+        *self.seq.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Receive every event emitted from now on.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SeqEvent> {
+        self.tx.subscribe()
+    }
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A test-side subscription yielding bare events.
+#[cfg(test)]
+pub struct EventReceiver(tokio::sync::broadcast::Receiver<SeqEvent>);
+
+#[cfg(test)]
+impl EventReceiver {
+    pub fn try_recv(&mut self) -> Result<msst_ipc_protocol::IpcEvent, tokio::sync::broadcast::error::TryRecvError> {
+        self.0.try_recv().map(|e| e.event)
+    }
+}
+
+#[cfg(test)]
+mod event_bus_tests {
+    use super::*;
+    use msst_ipc_protocol::IpcEvent;
+
+    #[test]
+    fn seq_is_contiguous_and_ordered() {
+        let bus = EventBus::new();
+        assert_eq!(bus.emit(IpcEvent::NodeRemoved { device_id: "x".into() }), 1, "no subscriber: still numbered");
+        let mut rx = bus.subscribe();
+        for _ in 0..3 {
+            bus.emit(IpcEvent::CoordinatorConnectionChanged { connected: true });
         }
+        assert_eq!(bus.last_seq(), 4);
+        let got: Vec<u64> = (0..3).map(|_| rx.try_recv().unwrap().seq).collect();
+        assert_eq!(got, [2, 3, 4]);
+    }
+
+    #[test]
+    fn lagging_subscriber_is_told() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        for _ in 0..EVENT_BUS_CAPACITY + 1 {
+            bus.emit(IpcEvent::CoordinatorConnectionChanged { connected: true });
+        }
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Lagged(1))));
     }
 }
