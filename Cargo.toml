@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "3.1.0-alpha.1"
 edition = "2024"
-license = "proprietary"
+license = "MIT"
 
 # ── Shared dependency versions ────────────────────────────────────────────────
 [workspace.dependencies]
@@ -24,6 +24,7 @@ thiserror = "2"
 name = "msst-net-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "MSST-Net Core — the privileged networking daemon."
 
 [lib]

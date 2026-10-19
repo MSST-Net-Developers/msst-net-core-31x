@@ -2,6 +2,7 @@
 name = "msst-core-state"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "MSST-Net Core state containers with generation tracking and desired/observed state separation."
 
 [dependencies]
