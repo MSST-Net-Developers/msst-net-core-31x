@@ -92,7 +92,27 @@ Add `"async": true` to a command request:
 - **`SetLogStream {enabled}`:** stop/start log lines (`Diagnostic` events)
   on this connection; default on.  `GetLogs` is unaffected.
 - **New error codes:** `permission_denied`, `busy`, `incompatible_version`,
-  `response_too_large`.
+  `response_too_large`, `invalid_display_name`.
+- **Names and handles can be cleared** (`UpdateDisplayName`,
+  `UpdateHandle`): a field left out (`null`) is unchanged; `""` (or only
+  whitespace) clears it — previously `UpdateHandle` rejected `""` with
+  `invalid_handle`.  A cleared value is reported as `null`, like one never
+  set, and Core registers the default instead: the device handle becomes
+  the device ID (so the ezPlay hostname becomes
+  `<device_id>.<user handle or ID>.ezplay.msst.net`), the device display
+  name becomes `用户<user_id>的设备`.  Display names are trimmed and at
+  most 64 characters without control characters (else
+  `invalid_display_name`).
+- **Immediate coordinator sync:** both commands re-register the device
+  right away when something changed and add `"synced": bool` to the
+  reply.  `false` means the change is saved in Core but the coordinator
+  refused or could not be reached (e.g. an unauthenticated device on a
+  coordinator with OIDC enabled: `POST /device/register` needs a token);
+  it is sent with the next registration (WS reconnect).
+- **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`
+  and `NodeStateChanged` (previously `""` was passed through); a peer
+  without a device ID is ignored instead of failing the whole
+  `room_state`.
 - **Typed bodies** (`msst_ipc_protocol::views`): `Health`, `GetNodes`
   (`Nodes`), `GetNode` (`NodeDetail`), `OperationAccepted`,
   `OperationView`.  JSON is unchanged; Rust Controllers can decode with

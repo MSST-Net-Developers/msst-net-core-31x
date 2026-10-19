@@ -99,6 +99,8 @@ pub struct RoomStateData {
 /// Matches `roomStatePeer` in `hub.go`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomStatePeer {
+    /// Empty if the coordinator left it out; such peers are dropped.
+    #[serde(default)]
     pub device_id: String,
     #[serde(default)]
     pub public_key: String,

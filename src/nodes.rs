@@ -36,6 +36,8 @@ pub enum FetchDemand {
 /// Node data from the coordinator's `/nodes/*` endpoints (3.0.x `NodeInfo`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeInfo {
+    /// Empty if the coordinator left it out; such nodes are skipped.
+    #[serde(default)]
     pub device_id: String,
     #[serde(default)]
     pub device_handle: Option<String>,
@@ -130,6 +132,10 @@ pub struct PeerData<'a> {
 /// Upsert one peer into the peer list, scheduler and WireGuard engine.
 /// Returns `false` (and changes nothing) if its addresses are invalid.
 pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
+    if p.device_id.is_empty() {
+        warn!("nodes: ignoring a peer without a device ID ({:?}, {:?})", p.ipv4, p.ipv6);
+        return false;
+    }
     let (Ok(ipv4), Ok(ipv6)) = (p.ipv4.parse::<IpAddr>(), p.ipv6.parse::<IpAddr>()) else {
         debug!("nodes: ignoring {} with invalid addresses ({:?}, {:?})", p.device_id, p.ipv4, p.ipv6);
         return false;
@@ -198,7 +204,7 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
             ipv4: ipv4.to_string(),
             ipv6: ipv6.to_string(),
             hostname: p.hostname.filter(|h| !h.is_empty()).map(str::to_string),
-            display_name: p.display_name,
+            display_name: p.display_name.filter(|n| !n.is_empty()),
         });
     }
     true
@@ -207,6 +213,10 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
 async fn apply_nodes(state: &CoreState, nodes: &[NodeInfo]) -> usize {
     let mut n = 0;
     for node in nodes {
+        if node.device_id.is_empty() {
+            warn!("nodes: coordinator returned a node without a device ID — skipped");
+            continue;
+        }
         // A fetched node is kept for the communication TTL (3.0.x).
         crate::peer_cache::on_communication(state, &node.device_id).await;
         let ok = apply_peer(state, PeerData {
@@ -355,6 +365,29 @@ async fn is_known(state: &CoreState, d: &FetchDemand, applied: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_without_device_id_is_ignored_and_empty_names_are_unset() {
+        let (state, mut rx) = crate::test_support::core_state("nodes-empty").await;
+        let peer = |id, name: &str| PeerData {
+            device_id: id, ipv4: "172.22.1.1", ipv6: "fd22:2222:2222:2222::b",
+            device_handle: Some(""), display_name: Some(name.to_string()), ..Default::default()
+        };
+        assert!(!apply_peer(&state, peer("", "X")).await);
+        assert!(state.net.read().await.peer_list.get("").is_none());
+        assert!(apply_peer(&state, peer("device-0000000b", "")).await);
+        let net = state.net.read().await;
+        let e = net.peer_list.get("device-0000000b").unwrap();
+        assert_eq!((e.device_handle.as_deref(), e.display_name.as_deref()), (None, None));
+        drop(net);
+        let mut added = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let msst_ipc_protocol::IpcEvent::NodeAdded { display_name, .. } = ev {
+                added = Some(display_name);
+            }
+        }
+        assert_eq!(added, Some(None), "empty name is reported as null");
+    }
 
     #[test]
     fn gate_dedups_and_negative_caches() {

@@ -112,11 +112,54 @@ pub async fn emit_identity_changed(state: &CoreState) {
     state.emit_ipc_event(ev);
 }
 
-pub async fn update_display_name(state: &CoreState, user: Option<String>, device: Option<String>) -> Result<Value, IpcError> {
+/// Longest display name accepted, in characters.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+/// Normalize a display name from the Controller: surrounding whitespace is
+/// dropped; empty means "unset" (the default is registered instead).
+pub fn normalize_display_name(n: &str) -> Result<String, String> {
+    let n = n.trim();
+    if n.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        return Err(format!("display name is longer than {} characters", MAX_DISPLAY_NAME_CHARS));
+    }
+    if n.chars().any(char::is_control) {
+        return Err("display name must not contain control characters".into());
+    }
+    Ok(n.to_string())
+}
+
+/// Normalize a handle from the Controller: empty (after trimming) means
+/// "unset" (the device / user ID is registered instead).
+pub fn normalize_handle(h: &str) -> Result<String, &'static str> {
+    let h = h.trim();
+    if !h.is_empty() {
+        validate_handle(h)?;
+    }
+    Ok(h.to_string())
+}
+
+/// Push the identity to the coordinator now (`re_register`).  The change is
+/// already saved locally; on failure it reaches the coordinator with the
+/// next registration (WS reconnect).
+async fn sync_identity(state: &Arc<CoreState>, what: &str) -> bool {
+    match re_register(state).await {
+        Ok(_) => true,
+        Err(e) => {
+            warn!("account: {} saved locally, coordinator not updated yet: {}", what, e.message);
+            false
+        }
+    }
+}
+
+/// `UpdateDisplayName`.  `None` leaves a name unchanged; `""` clears it.
+pub async fn update_display_name(state: &Arc<CoreState>, user: Option<String>, device: Option<String>) -> Result<Value, IpcError> {
     if user.is_none() && device.is_none() {
         return Err(err("invalid_request", "At least one name field must be provided"));
     }
-    let (u, d) = update_identity(state, |id| {
+    let norm = |n: Option<String>| n.map(|n| normalize_display_name(&n)).transpose().map_err(|e| err("invalid_display_name", e));
+    let (user, device) = (norm(user)?, norm(device)?);
+    let (u, d, changed) = update_identity(state, |id| {
+        let before = (id.user.display_name.clone(), id.device.display_name.clone());
         if id.auth.is_none() {
             if let Some(n) = user {
                 id.user.display_name = n;
@@ -125,23 +168,26 @@ pub async fn update_display_name(state: &CoreState, user: Option<String>, device
         if let Some(n) = device {
             id.device.display_name = n;
         }
-        (id.user.display_name.clone(), id.device.display_name.clone())
+        let changed = before != (id.user.display_name.clone(), id.device.display_name.clone());
+        (id.user.display_name.clone(), id.device.display_name.clone(), changed)
     })
     .await?;
     info!("account: display names — user '{}', device '{}'", u, d);
-    Ok(json!({ "ok": true, "user_display_name": non_empty(&u), "device_display_name": non_empty(&d) }))
+    let synced = !changed || sync_identity(state, "display name").await;
+    Ok(json!({ "ok": true, "user_display_name": non_empty(&u), "device_display_name": non_empty(&d), "synced": synced }))
 }
 
+/// `UpdateHandle`.  `None` leaves a handle unchanged; `""` clears it.
 pub async fn update_handle(state: &Arc<CoreState>, user: Option<String>, device: Option<String>) -> Result<Value, IpcError> {
     if user.is_none() && device.is_none() {
         return Err(err("invalid_request", "At least one of user_handle or device_handle must be provided"));
     }
-    for (name, h) in [("user_handle", &user), ("device_handle", &device)] {
-        if let Some(h) = h {
-            validate_handle(h).map_err(|e| err("invalid_handle", format!("{}: {}", name, e)))?;
-        }
-    }
-    let (u, d) = update_identity(state, |id| {
+    let norm = |name: &str, h: Option<String>| {
+        h.map(|h| normalize_handle(&h)).transpose().map_err(|e| err("invalid_handle", format!("{}: {}", name, e)))
+    };
+    let (user, device) = (norm("user_handle", user)?, norm("device_handle", device)?);
+    let (u, d, changed) = update_identity(state, |id| {
+        let before = (id.user.handle.clone(), id.device.handle.clone());
         if id.auth.is_none() {
             if let Some(h) = user {
                 id.user.handle = h;
@@ -150,15 +196,13 @@ pub async fn update_handle(state: &Arc<CoreState>, user: Option<String>, device:
         if let Some(h) = device {
             id.device.handle = h;
         }
-        (id.user.handle.clone(), id.device.handle.clone())
+        let changed = before != (id.user.handle.clone(), id.device.handle.clone());
+        (id.user.handle.clone(), id.device.handle.clone(), changed)
     })
     .await?;
     info!("account: handles — user '{}', device '{}'", u, d);
-    // Tell the coordinator now; the handles are saved locally either way.
-    if let Err(e) = re_register(state).await {
-        warn!("account: re-register after handle update failed (saved locally): {}", e.message);
-    }
-    Ok(json!({ "ok": true, "user_handle": non_empty(&u), "device_handle": non_empty(&d) }))
+    let synced = !changed || sync_identity(state, "handle").await;
+    Ok(json!({ "ok": true, "user_handle": non_empty(&u), "device_handle": non_empty(&d), "synced": synced }))
 }
 
 /// `POST /device/register` with the current identity, then adopt the
@@ -404,6 +448,62 @@ mod tests {
         // Coordinator-assigned IPv4 recorded for next start.
         assert_eq!(id.device.assigned_ipv4.as_deref(), Some("172.22.9.9"));
         assert_eq!(id.device.hostname, "pc.me.ezplay.msst.net");
+    }
+
+    #[tokio::test]
+    async fn names_and_handles_sync_at_once_and_can_be_cleared() {
+        let coord = FakeCoordinator::start(
+            |req| if req.path == "/device/register" { (200, json!({ "hostname": req.body["network"]["hostname"], "ipv4": "" })) } else { (404, json!({})) },
+            |_| vec![],
+        ).await;
+        let (state, _ipc) = core_state("clear").await;
+        with_client(&state, &coord.url).await;
+        let registers = || coord.http_log.lock().unwrap().iter().filter(|r| r.path == "/device/register").map(|r| r.body.clone()).collect::<Vec<_>>();
+        let (dev_id, user_id) = {
+            let id = state.identity.read().await;
+            let id = id.as_ref().unwrap();
+            (id.device.id.clone(), id.user.id.clone())
+        };
+
+        // A display name change is registered right away.
+        let out = update_display_name(&state, None, Some("  Laptop ".into())).await.unwrap();
+        assert_eq!((out["device_display_name"].as_str(), out["synced"].as_bool()), (Some("Laptop"), Some(true)));
+        assert_eq!(registers().last().unwrap()["meta"]["device_display_name"], "Laptop");
+
+        // Cleared → stored as unset, registered as the default name.
+        let out = update_display_name(&state, None, Some(" ".into())).await.unwrap();
+        assert!(out["device_display_name"].is_null());
+        assert_eq!(identity_on_disk(&state).device.display_name, "");
+        assert_eq!(registers().last().unwrap()["meta"]["device_display_name"], format!("用户{}的设备", user_id));
+
+        // Handle set, then cleared → registered as the device ID.
+        update_handle(&state, None, Some("pc".into())).await.unwrap();
+        assert_eq!(registers().last().unwrap()["device"]["handle"], "pc");
+        let out = update_handle(&state, None, Some(String::new())).await.unwrap();
+        assert!(out["device_handle"].is_null());
+        let last = registers().last().unwrap().clone();
+        assert_eq!(last["device"]["handle"], dev_id.as_str());
+        assert_eq!(last["network"]["hostname"], format!("{}.{}.ezplay.msst.net", dev_id, user_id));
+        assert_eq!(identity_on_disk(&state).device.handle, "");
+        assert_eq!(identity_on_disk(&state).device.hostname, format!("{}.{}.ezplay.msst.net", dev_id, user_id));
+
+        // No change → nothing to send.
+        let n = registers().len();
+        assert_eq!(update_handle(&state, None, Some(String::new())).await.unwrap()["synced"], true);
+        assert_eq!(registers().len(), n);
+    }
+
+    #[tokio::test]
+    async fn display_names_are_validated_and_saved_without_coordinator() {
+        let (state, _ipc) = core_state("names-invalid").await;
+        let long = "名".repeat(MAX_DISPLAY_NAME_CHARS + 1);
+        assert_eq!(update_display_name(&state, None, Some(long)).await.unwrap_err().code, "invalid_display_name");
+        assert_eq!(update_display_name(&state, None, Some("a\nb".into())).await.unwrap_err().code, "invalid_display_name");
+        assert_eq!(update_handle(&state, None, Some(" PC ".into())).await.unwrap_err().code, "invalid_handle");
+        // No coordinator: saved locally, reported as not synced.
+        let out = update_display_name(&state, None, Some("名".repeat(MAX_DISPLAY_NAME_CHARS))).await.unwrap();
+        assert_eq!(out["synced"], false);
+        assert_eq!(identity_on_disk(&state).device.display_name.chars().count(), MAX_DISPLAY_NAME_CHARS);
     }
 
     #[tokio::test]

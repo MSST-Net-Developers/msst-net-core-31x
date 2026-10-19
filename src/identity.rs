@@ -15,15 +15,26 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
+    #[serde(default)]
     pub id: String,
+    /// Empty = not set (the coordinator then uses the ID).
+    #[serde(default)]
     pub handle: String,
+    /// Empty = not set.
+    #[serde(default)]
     pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
+    /// Missing or empty is re-derived from `private.key` on load.
+    #[serde(default)]
     pub id: String,
+    /// Empty = not set; registered as the device ID.
+    #[serde(default)]
     pub handle: String,
+    /// Empty = not set; registered as [`default_device_display_name`].
+    #[serde(default)]
     pub display_name: String,
     /// Server-assigned ezPlay hostname, e.g. "abjust-archlinux.abjust.ezplay.msst.net".
     /// Populated (and persisted) after the first successful coordinator registration.
@@ -108,6 +119,11 @@ impl Identity {
     }
 }
 
+/// The device display name registered when none is set.
+pub fn default_device_display_name(user_id: &str) -> String {
+    format!("用户{}的设备", user_id)
+}
+
 pub(crate) fn derive_id(pubkey: &[u8; 32], prefix: &str) -> String {
     let hash = Sha256::digest(pubkey);
     // First 4 bytes (8 hex chars) as the ID suffix.
@@ -179,6 +195,17 @@ pub fn load_or_create(data_dir: &Path) -> Result<Identity> {
         }
         if let Some(hex) = device.id.strip_prefix("dev-") {
             device.id = format!("device-{}", hex);
+            migrated = true;
+        }
+        // A missing user ID is recovered from the OIDC credentials, else
+        // re-derived from the key (as on first start).
+        if user.id.is_empty() {
+            user.id = auth
+                .as_ref()
+                .map(|a| a.user_id.clone())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| derive_id(&public_bytes, "user"));
+            warn!("identity: user ID missing from identity.json — using {}", user.id);
             migrated = true;
         }
         // The Coordinator only accepts a device ID derived from the key
@@ -365,6 +392,18 @@ mod tests {
         let reloaded: IdentityFile =
             serde_json::from_str(&std::fs::read_to_string(dir.join("identity.json")).unwrap()).unwrap();
         assert_eq!(reloaded.device.id, "device-1a92f238");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_fields_load_with_defaults() {
+        let dir = temp_dir("missing-fields");
+        std::fs::write(dir.join("private.key"), STANDARD.encode([1u8; 32])).unwrap();
+        std::fs::write(dir.join("identity.json"), r#"{"user":{},"device":{}}"#).unwrap();
+        let id = load_or_create(&dir).unwrap();
+        assert_eq!(id.device.id, "device-1a92f238");
+        assert_eq!(id.user.id, derive_id(&id.public_key, "user"));
+        assert_eq!((id.device.handle.as_str(), id.device.display_name.as_str()), ("", ""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

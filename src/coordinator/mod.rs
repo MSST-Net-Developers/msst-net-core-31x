@@ -632,22 +632,32 @@ where
 
 /// Builds the client-side ezPlay hostname proposal (3.0.x `ip::build_hostname`).
 ///
-/// Format: `<device_label>.<user_label>.ezplay.msst.net`; an empty handle
-/// falls back to the full ID.  The server may return a different
-/// (conflict-resolved) hostname in `registered`.
+/// Format: `<device_label>.<user_label>.ezplay.msst.net`; an empty (or
+/// invalid) handle falls back to the full ID.  The server may return a
+/// different (conflict-resolved) hostname in `registered`.
 pub fn build_hostname(device_handle: &str, device_id: &str, user_handle: &str, user_id: &str) -> String {
-    let device_label = if device_handle.is_empty() { device_id } else { device_handle };
-    let user_label = if user_handle.is_empty() { user_id } else { user_handle };
-    format!("{}.{}.ezplay.msst.net", device_label, user_label)
+    format!("{}.{}.ezplay.msst.net", handle_or_id(device_handle, device_id), handle_or_id(user_handle, user_id))
 }
 
-/// The `register` message — byte-for-byte the 3.0.x shape.
+/// The handle to register: unset (or invalid) handles are replaced by the
+/// ID, as the coordinator does.
+fn handle_or_id<'a>(handle: &'a str, id: &'a str) -> &'a str {
+    if crate::account::validate_handle(handle).is_ok() { handle } else { id }
+}
+
+/// The `register` message — the 3.0.x shape.  Unset handles are sent as
+/// the IDs and an unset device display name as
+/// [`default_device_display_name`](crate::identity::default_device_display_name).
 pub fn build_register_message(id: &Identity) -> Value {
     let (ipv4, ipv6) = id.virtual_ips();
-    // Handles must be non-empty; fall back to the full ID.
-    let device_handle = if id.device.handle.is_empty() { &id.device.id } else { &id.device.handle };
-    let user_handle = if id.user.handle.is_empty() { &id.user.id } else { &id.user.handle };
+    let device_handle = handle_or_id(&id.device.handle, &id.device.id);
+    let user_handle = handle_or_id(&id.user.handle, &id.user.id);
     let hostname = build_hostname(&id.device.handle, &id.device.id, &id.user.handle, &id.user.id);
+    let device_display_name = if id.device.display_name.is_empty() {
+        crate::identity::default_device_display_name(&id.user.id)
+    } else {
+        id.device.display_name.clone()
+    };
 
     json!({
         "type": "register",
@@ -668,7 +678,7 @@ pub fn build_register_message(id: &Identity) -> Value {
             },
             "meta": {
                 "user_display_name": id.user.display_name,
-                "device_display_name": id.device.display_name,
+                "device_display_name": device_display_name,
             }
         }
     })
@@ -715,7 +725,7 @@ fn apply_token_refresh(id: &mut Identity, body: &Value) -> bool {
 /// `on_registered`).  Returns `true` if anything changed and the identity
 /// must be persisted.
 ///
-/// * Hostname: always adopted.
+/// * Hostname: adopted unless empty.
 /// * IPv4: a different address is stored as `assigned_ipv4`; the TUN is not
 ///   reconfigured at runtime — it takes effect on the next start.
 /// * User handle / display name: adopted only when OIDC auth is active, so
@@ -728,7 +738,8 @@ pub fn apply_registered(
     user_display_name: &str,
 ) -> bool {
     let mut changed = false;
-    if id.device.hostname != hostname {
+    // An empty hostname is not an assignment: keep the one we have.
+    if !hostname.is_empty() && id.device.hostname != hostname {
         info!("coordinator assigned hostname {} (was {:?})", hostname, id.device.hostname);
         id.device.hostname = hostname.to_string();
         changed = true;
@@ -813,15 +824,26 @@ impl CoordinatorClient {
             "room_state" => {
                 let data: RoomStateData = serde_json::from_value(envelope.data)
                     .map_err(|e| format!("invalid room_state payload: {}", e))?;
+                // A peer without a device ID can't be addressed: drop it, not
+                // the whole room.
+                let mut peers = data.peers;
+                let before = peers.len();
+                peers.retain(|p| !p.device_id.is_empty());
+                if peers.len() != before {
+                    warn!("coordinator: room_state {} had {} peer(s) without a device ID — ignored", data.room_id, before - peers.len());
+                }
                 Ok(Some(CoordinatorEvent::RoomState {
                     room_id: data.room_id,
                     room_name: data.room_name,
-                    peers: data.peers,
+                    peers,
                 }))
             }
             "member_joined" => {
                 let data: MemberJoinedData = serde_json::from_value(envelope.data)
                     .map_err(|e| format!("invalid member_joined: {}", e))?;
+                if data.peer.device_id.is_empty() {
+                    return Err("member_joined without a device_id".into());
+                }
                 Ok(Some(CoordinatorEvent::MemberJoined {
                     room_id: data.room_id.or(envelope.room_id).unwrap_or_default(),
                     peer: data.peer,
@@ -1037,6 +1059,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn peers_without_device_id_are_dropped_not_the_room() {
+        let c = make_client();
+        let json = r#"{"type":"room_state","data":{"room_id":"space-1","room_name":"r","peers":[
+            {"ipv4":"172.22.1.2","ipv6":"::2"},{"device_id":"","ipv4":"172.22.1.3","ipv6":"::3"},
+            {"device_id":"device-aabbccdd","ipv4":"172.22.1.1","ipv6":"::1"}]}}"#;
+        match c.parse_incoming(json).unwrap() {
+            Some(CoordinatorEvent::RoomState { peers, .. }) => {
+                assert_eq!(peers.iter().map(|p| p.device_id.as_str()).collect::<Vec<_>>(), ["device-aabbccdd"]);
+            }
+            e => panic!("expected RoomState, got {:?}", e),
+        }
+        let joined = r#"{"type":"member_joined","room_id":"space-1","data":{"ipv4":"172.22.1.1","ipv6":"::1"}}"#;
+        assert!(c.parse_incoming(joined).is_err());
+    }
+
     // ── Pure helpers ─────────────────────────────────────────────────────
 
     fn test_identity(auth: bool) -> Identity {
@@ -1088,6 +1126,28 @@ mod tests {
         assert_eq!(d["device"]["handle"], "pc");
         assert_eq!(d["network"]["hostname"], "pc.abjust.ezplay.msst.net");
         assert_eq!(d["network"]["ipv4"], "172.22.9.9");
+    }
+
+    #[test]
+    fn register_message_defaults_unset_device_name_and_handle() {
+        let mut id = test_identity(false);
+        id.device.display_name.clear();
+        let d = &build_register_message(&id)["data"];
+        assert_eq!(d["meta"]["device_display_name"], "用户user-11223344的设备");
+        assert_eq!(d["device"]["handle"], "device-a1b2c3d4");
+        // An invalid handle (e.g. hand-edited identity.json) is not sent.
+        id.device.handle = "My PC".into();
+        let d = &build_register_message(&id)["data"];
+        assert_eq!(d["device"]["handle"], "device-a1b2c3d4");
+        assert_eq!(d["network"]["hostname"], "device-a1b2c3d4.user-11223344.ezplay.msst.net");
+    }
+
+    #[test]
+    fn apply_registered_keeps_hostname_when_none_assigned() {
+        let mut id = test_identity(false);
+        id.device.hostname = "pc.abjust.ezplay.msst.net".into();
+        assert!(!apply_registered(&mut id, "", "", "", ""));
+        assert_eq!(id.device.hostname, "pc.abjust.ezplay.msst.net");
     }
 
     #[test]

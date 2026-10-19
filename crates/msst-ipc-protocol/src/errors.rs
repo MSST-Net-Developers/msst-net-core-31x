@@ -14,6 +14,8 @@ pub const INVALID_PATCH: &str = "invalid_patch";
 pub const INVALID_GROUP: &str = "invalid_group";
 /// Network settings failed validation (e.g. MTU outside 1280–1500).
 pub const INVALID_SETTINGS: &str = "invalid_settings";
+/// Display name is too long or contains control characters (0.4).
+pub const INVALID_DISPLAY_NAME: &str = "invalid_display_name";
 /// Handle is not `^[a-z0-9-]+$`.
 pub const INVALID_HANDLE: &str = "invalid_handle";
 /// The referenced rule / group / auth request / ping job / node doesn't exist.
@@ -54,6 +56,7 @@ pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
 /// Every code above.
 pub const ALL: &[&str] = &[
     INVALID_REQUEST, INVALID_RULE, INVALID_PATCH, INVALID_GROUP, INVALID_SETTINGS, INVALID_HANDLE,
+    INVALID_DISPLAY_NAME,
     NOT_FOUND, MNEMONIC_NOT_FOUND, NOT_INITIALIZED, NOT_AUTHENTICATED, AUTH_FAILED,
     COORDINATOR_UNAVAILABLE, COORDINATOR_ERROR, REGISTER_FAILED, RELAY_UNAVAILABLE,
     ROOM_CREATE_FAILED, ROOM_REJECTED, PERSIST_FAILED, PERMISSION_DENIED, BUSY, INCOMPATIBLE_VERSION,

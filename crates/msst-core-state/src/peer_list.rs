@@ -81,7 +81,7 @@ impl PeerList {
     // ── Mutation ──────────────────────────────────────────────────────────
 
     /// Add or update a peer.  Passing `None` for optional fields leaves any
-    /// existing value intact. `is_authenticated` and `last_seen_unix` are
+    /// existing value intact; `Some("")` unsets it. `is_authenticated` and `last_seen_unix` are
     /// always applied (the coordinator sends them on every peer update).
     #[allow(clippy::too_many_arguments)]
     pub fn upsert(
@@ -126,17 +126,19 @@ impl PeerList {
             last_seen_unix,
         });
 
-        // Apply updates — `None` means "leave existing value".
+        // Apply updates — `None` means "leave existing value", `Some("")`
+        // means "unset" (stored as `None`, never as an empty string).
+        let set = |s: &str| (!s.is_empty()).then(|| s.to_string());
         entry.ipv4 = ipv4;
         entry.ipv6 = ipv6;
         entry.is_authenticated = is_authenticated;
         entry.last_seen_unix = last_seen_unix;
-        if let Some(uid) = user_id { entry.user_id = Some(uid.to_string()); }
-        if let Some(dh)  = device_handle { entry.device_handle = Some(dh.to_string()); }
-        if let Some(uh)  = user_handle  { entry.user_handle  = Some(uh.to_string()); }
-        if let Some(hn)  = hostname     { entry.hostname     = Some(hn.to_string()); }
-        if display_name.is_some()        { entry.display_name = display_name; }
-        if user_display_name.is_some()   { entry.user_display_name = user_display_name; }
+        if let Some(uid) = user_id { entry.user_id = set(uid); }
+        if let Some(dh)  = device_handle { entry.device_handle = set(dh); }
+        if let Some(uh)  = user_handle  { entry.user_handle  = set(uh); }
+        if let Some(hn)  = hostname     { entry.hostname     = set(hn); }
+        if let Some(n)   = display_name { entry.display_name = set(&n); }
+        if let Some(n)   = user_display_name { entry.user_display_name = set(&n); }
 
         // Clone the updated entry data so we can rebuild indexes without
         // holding a borrow on `self.by_device`.
@@ -768,6 +770,22 @@ mod tests {
         // Re-upserting A with a new IPv4 must not remove B's claim on v4.
         pl.upsert("device-aaaaaaaa", "172.22.1.9".parse().unwrap(), a6, None, None, None, None, None, None, false, 0);
         assert_eq!(pl.lookup_device_id_by_ip(&v4), Some("device-bbbbbbbb"));
+    }
+
+    #[test]
+    fn empty_fields_unset_and_are_not_indexed() {
+        let mut pl = PeerList::new();
+        let (a, b) = ("172.22.1.1".parse().unwrap(), "fd22:2222:2222:2222::1".parse().unwrap());
+        pl.upsert("device-aabbccdd", a, b, Some("user-11"), Some("pc"), Some("bob"), None, Some("PC".into()), None, false, 0);
+        assert_eq!(pl.resolve_device_mnemonic("pc.bob", "user-00"), Some("device-aabbccdd"));
+        // `None` keeps, `Some("")` clears (and drops the index entries).
+        pl.upsert("device-aabbccdd", a, b, None, Some(""), None, None, None, None, false, 1);
+        assert_eq!(pl.get("device-aabbccdd").unwrap().display_name.as_deref(), Some("PC"));
+        pl.upsert("device-aabbccdd", a, b, None, None, None, None, Some(String::new()), None, false, 2);
+        let e = pl.get("device-aabbccdd").unwrap();
+        assert_eq!((e.device_handle.as_deref(), e.display_name.as_deref()), (None, None));
+        assert!(pl.resolve_device_mnemonic("pc.bob", "user-00").is_none());
+        assert!(pl.resolve_device_mnemonic(".bob", "user-00").is_none());
     }
 
     #[test]
