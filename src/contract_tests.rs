@@ -61,7 +61,7 @@ fn check(name: &str, mut frames: Value, mismatches: &mut Vec<String>) {
 }
 
 async fn query(state: &Arc<CoreState>, name: &str, request: IpcRequest, mismatches: &mut Vec<String>) {
-    let req = IpcMessage::Request { id: "1".into(), body: request.clone() };
+    let req = IpcMessage::Request { id: "1".into(), body: request.clone(), r#async: false };
     let session = crate::ipc::Session::new(msst_ipc_protocol::Role::Admin);
     let event_seq = Some(state.events.last_seq());
     let resp = IpcMessage::Response { id: "1".into(), body: crate::ipc::handler::handle_request(request, state, &session).await, event_seq };

@@ -52,6 +52,7 @@ async fn join_and_wait(state: &CoreState, client: &CoordinatorClient, room_id: &
         .send_join(room_id, password.map(password_hash).as_deref())
         .await
         .map_err(|e| err("coordinator_unavailable", e.to_string()))?;
+    crate::ipc::ops::progress("join_sent");
     match tokio::time::timeout(ROOM_STATE_WAIT, rx).await {
         Ok(Ok(Ok(v))) => Ok(v["room_name"].as_str().unwrap_or("").to_string()),
         Ok(Ok(Err(e))) => Err(err("room_rejected", e)),
@@ -77,6 +78,7 @@ pub async fn create_room(state: &Arc<CoreState>, room_name: String, password: Op
     let client = client(state)?;
     // 3.0.x re-selects the relay before creating a room.
     crate::runtime::select_relay_now(state, &client).await.map_err(|e| err("relay_unavailable", e))?;
+    crate::ipc::ops::progress("relay_selected");
 
     let mut body = json!({ "room_name": room_name });
     if let Some(pw) = &password {
@@ -94,6 +96,7 @@ pub async fn create_room(state: &Arc<CoreState>, room_name: String, password: Op
         .ok_or_else(|| err("room_create_failed", "missing room_id in coordinator response"))?
         .to_string();
     info!("rooms: created {} ({})", room_id, room_name);
+    crate::ipc::ops::progress("room_created");
 
     // The creator joins without the password (as 3.0.x).
     join_and_wait(state, &client, &room_id, None).await?;
@@ -104,6 +107,7 @@ pub async fn join_room(state: &Arc<CoreState>, room_id: String, password: Option
     let client = client(state)?;
     if state.net.read().await.relay_addr.is_none() {
         crate::runtime::select_relay_now(state, &client).await.map_err(|e| err("relay_unavailable", e))?;
+        crate::ipc::ops::progress("relay_selected");
     }
     let room_name = join_and_wait(state, &client, &room_id, password.as_deref()).await?;
     info!("rooms: joined {}", room_id);

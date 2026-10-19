@@ -37,3 +37,21 @@ fn all_vectors_decode() {
     }
     assert!(count >= 20, "expected the full vector set, found {}", count);
 }
+
+/// The typed views (`views`) decode Core's actual responses.
+#[test]
+fn typed_views_decode_vectors() {
+    use msst_ipc_protocol::views;
+    let data = |name: &str| -> serde_json::Value {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors").join(name);
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(v["response"]["body"]["status"], "ok", "{}", name);
+        v["response"]["body"]["data"].clone()
+    };
+    let h: views::Health = serde_json::from_value(data("health.json")).expect("health");
+    assert_eq!(h.status, "ok");
+    let n: views::Nodes = serde_json::from_value(data("get_nodes.json")).expect("get_nodes");
+    assert!(!n.nodes.is_empty());
+    let d: views::NodeDetail = serde_json::from_value(data("get_node.json")).expect("get_node");
+    assert_eq!(d.node.device_id, "device-0000000b");
+}

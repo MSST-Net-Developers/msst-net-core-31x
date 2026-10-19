@@ -30,6 +30,11 @@ pub enum IpcMessage {
         /// may arrive in a different order than the requests were sent.
         id: String,
         body: IpcRequest,
+        /// Run a command as a background operation (0.4): Core answers at
+        /// once with `{"operation_id"}` and reports the outcome with
+        /// `OperationProgress` / `OperationCompleted`.  Ignored for queries.
+        #[serde(default, rename = "async", skip_serializing_if = "std::ops::Not::not")]
+        r#async: bool,
     },
     /// Core → Controller: reply to a previous request.
     Response {
@@ -167,6 +172,12 @@ pub enum IpcRequest {
     GetDiagPingResult { job_id: String },
     /// Clear log buffer.
     ClearLogs,
+    /// State of an operation started with `async: true` (0.4): running,
+    /// or its result while it is still remembered (recent operations).
+    GetOperation { operation_id: String },
+    /// Whether log lines are streamed to this connection as `Diagnostic`
+    /// events (0.4).  Affects only the requesting connection; default on.
+    SetLogStream { enabled: bool },
 }
 
 /// Auth decision variants — matches the 3.0.x `decision` string values.
@@ -319,6 +330,22 @@ pub enum IpcEvent {
         connected: bool,
     },
 
+    // ── Operations (0.4) ────────────────────────────────────────────────────
+    /// Progress of an operation started with `async: true`.  `stage` is a
+    /// short machine-readable step name (e.g. `relay_selected`).
+    OperationProgress {
+        operation_id: String,
+        stage: String,
+    },
+    /// An operation started with `async: true` finished.  `result` is what
+    /// the synchronous request would have returned.
+    OperationCompleted {
+        operation_id: String,
+        /// The request's `type`, e.g. `"create_room"`.
+        request_type: String,
+        result: IpcResponse,
+    },
+
     // ── Diagnostic ──────────────────────────────────────────────────────────
     /// A diagnostic event (log entry, performance metric, etc.).
     Diagnostic {
@@ -350,6 +377,7 @@ mod tests {
     #[test]
     fn request_get_system_state() {
         roundtrip(&IpcMessage::Request {
+            r#async: false,
             id: "req-1".into(),
             body: IpcRequest::GetSystemState,
         });
@@ -358,6 +386,7 @@ mod tests {
     #[test]
     fn request_create_room() {
         roundtrip(&IpcMessage::Request {
+            r#async: false,
             id: "req-2".into(),
             body: IpcRequest::CreateRoom {
                 room_name: "test-room".into(),
@@ -369,6 +398,7 @@ mod tests {
     #[test]
     fn request_auth_decision() {
         roundtrip(&IpcMessage::Request {
+            r#async: false,
             id: "req-3".into(),
             body: IpcRequest::AuthDecision {
                 request_id: "auth-abc".into(),
@@ -380,6 +410,7 @@ mod tests {
     #[test]
     fn request_create_acl_rule() {
         roundtrip(&IpcMessage::Request {
+            r#async: false,
             id: "req-4".into(),
             body: IpcRequest::CreateAclRule {
                 rule: serde_json::json!({"action": "allow", "proto": "tcp", "port": 25565}),
@@ -473,6 +504,7 @@ mod tests {
     #[test]
     fn request_json_has_kind_field() {
         let msg = IpcMessage::Request {
+            r#async: false,
             id: "test".into(),
             body: IpcRequest::Health,
         };
@@ -534,21 +566,40 @@ mod tests {
 
     #[test]
     fn envelope_fields_are_optional_and_omitted_by_default() {
-        // 0.3 frames (no event_seq / seq) still decode.
+        // 0.3 frames (no async / event_seq / seq) still decode.
+        let req: IpcMessage = serde_json::from_str(r#"{"kind":"request","id":"1","body":{"type":"health"}}"#).unwrap();
+        assert!(matches!(req, IpcMessage::Request { r#async: false, .. }));
         let resp: IpcMessage = serde_json::from_str(r#"{"kind":"response","id":"1","body":{"status":"ok","data":{}}}"#).unwrap();
         assert!(matches!(resp, IpcMessage::Response { event_seq: None, .. }));
-        let ev: IpcMessage = serde_json::from_str(r#"{"kind":"event","body":{"type":"node_removed","data":{"device_id":"d"}}}"#).unwrap();
-        assert!(matches!(ev, IpcMessage::Event { seq: None, .. }));
-        // Absent values are not serialized, so 0.3 receivers see 0.3 frames.
-        let json = serde_json::to_string(&IpcMessage::Response { id: "1".into(), body: IpcResponse::Ok(serde_json::json!({})), event_seq: None }).unwrap();
-        assert_eq!(json, r#"{"kind":"response","id":"1","body":{"status":"ok","data":{}}}"#);
+        // Defaults are not serialized, so 0.3 receivers see 0.3 frames.
+        let json = serde_json::to_string(&IpcMessage::Request { id: "1".into(), body: IpcRequest::Health, r#async: false }).unwrap();
+        assert_eq!(json, r#"{"kind":"request","id":"1","body":{"type":"health"}}"#);
     }
 
     #[test]
     fn envelope_fields_round_trip() {
+        let json = r#"{"kind":"request","id":"1","body":{"type":"leave_room","params":{"room_id":"r"}},"async":true}"#;
+        let m: IpcMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(m, IpcMessage::Request { r#async: true, .. }));
+        assert_eq!(serde_json::to_string(&m).unwrap(), json);
         roundtrip(&IpcMessage::Response { id: "1".into(), body: IpcResponse::Ok(serde_json::json!({})), event_seq: Some(7) });
         let ev = IpcMessage::Event { body: IpcEvent::CoordinatorConnectionChanged { connected: true }, seq: Some(8) };
         assert!(serde_json::to_string(&ev).unwrap().contains(r#""seq":8"#));
         roundtrip(&ev);
+    }
+
+    #[test]
+    fn operation_messages_round_trip() {
+        roundtrip(&IpcMessage::Request { id: "1".into(), body: IpcRequest::GetOperation { operation_id: "op-1".into() }, r#async: false });
+        roundtrip(&IpcMessage::Request { id: "2".into(), body: IpcRequest::SetLogStream { enabled: false }, r#async: false });
+        roundtrip(&IpcMessage::Event { body: IpcEvent::OperationProgress { operation_id: "op-1".into(), stage: "relay_selected".into() }, seq: Some(1) });
+        roundtrip(&IpcMessage::Event {
+            body: IpcEvent::OperationCompleted {
+                operation_id: "op-1".into(),
+                request_type: "create_room".into(),
+                result: IpcResponse::Error(IpcError { code: "relay_unavailable".into(), message: "x".into() }),
+            },
+            seq: Some(2),
+        });
     }
 }

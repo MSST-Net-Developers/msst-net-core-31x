@@ -43,11 +43,19 @@ pub const PERSIST_FAILED: &str = "persist_failed";
 
 /// The connection's role does not allow this request (0.4; see `access`).
 pub const PERMISSION_DENIED: &str = "permission_denied";
+/// Too many operations are running; try again later (0.4).
+pub const BUSY: &str = "busy";
+/// The Controller's protocol major version is not supported (0.4; sent as a
+/// response with id `"handshake"` right before Core closes the connection).
+pub const INCOMPATIBLE_VERSION: &str = "incompatible_version";
+/// The response would exceed the frame size limit (0.4).
+pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
 
 /// Every code above.
 pub const ALL: &[&str] = &[
     INVALID_REQUEST, INVALID_RULE, INVALID_PATCH, INVALID_GROUP, INVALID_SETTINGS, INVALID_HANDLE,
     NOT_FOUND, MNEMONIC_NOT_FOUND, NOT_INITIALIZED, NOT_AUTHENTICATED, AUTH_FAILED,
     COORDINATOR_UNAVAILABLE, COORDINATOR_ERROR, REGISTER_FAILED, RELAY_UNAVAILABLE,
-    ROOM_CREATE_FAILED, ROOM_REJECTED, PERSIST_FAILED, PERMISSION_DENIED,
+    ROOM_CREATE_FAILED, ROOM_REJECTED, PERSIST_FAILED, PERMISSION_DENIED, BUSY, INCOMPATIBLE_VERSION,
+    RESPONSE_TOO_LARGE,
 ];

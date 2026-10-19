@@ -39,23 +39,27 @@ impl Role {
     }
 }
 
-/// Whether a request reads state (query) or changes it (command).
+/// Whether a request reads state (query), changes it (command), or only
+/// affects the requesting connection (session).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
     Query,
     Command,
+    Session,
 }
 
 impl IpcRequest {
-    /// Query or command.  Exhaustive on purpose: a new request type must be
-    /// classified before it compiles.
+    /// Query, command or session request.  Exhaustive on purpose: a new
+    /// request type must be classified before it compiles.
     pub fn kind(&self) -> RequestKind {
         use IpcRequest::*;
         match self {
             GetSystemState | GetNodes | GetNode { .. } | GetConnections | GetPaths | GetAclRules | GetAclGroups
             | GetAccessLog { .. } | GetPendingAuth | Health | GetNetSettings | GetEndpoints | GetTrafficStats
             | GetPathView | GetLogs { .. } | GetDnsDomains | GetDnsRecords { .. } | GetRelays | GetContacts
-            | GetServices | GetDiagPingResult { .. } => RequestKind::Query,
+            | GetServices | GetDiagPingResult { .. } | GetOperation { .. } => RequestKind::Query,
+
+            SetLogStream { .. } => RequestKind::Session,
 
             CreateRoom { .. } | JoinRoom { .. } | LeaveRoom { .. } | CreateAclRule { .. } | UpdateAclRule { .. }
             | DeleteAclRule { .. } | ClearAclRules | CreateAclGroup { .. } | UpdateAclGroup { .. }
@@ -69,7 +73,7 @@ impl IpcRequest {
     /// The minimum role allowed to send this request.
     pub fn required_role(&self) -> Role {
         match self.kind() {
-            RequestKind::Query => Role::Viewer,
+            RequestKind::Query | RequestKind::Session => Role::Viewer,
             RequestKind::Command => Role::Admin,
         }
     }
@@ -84,6 +88,7 @@ mod tests {
         assert_eq!(IpcRequest::Health.required_role(), Role::Viewer);
         assert_eq!(IpcRequest::GetAclRules.required_role(), Role::Viewer);
         assert_eq!(IpcRequest::GetDiagPingResult { job_id: "j".into() }.required_role(), Role::Viewer);
+        assert_eq!(IpcRequest::SetLogStream { enabled: false }.required_role(), Role::Viewer);
         assert_eq!(IpcRequest::ClearAclRules.required_role(), Role::Admin);
         assert_eq!(IpcRequest::JoinRoom { room_id: "r".into(), password: None }.required_role(), Role::Admin);
         assert_eq!(IpcRequest::StartDiagPing { device_id: "d".into() }.required_role(), Role::Admin);

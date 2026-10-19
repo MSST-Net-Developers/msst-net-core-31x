@@ -39,6 +39,7 @@ pub mod access;
 pub mod errors;
 pub mod message;
 pub mod version;
+pub mod views;
 
 pub use access::Role;
 pub use message::{IpcMessage, IpcRequest, IpcResponse, IpcEvent, IpcError, AuthDecision};

@@ -57,6 +57,47 @@ Recommended sync:
 - A slow command (e.g. `CreateRoom`) no longer blocks `Health` or other
   queries on the same connection.
 
+## 4. Async commands (opt-in)
+
+Add `"async": true` to a command request:
+
+```json
+{"kind":"request","id":"7","async":true,"body":{"type":"create_room","params":{"room_name":"x","password":null}}}
+```
+
+- Response at once: `{"operation_id":"op-3"}` (or an error such as
+  `permission_denied` / `busy`).
+- Then events `operation_progress {operation_id, stage}` (create/join room:
+  `relay_selected`, `room_created`, `join_sent`) and finally
+  `operation_completed {operation_id, request_type, result}`, where
+  `result` is exactly what the synchronous request would have returned.
+  The completion never arrives before the accepted response.
+- `GetOperation {operation_id}` → `status` `running` (with `stage`) or
+  `completed` (with `result`, `finished_at`).  Finished operations stay
+  queryable for 10 minutes (last 64), so a Controller that reconnects
+  mid-operation can still get the outcome.
+- At most 16 operations run Core-wide; beyond that → `busy`.
+- Operations belong to Core: they finish even if the Controller
+  disconnects.
+- `async` on a query is ignored (answered normally).  Without `async`,
+  commands behave exactly as in 0.3.
+
+## 5. Smaller changes
+
+- **Handshake:** on an incompatible major version Core now sends one frame
+  before closing: response id `"handshake"`, error `incompatible_version`.
+- **Frame limit (1 MiB) on Core's side too:** an oversized response becomes
+  error `response_too_large` (same `id`); an oversized event closes the
+  connection (reconnect + re-snapshot).
+- **`SetLogStream {enabled}`:** stop/start log lines (`Diagnostic` events)
+  on this connection; default on.  `GetLogs` is unaffected.
+- **New error codes:** `permission_denied`, `busy`, `incompatible_version`,
+  `response_too_large`.
+- **Typed bodies** (`msst_ipc_protocol::views`): `Health`, `GetNodes`
+  (`Nodes`), `GetNode` (`NodeDetail`), `OperationAccepted`,
+  `OperationView`.  JSON is unchanged; Rust Controllers can decode with
+  these types (the contract vectors are checked against them).
+
 ## Vectors
 
 `crates/msst-ipc-protocol/tests/vectors/*.json` now show `seq` /

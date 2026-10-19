@@ -118,6 +118,8 @@ pub struct CoreState {
     pub generation: Generation,
     /// The IPC event stream — pushed to all connected Controllers.
     pub events: EventBus,
+    /// Background operations (`async` commands).
+    pub operations: crate::ipc::ops::Operations,
     /// The main UDP socket (shared for send and receive).
     pub udp_socket: Arc<tokio::net::UdpSocket>,
     /// Local identity (keypair, IDs, auth).  `None` until `apply_identity`.
@@ -187,6 +189,7 @@ impl CoreState {
             relay_epoch: std::sync::atomic::AtomicU64::new(0),
             generation: Generation::new(),
             events: EventBus::new(),
+            operations: Default::default(),
             udp_socket,
             identity: RwLock::new(None),
             data_dir,

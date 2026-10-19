@@ -21,7 +21,8 @@
 //!
 //! ```text
 //! accept → authorize peer (Unix: SO_PEERCRED UID → role or refuse)
-//!        → version handshake (u32 BE both ways; incompatible → close)
+//!        → version handshake (u32 BE both ways; incompatible → error
+//!          frame with id "handshake", then close)
 //!        → Windows: role from the impersonated client token
 //!        → frames: [len: u32 BE][JSON IpcMessage]
 //!             Controller → Core: Request{id}
@@ -33,13 +34,14 @@
 //!
 //! ## Concurrency (0.4)
 //!
-//! Queries run concurrently, at most `MAX_INFLIGHT_QUERIES` per connection;
-//! commands run one at a time in arrival order (`COMMAND_QUEUE` may wait).
-//! So a slow command no longer blocks queries, and responses can arrive out
-//! of order — correlate by `id`.  A query sent before an earlier command's
-//! response arrived may not see that command's effect yet.  When the
-//! connection closes, running queries are aborted; the running command
-//! completes, queued ones are dropped.
+//! Queries (and session requests) run concurrently, at most
+//! `MAX_INFLIGHT_QUERIES` per connection; commands run one at a time in
+//! arrival order (`COMMAND_QUEUE` may wait).  So a slow command no longer
+//! blocks queries, and responses can arrive out of order — correlate by
+//! `id`.  A query sent before an earlier command's response arrived may not
+//! see that command's effect yet.  When the connection closes, running
+//! queries are aborted; the running command completes, queued ones are
+//! dropped.
 //!
 //! ## Events, `seq` and snapshots (0.4)
 //!
@@ -59,6 +61,7 @@
 #[cfg(unix)]
 pub mod auth;
 pub(crate) mod handler;
+pub(crate) mod ops;
 #[cfg(windows)]
 mod windows_pipe;
 
@@ -66,13 +69,11 @@ use crate::state::{CoreState, SeqEvent};
 use handler::handle_request;
 use msst_ipc_protocol::version::PROTOCOL_VERSION;
 use msst_ipc_protocol::access::RequestKind;
-use msst_ipc_protocol::{IpcEvent, IpcMessage, IpcRequest, Role};
-#[cfg(test)]
-use msst_ipc_protocol::IpcResponse;
+use msst_ipc_protocol::{IpcEvent, IpcMessage, IpcRequest, IpcResponse, Role};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, Semaphore};
 use tracing::{debug, error, info, warn};
 
 /// Maximum accepted frame size.
@@ -203,11 +204,13 @@ impl IpcServer {
 pub struct Session {
     /// Permission tier, fixed for the connection's lifetime.
     pub role: Role,
+    /// Whether log lines are streamed to this connection (`SetLogStream`).
+    pub log_stream: AtomicBool,
 }
 
 impl Session {
     pub fn new(role: Role) -> Self {
-        Session { role }
+        Session { role, log_stream: AtomicBool::new(true) }
     }
 }
 
@@ -251,6 +254,19 @@ where
             "IPC: incompatible Controller {}.{}.{} (Core {}.{}.{}), closing",
             rmaj, rmin, rpat, maj, min, pat
         );
+        // Best effort: say why before closing (0.4).  A Controller of another
+        // major version may not understand it; it then just sees EOF.
+        let why = IpcMessage::Response {
+            id: "handshake".into(),
+            body: IpcResponse::Error(msst_ipc_protocol::IpcError {
+                code: "incompatible_version".into(),
+                message: format!("Core speaks protocol {}.{}.{}; Controller sent {}.{}.{}", maj, min, pat, rmaj, rmin, rpat),
+            }),
+            event_seq: None,
+        };
+        if let Ok(json) = serde_json::to_string(&why) {
+            let _ = write_frame(&mut stream, &json).await;
+        }
         return;
     }
     info!("IPC: Controller protocol {}.{}.{}", rmaj, rmin, rpat);
@@ -264,24 +280,27 @@ where
 
     // ── Single writer: responses and events share one ordered queue ──────
     let (out_tx, mut out_rx) = mpsc::channel::<IpcMessage>(CLIENT_QUEUE);
+    // Anything that must end the connection (lagging client, oversized
+    // event, write error) flips this.
+    let (close_tx, mut close_rx) = watch::channel(false);
+    let writer_close = close_tx.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(e) => {
-                    error!("IPC: failed to serialize outgoing message: {}", e);
-                    continue;
-                }
+            let Some(json) = encode_outgoing(msg) else {
+                // An event can't be replaced without a gap: make the client
+                // reconnect and re-snapshot.
+                let _ = writer_close.send(true);
+                break;
             };
             if let Err(e) = write_frame(&mut writer, &json).await {
                 debug!("IPC: write failed: {}", e);
+                let _ = writer_close.send(true);
                 break;
             }
         }
     });
 
     // ── Event forwarder; closes the connection if the client lags ────────
-    let (close_tx, mut close_rx) = oneshot::channel::<()>();
     let event_out = out_tx.clone();
     let event_task = tokio::spawn(async move {
         loop {
@@ -290,14 +309,14 @@ where
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!("IPC: client not reading (queue full); disconnecting so it re-snapshots");
-                        let _ = close_tx.send(());
+                        let _ = close_tx.send(true);
                         break;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 },
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("IPC: client lagged {} event(s); disconnecting so it re-snapshots", n);
-                    let _ = close_tx.send(());
+                    let _ = close_tx.send(true);
                     break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -308,9 +327,11 @@ where
     // ── Log lines: best effort, never a reason to disconnect ─────────────
     let log_out = out_tx.clone();
     let mut logs = crate::logcapture::subscribe();
+    let log_session = session.clone();
     let log_task = tokio::spawn(async move {
         loop {
             match logs.recv().await {
+                Ok(_) if !log_session.log_stream.load(Ordering::Relaxed) => continue,
                 Ok(e) => {
                     // Leave at least half the queue for responses and state
                     // events; excess log lines are simply not forwarded.
@@ -330,17 +351,31 @@ where
 
     // ── Command runner: commands run one at a time, in arrival order ─────
     let closed = Arc::new(AtomicBool::new(false));
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<(String, IpcRequest)>(COMMAND_QUEUE);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<(String, IpcRequest, bool)>(COMMAND_QUEUE);
     let cmd_task = {
         let (state, session, out, closed) = (state.clone(), session.clone(), out_tx.clone(), closed.clone());
         tokio::spawn(async move {
-            while let Some((id, body)) = cmd_rx.recv().await {
+            while let Some((id, body, run_async)) = cmd_rx.recv().await {
                 if closed.load(Ordering::SeqCst) {
                     debug!("IPC: client gone; not starting queued command {}", id);
                     continue;
                 }
-                let msg = respond(&state, &session, id, body).await;
-                let _ = out.send(msg).await;
+                if !run_async {
+                    let msg = respond(&state, &session, id, body).await;
+                    let _ = out.send(msg).await;
+                    continue;
+                }
+                // Background operation: answer "accepted" first, then start
+                // it, so its OperationCompleted can't overtake the answer.
+                let event_seq = Some(state.events.last_seq());
+                let (body, go) = match ops::start(&state, session.clone(), body) {
+                    Ok((op, go)) => (IpcResponse::ok(&msst_ipc_protocol::views::OperationAccepted { operation_id: op }), Some(go)),
+                    Err(e) => (IpcResponse::Error(e), None),
+                };
+                let _ = out.send(IpcMessage::Response { id, body, event_seq }).await;
+                if let Some(go) = go {
+                    let _ = go.send(());
+                }
             }
         })
     };
@@ -353,7 +388,7 @@ where
         while queries.try_join_next().is_some() {}
         let frame = tokio::select! {
             f = read_frame(&mut reader) => f,
-            _ = &mut close_rx => break,
+            _ = close_rx.changed() => break,
         };
         let json = match frame {
             Ok(j) => j,
@@ -365,10 +400,10 @@ where
             }
         };
         match serde_json::from_str::<IpcMessage>(&json) {
-            Ok(IpcMessage::Request { id, body }) => {
+            Ok(IpcMessage::Request { id, body, r#async }) => {
                 if body.kind() == RequestKind::Command {
                     // Backpressure: reading pauses while the queue is full.
-                    if cmd_tx.send((id, body)).await.is_err() {
+                    if cmd_tx.send((id, body, r#async)).await.is_err() {
                         break;
                     }
                     continue;
@@ -412,6 +447,36 @@ where
     drop(out_tx);
     // Let queued responses flush, but don't hang on a stuck peer.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer_task).await;
+}
+
+/// Serialize an outgoing message within [`MAX_FRAME_LEN`].  An oversized
+/// response becomes a `response_too_large` error (same `id`); an oversized
+/// event, or one that can't be serialized, gives `None` (close).
+fn encode_outgoing(msg: IpcMessage) -> Option<String> {
+    let json = match serde_json::to_string(&msg) {
+        Ok(j) => j,
+        Err(e) => {
+            error!("IPC: failed to serialize outgoing message: {}", e);
+            return None;
+        }
+    };
+    if json.len() <= MAX_FRAME_LEN {
+        return Some(json);
+    }
+    match msg {
+        IpcMessage::Response { id, event_seq, .. } => {
+            warn!("IPC: response {} is {} bytes (limit {}); sending an error instead", id, json.len(), MAX_FRAME_LEN);
+            let body = IpcResponse::Error(msst_ipc_protocol::IpcError {
+                code: "response_too_large".into(),
+                message: format!("response is {} bytes; the limit is {}", json.len(), MAX_FRAME_LEN),
+            });
+            serde_json::to_string(&IpcMessage::Response { id, body, event_seq }).ok()
+        }
+        _ => {
+            warn!("IPC: event of {} bytes exceeds the frame limit; disconnecting so the client re-snapshots", json.len());
+            None
+        }
+    }
 }
 
 /// Handle one request and build its response frame.
@@ -519,6 +584,7 @@ mod tests {
         let msg = IpcMessage::Request {
             id: "test-1".into(),
             body: IpcRequest::Health,
+            r#async: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: IpcMessage = serde_json::from_str(&json).unwrap();
@@ -582,7 +648,7 @@ mod tests {
     }
 
     async fn request(client: &mut tokio::io::DuplexStream, id: &str, body: IpcRequest) {
-        let msg = IpcMessage::Request { id: id.into(), body };
+        let msg = IpcMessage::Request { id: id.into(), body, r#async: false };
         write_frame(client, &serde_json::to_string(&msg).unwrap()).await.unwrap();
     }
 
@@ -723,6 +789,15 @@ mod tests {
         let bad = msst_ipc_protocol::version::make_version(9, 0, 0);
         let (mut client, task) = connect(state, &events, bad).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap();
+        // Core says why, then closes.
+        let why: IpcMessage = serde_json::from_str(&read_frame(&mut client).await.unwrap()).unwrap();
+        match why {
+            IpcMessage::Response { id, body: IpcResponse::Error(e), .. } => {
+                assert_eq!(id, "handshake");
+                assert_eq!(e.code, "incompatible_version");
+            }
+            other => panic!("{:?}", other),
+        }
         let mut buf = [0u8; 1];
         assert_eq!(client.read(&mut buf).await.unwrap(), 0); // EOF
     }
@@ -787,9 +862,9 @@ mod tests {
             }
             other => panic!("expected permission_denied, got {:?}", other),
         }
-        // The connection stays usable.
-        request(&mut client, "q2", IpcRequest::GetNodes).await;
-        assert!(matches!(next(&mut client).await, IpcMessage::Response { id, body: IpcResponse::Ok(_), .. } if id == "q2"));
+        // Session requests are allowed and the connection stays usable.
+        request(&mut client, "s", IpcRequest::SetLogStream { enabled: false }).await;
+        assert!(matches!(next(&mut client).await, IpcMessage::Response { id, body: IpcResponse::Ok(_), .. } if id == "s"));
     }
 
     #[tokio::test]
@@ -805,4 +880,51 @@ mod tests {
         assert_eq!(client.read(&mut buf).await.unwrap(), 0);
     }
 
+    #[tokio::test]
+    async fn async_command_answers_first_then_completes() {
+        let (state, events) = test_state().await;
+        let (mut client, _t) = connect(state.clone(), &events, PROTOCOL_VERSION).await;
+        let msg = IpcMessage::Request { id: "a".into(), body: IpcRequest::SetPingEnabled { enabled: true }, r#async: true };
+        write_frame(&mut client, &serde_json::to_string(&msg).unwrap()).await.unwrap();
+        let op = match next(&mut client).await {
+            IpcMessage::Response { id, body: IpcResponse::Ok(v), .. } if id == "a" => v["operation_id"].as_str().unwrap().to_string(),
+            other => panic!("expected the accepted response first, got {:?}", other),
+        };
+        loop {
+            if let IpcMessage::Event { body: IpcEvent::OperationCompleted { operation_id, result, .. }, .. } = next(&mut client).await {
+                assert_eq!(operation_id, op);
+                assert!(matches!(result, IpcResponse::Ok(_)));
+                break;
+            }
+        }
+        request(&mut client, "g", IpcRequest::GetOperation { operation_id: op }).await;
+        match next(&mut client).await {
+            IpcMessage::Response { body: IpcResponse::Ok(v), .. } => assert_eq!(v["status"], "completed"),
+            other => panic!("{:?}", other),
+        }
+        // `async` on a query is ignored: answered normally.
+        let msg = IpcMessage::Request { id: "q".into(), body: IpcRequest::Health, r#async: true };
+        write_frame(&mut client, &serde_json::to_string(&msg).unwrap()).await.unwrap();
+        match next(&mut client).await {
+            IpcMessage::Response { id, body: IpcResponse::Ok(v), .. } => assert_eq!((id.as_str(), &v["status"]), ("q", &serde_json::json!("ok"))),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn oversized_outgoing_frames() {
+        let big = serde_json::json!({ "x": "y".repeat(MAX_FRAME_LEN) });
+        let resp = IpcMessage::Response { id: "r".into(), body: IpcResponse::Ok(big.clone()), event_seq: Some(3) };
+        let out: IpcMessage = serde_json::from_str(&encode_outgoing(resp).unwrap()).unwrap();
+        match out {
+            IpcMessage::Response { id, body: IpcResponse::Error(e), event_seq } => {
+                assert_eq!((id.as_str(), e.code.as_str(), event_seq), ("r", "response_too_large", Some(3)));
+            }
+            other => panic!("{:?}", other),
+        }
+        let ev = IpcMessage::Event { body: IpcEvent::NodeStateChanged { device_id: "d".into(), change: big }, seq: Some(1) };
+        assert!(encode_outgoing(ev).is_none(), "oversized event closes the connection");
+        let small = IpcMessage::Event { body: IpcEvent::NodeRemoved { device_id: "d".into() }, seq: Some(2) };
+        assert!(encode_outgoing(small).is_some());
+    }
 }

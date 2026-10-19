@@ -1,13 +1,15 @@
 //! IPC request handler — routes IpcRequest to IpcResponse.
 //!
-//! This module contains the dispatch logic for all IPC requests.
-//! Each handler is a pure function that takes the Core state and returns
-//! a response.  No I/O, no side effects (except for Commands, which
-//! return an "accepted" response and the actual work happens async).
+//! This module contains the dispatch logic for all IPC requests: the
+//! permission check (`msst_ipc_protocol::access`), then the business module
+//! that serves the request.  Queries only read state.  Commands may do I/O
+//! (coordinator calls, relay selection, disk) and, by default, return their
+//! final result; sent with `async: true` they run as operations instead
+//! (`super::ops`).
 
 use super::Session;
 use crate::state::CoreState;
-use msst_ipc_protocol::{IpcError, IpcRequest, IpcResponse};
+use msst_ipc_protocol::{views, IpcError, IpcRequest, IpcResponse};
 use reqwest::Method;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -27,6 +29,21 @@ pub async fn handle_request(request: IpcRequest, state: &Arc<CoreState>, session
         });
     }
     match request {
+        // ── Session ────────────────────────────────────────────────────────
+        IpcRequest::SetLogStream { enabled } => {
+            session.log_stream.store(enabled, std::sync::atomic::Ordering::Relaxed);
+            IpcResponse::Ok(serde_json::json!({ "log_stream": enabled }))
+        }
+        IpcRequest::GetOperation { operation_id } => {
+            match state.operations.view(&operation_id, crate::runtime::current_unix()) {
+                Some(v) => IpcResponse::ok(&v),
+                None => IpcResponse::Error(IpcError {
+                    code: "not_found".into(),
+                    message: format!("no operation {} (unknown, or finished too long ago)", operation_id),
+                }),
+            }
+        }
+
         // ── Queries ────────────────────────────────────────────────────────
         IpcRequest::Health => handle_health(state, session).await,
         IpcRequest::GetSystemState => handle_get_system_state(state).await,
@@ -134,33 +151,32 @@ async fn handle_health(state: &Arc<CoreState>, session: &Session) -> IpcResponse
     let id = state.identity.read().await;
     let id = id.as_ref();
     let auth = id.and_then(|i| i.auth.as_ref());
-    IpcResponse::Ok(serde_json::json!({
-        "status": "ok",
-        "generation": state.generation.current(),
-        // This connection's permission tier (0.4).
-        "ipc_role": session.role.as_str(),
-        "device_id": id.map(|i| i.device.id.clone()),
-        "user_id": id.map(|i| i.user.id.clone()),
-        // Unset names/handles are null, not "".
-        "device_handle": id.map(|i| i.device.handle.clone()).filter(|s| !s.is_empty()),
-        "user_handle": id.map(|i| i.user.handle.clone()).filter(|s| !s.is_empty()),
-        "user_display_name": id.map(|i| i.user.display_name.clone()).filter(|s| !s.is_empty()),
-        "device_display_name": id.map(|i| i.device.display_name.clone()).filter(|s| !s.is_empty()),
-        "device_hostname": id.map(|i| i.device.hostname.clone()).filter(|h| !h.is_empty()),
-        "is_authenticated": auth.is_some_and(|a| !a.access_token.is_empty() && a.expires_at > now),
-        "auth_expires_at": auth.map(|a| a.expires_at),
-        "ws_connected": coordinator == crate::coordinator::ConnectionState::Connected,
-        "coordinator_state": format!("{:?}", coordinator),
-        "tun_ready": state.tun_attached.load(std::sync::atomic::Ordering::SeqCst),
-        "access_auth_required": state.access_auth_required.load(std::sync::atomic::Ordering::SeqCst),
-        "relay": net.relay_addr,
-        "peer_count": net.peer_list.len(),
-        "rule_count": net.acl_rules.len(),
-        "ping_enabled": net.ping_enabled,
-        // 3.1.0-alpha names, kept for compatibility.
-        "local_device_id": net.local_device_id,
-        "local_user_id": net.local_user_id,
-    }))
+    // Unset names/handles are null, not "".
+    let set = |s: &String| Some(s.clone()).filter(|s| !s.is_empty());
+    IpcResponse::ok(&views::Health {
+        status: "ok".into(),
+        generation: state.generation.current(),
+        ipc_role: session.role,
+        device_id: id.map(|i| i.device.id.clone()),
+        user_id: id.map(|i| i.user.id.clone()),
+        device_handle: id.and_then(|i| set(&i.device.handle)),
+        user_handle: id.and_then(|i| set(&i.user.handle)),
+        user_display_name: id.and_then(|i| set(&i.user.display_name)),
+        device_display_name: id.and_then(|i| set(&i.device.display_name)),
+        device_hostname: id.and_then(|i| set(&i.device.hostname)),
+        is_authenticated: auth.is_some_and(|a| !a.access_token.is_empty() && a.expires_at > now),
+        auth_expires_at: auth.map(|a| a.expires_at),
+        ws_connected: coordinator == crate::coordinator::ConnectionState::Connected,
+        coordinator_state: format!("{:?}", coordinator),
+        tun_ready: state.tun_attached.load(std::sync::atomic::Ordering::SeqCst),
+        access_auth_required: state.access_auth_required.load(std::sync::atomic::Ordering::SeqCst),
+        relay: net.relay_addr.clone(),
+        peer_count: net.peer_list.len() as u64,
+        rule_count: net.acl_rules.len() as u64,
+        ping_enabled: net.ping_enabled,
+        local_device_id: net.local_device_id.clone(),
+        local_user_id: net.local_user_id.clone(),
+    })
 }
 
 async fn handle_get_system_state(state: &Arc<CoreState>) -> IpcResponse {
@@ -176,40 +192,30 @@ async fn handle_get_system_state(state: &Arc<CoreState>) -> IpcResponse {
     IpcResponse::Ok(v)
 }
 
+fn node_summary(e: &msst_core_state::peer_list::PeerEntry) -> views::NodeSummary {
+    views::NodeSummary {
+        device_id: e.device_id.clone(),
+        ipv4: e.ipv4.to_string(),
+        ipv6: e.ipv6.to_string(),
+        hostname: e.hostname.clone(),
+        display_name: e.display_name.clone(),
+        user_id: e.user_id.clone(),
+        user_handle: e.user_handle.clone(),
+        device_handle: e.device_handle.clone(),
+        is_authenticated: e.is_authenticated,
+    }
+}
+
 async fn handle_get_nodes(state: &Arc<CoreState>) -> IpcResponse {
     let net = state.net.read().await;
-    let nodes: Vec<serde_json::Value> = net.peer_list.device_ids().map(|id| {
-        let entry = net.peer_list.get(id);
-        serde_json::json!({
-            "device_id": id,
-            "ipv4": entry.map(|e| e.ipv4.to_string()),
-            "ipv6": entry.map(|e| e.ipv6.to_string()),
-            "hostname": entry.and_then(|e| e.hostname.as_deref()),
-            "display_name": entry.and_then(|e| e.display_name.as_deref()),
-            "user_id": entry.and_then(|e| e.user_id.as_deref()),
-            "user_handle": entry.and_then(|e| e.user_handle.as_deref()),
-            "device_handle": entry.and_then(|e| e.device_handle.as_deref()),
-            "is_authenticated": entry.map(|e| e.is_authenticated).unwrap_or(false),
-        })
-    }).collect();
-    IpcResponse::Ok(serde_json::json!({ "nodes": nodes }))
+    let nodes = net.peer_list.device_ids().filter_map(|id| net.peer_list.get(id)).map(node_summary).collect();
+    IpcResponse::ok(&views::Nodes { nodes })
 }
 
 async fn handle_get_node(state: &Arc<CoreState>, device_id: &str) -> IpcResponse {
     let net = state.net.read().await;
     match net.peer_list.get(device_id) {
-        Some(entry) => IpcResponse::Ok(serde_json::json!({
-            "device_id": entry.device_id,
-            "ipv4": entry.ipv4.to_string(),
-            "ipv6": entry.ipv6.to_string(),
-            "hostname": entry.hostname,
-            "display_name": entry.display_name,
-            "user_id": entry.user_id,
-            "user_handle": entry.user_handle,
-            "device_handle": entry.device_handle,
-            "preferred_relay": entry.preferred_relay,
-            "is_authenticated": entry.is_authenticated,
-        })),
+        Some(entry) => IpcResponse::ok(&views::NodeDetail { node: node_summary(entry), preferred_relay: entry.preferred_relay.clone() }),
         None => IpcResponse::Error(IpcError {
             code: "not_found".into(),
             message: format!("Peer {} not found", device_id),
