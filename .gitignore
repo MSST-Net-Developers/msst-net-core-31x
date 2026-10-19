@@ -5,3 +5,7 @@
 *.swp
 *.swo
 *~
+
+# AI
+.mimocode
+.claude

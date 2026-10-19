@@ -80,3 +80,33 @@ winapi = { version = "0.3", features = [
     "winnt",
     "winerror",
 ] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.dev-fast]
+inherits = "dev"
+debug = false
+strip = "debuginfo"
+
+[profile.release]
+# "3" favors runtime speed (packet-processing hot path) over binary size.
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
+rpath = false
+
+[profile.release.package."*"]
+opt-level = "z"
+strip = true
+codegen-units = 1
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
