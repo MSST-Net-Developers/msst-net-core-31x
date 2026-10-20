@@ -132,14 +132,12 @@ pub async fn path_view(state: &CoreState) -> Value {
                 "chosen": chosen,
                 "candidates": candidates,
             });
-            // Data-plane encryption (no session: no key from the coordinator).
+            // WireGuard session; `no_key`: the coordinator gave no public
+            // key, so nothing can be exchanged with this peer.
             let ev = enc_views.get(id);
-            v["encryption"] = json!(ev.map_or("unknown", |e| e.state.name()));
+            v["encryption"] = json!(ev.map_or("no_key", |e| e.state.name()));
             if let Some(t) = ev.and_then(|e| e.last_handshake_at) {
                 v["last_handshake_at"] = json!(t);
-            }
-            if let Some(t) = ev.and_then(|e| e.next_retry_at) {
-                v["next_retry_at"] = json!(t);
             }
             // Unreachable peer: when the next probe round may start.
             if pp.probe_failures > 0 {

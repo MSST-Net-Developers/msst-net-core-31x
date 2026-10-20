@@ -1,12 +1,8 @@
 //! Packet router — decides relay vs direct for outbound data.
 //!
-//! Given a destination peer and its current path state, determines:
-//! - The target address to send the UDP packet to
-//! - Whether to wrap the payload in an MSST data frame
-//!
-//! This is a pure function — no I/O, no state mutation.
+//! Given a destination peer's path state, determines the address its
+//! frames (`TYPE_WG`) are sent to.  Pure — no I/O, no state mutation.
 
-use crate::net::msst_packet;
 use crate::net::path::PeerPathMode;
 use std::net::SocketAddr;
 
@@ -15,7 +11,7 @@ use std::net::SocketAddr;
 pub enum RouteTarget {
     /// Send directly to the peer's P2P endpoint.
     Direct { endpoint: SocketAddr },
-    /// Send through a relay server (MSST data frame, relay forwards to peer).
+    /// Send through a relay server (it forwards by `dst_id`).
     Relay { relay_addr: SocketAddr },
     /// No route available — packet should be dropped.
     NoRoute,
@@ -46,17 +42,6 @@ pub fn route_outbound(
             }
         }
     }
-}
-
-/// Build an MSST data frame for a peer.
-///
-/// Wraps the raw IP payload in an MSST packet with the correct src/dst IDs.
-pub fn build_data_frame(
-    local_device_id: &str,
-    dst_device_id: &str,
-    ip_payload: &[u8],
-) -> Vec<u8> {
-    msst_packet::build_data(local_device_id, dst_device_id, ip_payload)
 }
 
 // ===========================================================================
@@ -134,13 +119,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_data_frame_encodes_correctly() {
-        let frame = build_data_frame("device-aabbccdd", "device-11223344", &[1, 2, 3, 4]);
-        let pkt = msst_packet::MsstPacket::decode(&frame).unwrap();
-        assert_eq!(pkt.packet_type, msst_packet::TYPE_DATA);
-        assert_eq!(pkt.src_id, msst_packet::encode_id("device-aabbccdd"));
-        assert_eq!(pkt.dst_id, msst_packet::encode_id("device-11223344"));
-        assert_eq!(pkt.payload, vec![1, 2, 3, 4]);
-    }
 }

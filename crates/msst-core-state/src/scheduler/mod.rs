@@ -273,21 +273,6 @@ impl P2PScheduler {
 
     // ── Outbound routing ──────────────────────────────────────────────────
 
-    /// Route an outbound data packet to the correct destination.
-    ///
-    /// Returns the target address and the MSST data frame to send.
-    /// This is the MSST-framed path (relay or direct without WG).
-    pub fn route_outbound(
-        &self,
-        dst_device_id: &str,
-        ip_payload: &[u8],
-        peer_relay: Option<SocketAddr>,
-        own_relay: Option<SocketAddr>,
-    ) -> Option<(SocketAddr, Vec<u8>)> {
-        let target = self.route_target(dst_device_id, peer_relay, own_relay)?;
-        Some((target, router::build_data_frame(&self.local_device_id, dst_device_id, ip_payload)))
-    }
-
     /// Where frames to a peer go now: its direct endpoint, else the relay.
     pub fn route_target(
         &self,
@@ -533,45 +518,19 @@ mod tests {
     // ── Outbound routing ──────────────────────────────────────────────────
 
     #[test]
-    fn route_outbound_direct() {
+    fn route_target_direct_relay_none() {
         let mut s = make_scheduler();
         s.ensure_peer("device-11223344");
-        // Force direct mode.
+        // No path entry → relay (the peer's, else ours).
+        assert_eq!(s.route_target("device-99999999", Some(v4(5, 6, 7, 8, 21031)), None), Some(v4(5, 6, 7, 8, 21031)));
+        assert_eq!(s.route_target("device-11223344", None, Some(v4(5, 6, 7, 8, 1))), Some(v4(5, 6, 7, 8, 1)));
+        assert_eq!(s.route_target("device-11223344", None, None), None);
+        // Direct wins over any relay.
         if let Some(pp) = s.paths.get_mut("device-11223344") {
             pp.set_direct(v4(1, 2, 3, 4, 12345), 1000);
         }
-
-        let result = s.route_outbound(
-            "device-11223344",
-            &[1, 2, 3],
-            None,
-            Some(v4(5, 6, 7, 8, 21031)),
-        );
-        let (addr, frame) = result.unwrap();
-        assert_eq!(addr, v4(1, 2, 3, 4, 12345));
-        let pkt = msst_packet::MsstPacket::decode(&frame).unwrap();
-        assert_eq!(pkt.packet_type, msst_packet::TYPE_DATA);
-    }
-
-    #[test]
-    fn route_outbound_relay() {
-        let s = make_scheduler();
-        // No path entry → default Relay.
-        let result = s.route_outbound(
-            "device-11223344",
-            &[1, 2, 3],
-            Some(v4(5, 6, 7, 8, 21031)),
-            None,
-        );
-        let (addr, _) = result.unwrap();
-        assert_eq!(addr, v4(5, 6, 7, 8, 21031));
-    }
-
-    #[test]
-    fn route_outbound_no_route() {
-        let s = make_scheduler();
-        let result = s.route_outbound("device-11223344", &[1, 2, 3], None, None);
-        assert!(result.is_none());
+        assert_eq!(s.route_target("device-11223344", None, Some(v4(5, 6, 7, 8, 21031))), Some(v4(1, 2, 3, 4, 12345)));
+        assert_eq!(s.direct_endpoint("device-11223344"), Some(v4(1, 2, 3, 4, 12345)));
     }
 
     // ── STUN ──────────────────────────────────────────────────────────────

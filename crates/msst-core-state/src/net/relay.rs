@@ -4,27 +4,8 @@
 //! forwarding) and for parsing relay responses.  These are pure functions
 //! — they don't own sockets or state.
 
-use super::msst_packet::{
-    self, build_keepalive, build_register, build_relay_ping, build_data,
-    encode_id, MsstPacket, HEADER_LEN, TYPE_DATA, TYPE_P2P_PING, VERSION,
-};
+use super::msst_packet::{self, build_keepalive, build_register, build_relay_ping, MsstPacket};
 use std::net::SocketAddr;
-
-// ---------------------------------------------------------------------------
-// Relay data forwarding
-// ---------------------------------------------------------------------------
-
-/// Build a data packet addressed to `dst_device_id` and return the bytes
-/// to send to the relay at `relay_addr`.
-///
-/// The relay will forward the payload to the destination device.
-pub fn build_relay_data(
-    src_device_id: &str,
-    dst_device_id: &str,
-    ip_payload: &[u8],
-) -> Vec<u8> {
-    build_data(src_device_id, dst_device_id, ip_payload)
-}
 
 // ---------------------------------------------------------------------------
 // Relay registration
@@ -59,13 +40,13 @@ pub fn build_relay_rtt_ping(device_id: &str) -> Vec<u8> {
 
 /// Classify a received UDP datagram.
 ///
-/// Returns the packet type if it's a valid MSST packet, or `None` if it's
-/// raw (WireGuard or unrecognized).
+/// MSST packets are decoded; anything else (STUN responses, garbage) is
+/// returned raw.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReceivedPacket<'a> {
     /// An MSST protocol packet.
     Msst(MsstPacket),
-    /// A non-MSST packet (likely WireGuard or raw IP).
+    /// A non-MSST datagram (a STUN response, or unrecognized).
     Raw(&'a [u8]),
 }
 
@@ -79,15 +60,6 @@ pub fn classify_packet(data: &[u8]) -> ReceivedPacket<'_> {
     } else {
         ReceivedPacket::Raw(data)
     }
-}
-
-/// Returns `true` if the packet is a raw IP packet (IPv4 or IPv6).
-pub fn is_raw_ip_packet(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    let version = data[0] >> 4;
-    version == 4 || version == 6
 }
 
 // ---------------------------------------------------------------------------
@@ -147,11 +119,11 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     #[test]
-    fn classify_msst_data_packet() {
-        let pkt = build_data("device-aabbccdd", "device-11223344", &[1, 2, 3]);
+    fn classify_msst_packet() {
+        let pkt = msst_packet::build_wg("device-aabbccdd", "device-11223344", &[1, 2, 3]);
         match classify_packet(&pkt) {
             ReceivedPacket::Msst(p) => {
-                assert_eq!(p.packet_type, TYPE_DATA);
+                assert_eq!(p.packet_type, msst_packet::TYPE_WG);
                 assert_eq!(p.payload, vec![1, 2, 3]);
             }
             _ => panic!("expected Msst"),
@@ -174,14 +146,6 @@ mod tests {
             ReceivedPacket::Raw(_) => {} // expected
             _ => panic!("expected Raw"),
         }
-    }
-
-    #[test]
-    fn is_raw_ip_packet_versions() {
-        assert!(is_raw_ip_packet(&[0x45, 0, 0, 20])); // IPv4
-        assert!(is_raw_ip_packet(&[0x60, 0, 0, 0]));  // IPv6
-        assert!(!is_raw_ip_packet(&[0x00, 0, 0, 0])); // version 0
-        assert!(!is_raw_ip_packet(&[]));               // empty
     }
 
     #[test]
@@ -216,11 +180,4 @@ mod tests {
         assert_eq!(unmap_addr(v6), v6);
     }
 
-    #[test]
-    fn build_relay_data_packet() {
-        let pkt = build_relay_data("device-aabbccdd", "device-11223344", &[9, 8, 7]);
-        let decoded = MsstPacket::decode(&pkt).unwrap();
-        assert_eq!(decoded.packet_type, TYPE_DATA);
-        assert_eq!(decoded.payload, vec![9, 8, 7]);
-    }
 }

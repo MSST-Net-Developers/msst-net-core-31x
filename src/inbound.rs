@@ -492,6 +492,9 @@ mod tests {
 
     /// Local device 172.22.0.1 (authenticated); peer device-0000000b at
     /// 172.22.1.1 (authenticated), reachable via a loopback "relay".
+    /// The peer's (device-0000000b) WireGuard key.
+    const BOB_SECRET: [u8; 32] = [0xb0; 32];
+
     async fn harness(name: &str, in_room: bool) -> Harness {
         let dir = std::env::temp_dir().join(format!("msst-inbound-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -520,6 +523,8 @@ mod tests {
                 net.room_peers.insert("device-0000000b".into());
             }
         }
+        let bob_pk = crate::test_support::identity_with_key(BOB_SECRET).public_key_base64();
+        state.encryption.lock().await.add_peer("device-0000000b", &bob_pk).unwrap();
         let (tun_tx, tun_rx) = mpsc::channel(16);
         let _ = state.tun_tx.set(tun_tx.clone());
         Harness { state, ipc_rx, tun_tx, tun_rx, relay }
@@ -609,11 +614,20 @@ mod tests {
         deliver_inbound(&h.state, &h.tun_tx, syn.clone()).await;
         assert!(auth_request_id(&mut h.ipc_rx).is_some());
 
-        // The RST went to the peer (via its relay) as an MSST data frame.
+        // The RST went to the peer via its relay, encrypted: a handshake
+        // initiation first, the RST waiting in the session queue.
         let mut buf = [0u8; 256];
         let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(1), h.relay.recv_from(&mut buf)).await.unwrap().unwrap();
-        let frame = msst_core_state::net::msst_packet::MsstPacket::decode(&buf[..n]).unwrap();
-        assert_eq!(frame.payload[20 + 13], 0x14);
+        let init = msst_core_state::net::msst_packet::MsstPacket::decode(&buf[..n]).unwrap();
+        assert_eq!(init.packet_type, msst_core_state::net::msst_packet::TYPE_WG);
+        // Play the peer: answer the handshake and decrypt what follows.
+        let mut bob = msst_core_state::encryption::EncryptionEngine::new();
+        bob.set_local_keypair(BOB_SECRET);
+        bob.add_peer("device-00000001", &h.state.encryption.lock().await.local_public_key_b64().unwrap()).unwrap();
+        let resp = bob.inbound("device-00000001", &init.payload, 0).reply.remove(0);
+        let flushed = h.state.encryption.lock().await.inbound("device-0000000b", &resp, 0).reply;
+        let rst = flushed.iter().find_map(|m| bob.inbound("device-00000001", m, 0).packet).expect("RST");
+        assert_eq!(rst[20 + 13], 0x14);
 
         // Retrying the SYN must not be admitted via connection tracking.
         deliver_inbound(&h.state, &h.tun_tx, syn).await;

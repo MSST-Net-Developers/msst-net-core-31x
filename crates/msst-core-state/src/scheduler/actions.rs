@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 /// An action the Core runtime should execute.
 #[derive(Debug, Clone)]
 pub enum SchedulerAction {
-    /// Send a UDP packet to the given address (MSST-framed or punch).
+    /// Send a UDP packet to the given address (MSST frame or punch).
     UdpSend {
         data: Vec<u8>,
         target: SocketAddr,

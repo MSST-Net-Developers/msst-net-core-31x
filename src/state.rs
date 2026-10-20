@@ -244,13 +244,6 @@ impl CoreState {
         sched.set_disable_p2p(s.disable_p2p);
         sched.set_lock_path(s.lock_path);
         sched.set_keepalive_secs(s.p2p_keepalive_secs());
-        drop(sched);
-        let changes = {
-            let mut enc = self.encryption.lock().await;
-            enc.set_policy(s.data_encryption);
-            enc.take_changes()
-        };
-        self.emit_encryption_changes(changes);
     }
 
     /// Emit `EncryptionChanged` for data-plane encryption state changes.

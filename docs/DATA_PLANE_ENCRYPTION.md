@@ -1,140 +1,95 @@
-# Data-plane encryption (WireGuard, negotiated)
+# Data-plane encryption (WireGuard only)
 
-Status: P1 implemented (MSST-Net 3.1.x).  P2/P3 are planned.
+Status: implemented (MSST-Net 3.1.x).
 
-Before this, data between peers travelled as plaintext MSST `TYPE_DATA`
-frames, directly or through a relay: anyone on the path, the relay
-included, could read or forge virtual-LAN traffic, and the inbound
-firewall trusted a source IP that anyone could spoof.  boringtun was a
-dependency, but no data was ever encrypted with it.
+All data between peers is WireGuard-encrypted, on the direct path and
+through relays.  There is no plaintext mode, no setting to turn it off and
+no fallback: a peer that cannot complete a WireGuard handshake cannot
+exchange data.  3.1.x is not wire-compatible with 3.0.x (which sent
+plaintext MSST `0x04` frames).
 
-3.1.x does not keep wire compatibility with 3.0.x.  The plaintext
-fallback below exists for peers that turned encryption off (and for a
-relay that does not forward `TYPE_WG`), not for 3.0.x.
+Relay requirements: `docs/RELAY_REQUIREMENTS_3.1.md`.
 
-## Goals and constraints
+## Keys
 
-- Relays forward by the MSST header's `dst_id`, so WireGuard messages are
-  carried **inside an MSST header**; the direct and relay paths use the
-  same format.
-- Encryption is its own state dimension, orthogonal to the path mode
-  (`relay` / `probing` / `direct`).  A path change never rebuilds a
-  WireGuard session.
-- The coordinator does not advertise capabilities today, so P1 negotiates
-  in-band: the WireGuard handshake itself is the negotiation.
-- The WireGuard static key is the device identity key; the coordinator's
-  `public_key` is the peer's WireGuard key.  keyproof already proves the
-  device holds it.
+- The WireGuard static key is the device identity key (`private.key`).
+- A peer's WireGuard public key is its `public_key` from the coordinator
+  (`room_state`, `member_joined`, `/nodes/*`).  keyproof v1 proves to the
+  coordinator that the device holds the key it registered.
+- A peer without a public key cannot be reached (`GetPathView`:
+  `encryption: "no_key"`); sending to it triggers a node fetch.
+- A changed public key rebuilds the peer's session.
 
 ## Wire format
 
-New MSST type **`TYPE_WG = 0x0D`** (`0x0A`–`0x0C` are secure discovery).
-The payload is one unmodified WireGuard message (handshake initiation,
-handshake response, cookie reply, or transport data):
+MSST type **`TYPE_WG = 0x0D`** carries exactly one WireGuard message
+(handshake initiation, handshake response, cookie reply or transport data),
+unmodified:
 
 ```
 [MSST header 23 B: "MSST", ver=1, type=0x0D, flags=0, src_id, dst_id][WireGuard message]
 ```
 
+- Relays forward by `dst_id`, so the same frames work directly and via a
+  relay.
 - The receiver finds the session by the header's `src_id`.  A forged
-  `src_id` only gets the packet rejected by WireGuard authentication.
-- Overhead: 32 bytes (WireGuard header 16 + tag 16).  With the default
-  TUN MTU of 1280 the UDP payload is 1335 bytes.
-- The old "any non-MSST datagram → try every WireGuard session" inbound
-  branch is gone.
+  `src_id` only gets the message rejected by WireGuard authentication.
+- Overhead: 32 bytes (WireGuard header 16 + tag 16).  With the default TUN
+  MTU of 1280 the UDP payload is 1335 bytes; with the maximum MTU override
+  (1500), 1555 bytes.
+- Retired and ignored: `0x04` (plaintext data), `0x08` / `0x09`
+  (unauthenticated discovery), raw IP datagrams.
 
-## Negotiation state machine (per peer)
+## Session state (per peer)
 
 ```
-               peer has a key, policy ≠ off,
-               first packet to the peer
-  unknown ─────────────────────────────────────► handshaking ──session usable──► encrypted
-     ▲                                                │
-     │                                                │ no session after 15 s
-     │                                                ▼
-     └──── retry due / key change / network ───── plaintext
-           change / peer sent us TYPE_WG          (retry 5 min, doubling to 1 h)
+           packet to the peer, or
+           the peer's handshake
+  unknown ─────────────────────────► handshaking ──session usable──► encrypted
+     ▲                                 │      ▲                         │
+     │                     no session  │      │ packet to the peer /    │ idle: keys
+     │                     after 15 s  ▼      │ the peer's handshake    │ erased
+     │                               failed ──┘                         │
+     └──────────────────────────────────────────────────────────────────┘
 ```
 
-The state says what we send to the peer:
-
-| State | Outbound data |
-|---|---|
-| `unknown` | plaintext `TYPE_DATA`; the first packet also starts a handshake |
-| `handshaking` | plaintext `TYPE_DATA` while the handshake runs, so connectivity is not interrupted |
-| `encrypted` | `TYPE_WG` only, never plaintext |
-| `plaintext` | plaintext `TYPE_DATA`; the next packet after `next_retry_at` starts a new handshake |
-
-- Negotiation is started on demand by outbound traffic, not for every
-  known node, so a large node cache does not cause handshake storms.
+- Handshakes start on demand: the first packet to a peer (or the peer's
+  own handshake).  A large node cache causes no handshake storm.
+- Packets sent before the session exists wait in boringtun's per-peer
+  queue and go out encrypted as soon as it does.
+- Retransmission (every 5 s, up to 90 s), rekey, keepalive and expiry are
+  boringtun's timers, driven by the 1 s scheduler tick.  When boringtun
+  gives up, the queue is dropped; the next packet starts a new handshake.
+  Retries are therefore bounded by traffic.
 - The initiator's session is usable when the handshake response arrives;
   the responder's when the initiator's first transport packet (the
   keepalive boringtun sends right after the response) arrives.
-- Retransmission, rekey and session expiry are boringtun's timers,
-  driven by the existing 1 s scheduler tick.
-- A peer that sends us any valid `TYPE_WG` message resets the backoff,
-  and so does a network change.  A changed public key resets the peer to
-  `unknown` with a fresh session.
-- Passive side: with policy `prefer` we answer handshakes in any state.
+- `failed` only reports that the last handshake got no answer within 15 s.
+- An idle session whose keys boringtun erased goes back to `unknown`.
 
-### Sticky encryption (downgrade protection)
+## Routing
 
-Once a session with a peer's current public key has been established,
-the peer stays `encrypted` for the lifetime of that key, in memory only:
-
-- outbound data to it is only ever sent through WireGuard; if the session
-  expired, boringtun re-handshakes and queues the packet;
-- plaintext `TYPE_DATA` from it is dropped.
-
-So a relay or on-path attacker that drops handshakes cannot force an
-established peer back to plaintext.  The cost: if that peer turns
-encryption off, traffic with it stops until its key changes, our policy
-changes, or our Core restarts.  The mark is not persisted.
+The session is independent of the path (`relay` / `probing` / `direct`): a
+path change never rebuilds it.  Every `TYPE_WG` frame to a peer, including
+replies to its handshakes, goes to the peer's direct endpoint when the path
+is direct, otherwise to the peer's relay, falling back to our own relay.
 
 ## Security rules
 
-1. **No plaintext from encrypted peers**: plaintext `TYPE_DATA` whose
-   `src_id` is an `encrypted` peer is dropped (otherwise anyone could
-   inject frames claiming to be that peer).
-2. **Source binding**: a decrypted IP packet must come from the peer's
-   own virtual IPv4/IPv6 address, like WireGuard's AllowedIPs, otherwise
-   it is dropped.  The firewall's source-IP decisions are then backed by
-   the peer's key.
-3. Downgrade by dropping handshakes is handled by sticky encryption
-   (above) for peers that were encrypted before; a peer never seen
-   encrypted can still be kept on plaintext by an on-path attacker until
-   P2/P3.
-
-## Policy: network setting `data_encryption`
-
-| Value | Behaviour |
-|---|---|
-| `prefer` (default) | Opportunistic: encrypt when the peer answers, plaintext otherwise |
-| `off` | Never initiate or answer; every peer is plaintext |
-| `require` (P2) | Only talk to peers that complete a handshake |
-
-Switching the policy rebuilds every session and forgets sticky marks.
+1. Peer data is only accepted from `TYPE_WG` frames that decrypt with that
+   peer's session.
+2. **Source binding**: a decrypted IP packet must carry the peer's own
+   virtual IPv4/IPv6 address as its source (WireGuard "AllowedIPs"),
+   otherwise it is dropped.  The firewall's source-IP decisions are thus
+   backed by the peer's key.
+3. Relays see only MSST headers (device IDs, sizes, timing), never content.
 
 ## Observability
 
 - `GetPathView`, per peer:
-  - `encryption`: `unknown` / `handshaking` / `encrypted` / `plaintext`;
-  - `last_handshake_at`: when the current session was established, if any;
-  - `next_retry_at`: in `plaintext`, when a new handshake may start.
-- IPC event `EncryptionChanged { device_id, old_state, new_state }`.
-- P2: `msst_core_wg_sessions_total`, `msst_core_wg_handshakes_total`.
-
-## Phases
-
-1. **P1** (done): `TYPE_WG`, the state machine, `prefer` / `off`, security
-   rules 1 and 2, sticky encryption, diagnostics and the event.
-2. **P2**: `require`, metrics.
-3. **P3** (needs a coordinator change): `capabilities: ["wg1"]` in
-   `register`, forwarded to peers.  A peer known to support WireGuard is
-   never downgraded, closing the remaining downgrade gap.
-
-## Open question
-
-Whether deployed relays forward an unknown MSST type (`0x0D`).  If a relay
-drops it, handshakes over that relay time out and the peers stay on
-plaintext until a direct path exists.
+  - `encryption`: `no_key`, `unknown`, `handshaking`, `encrypted` or
+    `failed`;
+  - `last_handshake_at`: when the current session was established, if any.
+- IPC event `EncryptionChanged { device_id, old_state, new_state }` (same
+  names, except `no_key`, which is not a session state).
+- Planned: `msst_core_wg_sessions_total`, `msst_core_wg_handshakes_total`.

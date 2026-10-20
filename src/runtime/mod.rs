@@ -13,6 +13,7 @@ pub use task_handle::{TaskHandle, cancel_all};
 use msst_core_state::nat::stun;
 use msst_core_state::net::msst_packet;
 use msst_core_state::net::relay::{self, classify_packet};
+use msst_core_state::encryption::Outbound;
 use msst_core_state::packet::{self, PipelineVerdict, StaticPingPolicy};
 use msst_core_state::scheduler::actions::SchedulerAction;
 use std::sync::Arc;
@@ -186,20 +187,9 @@ async fn inbound_loop(
             // ── MSST protocol packet ──────────────────────────────────────
             relay::ReceivedPacket::Msst(pkt) => {
                 match pkt.packet_type {
-                    msst_packet::TYPE_DATA => {
-                        // Inbound data from a peer (direct or via relay).
-                        // Unknown sender → learn about it for the next packet.
-                        let src_id = msst_packet::decode_id(pkt.src_id);
-                        if !src_id.is_empty() && !state.net.read().await.peer_list.contains(&src_id) {
-                            crate::nodes::demand(&state, crate::nodes::FetchDemand::ByDevice(src_id));
-                        } else if !state.encryption.lock().await.accepts_plaintext(&src_id) {
-                            debug!("inbound: dropped plaintext data from encrypted peer {}", src_id);
-                            continue;
-                        }
-                        crate::inbound::deliver_inbound(&state, &tun_tx, pkt.payload).await;
-                    }
                     msst_packet::TYPE_WG => {
-                        // WireGuard message from a peer (direct or via relay).
+                        // WireGuard message from a peer (direct or via relay):
+                        // the only way peer data is accepted.
                         let src_id = msst_packet::decode_id(pkt.src_id);
                         if !state.encryption.lock().await.has_peer(&src_id) {
                             // No key for it yet: learn it for the retransmission.
@@ -213,8 +203,13 @@ async fn inbound_loop(
                             (enc.inbound(&src_id, &pkt.payload, now), enc.take_changes())
                         };
                         state.emit_encryption_changes(changes);
-                        // Replies go back the way the message came.
-                        send_wg(&state, &src_id, src, &res.reply).await;
+                        // Replies take the same route as data to the peer
+                        // (its direct endpoint or its relay), else go back
+                        // the way the message came.
+                        if !res.reply.is_empty() {
+                            let target = peer_target(&state, &src_id).await.unwrap_or(src);
+                            send_wg(&state, &src_id, target, &res.reply).await;
+                        }
                         if let Some(ip) = res.packet {
                             if crate::inbound::from_peer_address(&state, &src_id, &ip).await {
                                 crate::inbound::deliver_inbound(&state, &tun_tx, ip).await;
@@ -284,9 +279,6 @@ async fn inbound_loop(
                 if stun::is_stun_response(data) {
                     // STUN response — hand it to the waiting endpoint detector.
                     crate::endpoints::on_stun_response(&state, data);
-                } else if is_raw_ip_packet(data) {
-                    // Raw IP datagram — still subject to the firewall.
-                    crate::inbound::deliver_inbound(&state, &tun_tx, data.to_vec()).await;
                 } else {
                     trace!("inbound: unrecognized non-MSST packet ({} bytes)", data.len());
                 }
@@ -621,9 +613,10 @@ async fn outbound_loop(mut tun_rx: mpsc::Receiver<Vec<u8>>, state: Arc<CoreState
 /// Route one IP packet read from the TUN to its peer.
 ///
 /// Directly to the peer's endpoint when the path is direct, otherwise via
-/// the peer's relay, falling back to our own.  Encrypted with WireGuard
-/// (`TYPE_WG`) when negotiated, plaintext `TYPE_DATA` otherwise (see
-/// `docs/DATA_PLANE_ENCRYPTION.md`).  Returns the UDP target.
+/// the peer's relay, falling back to our own.  Always encrypted with
+/// WireGuard (`TYPE_WG`, see `docs/DATA_PLANE_ENCRYPTION.md`); the first
+/// packets wait in the session's queue during the handshake.  Returns the
+/// UDP target.
 async fn route_outbound_packet(pkt: &[u8], state: &Arc<CoreState>) -> Option<std::net::SocketAddr> {
     route_packet(pkt, state, true).await
 }
@@ -670,14 +663,17 @@ async fn route_packet(pkt: &[u8], state: &Arc<CoreState>, track: bool) -> Option
         (enc.outbound(&dst_device_id, pkt, now), enc.take_changes())
     };
     state.emit_encryption_changes(changes);
-    if !send_wg(state, &dst_device_id, target, &out.wg).await {
-        return None;
-    }
-    if out.plain {
-        let local_id = state.net.read().await.local_device_id.clone();
-        let frame = msst_packet::build_data(&local_id, &dst_device_id, pkt);
-        if let Err(e) = state.udp_socket.send_to(&frame, relay::map_send_addr(target)).await {
-            warn!("outbound: send to {} via {} failed: {}", dst_device_id, target, e);
+    match out {
+        Outbound::Send(msg) => {
+            if !send_wg(state, &dst_device_id, target, std::slice::from_ref(&msg)).await {
+                return None;
+            }
+        }
+        Outbound::Queued => {}
+        Outbound::NoKey => {
+            // Nothing is ever sent unencrypted: learn the peer's key.
+            debug!("outbound: no public key for {}, dropped", dst_device_id);
+            crate::nodes::demand(state, crate::nodes::FetchDemand::ByDevice(dst_device_id));
             return None;
         }
     }
@@ -1005,12 +1001,6 @@ fn parse_ipv6(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
     })
 }
 
-fn is_raw_ip_packet(data: &[u8]) -> bool {
-    if data.is_empty() { return false; }
-    let v = data[0] >> 4;
-    v == 4 || v == 6
-}
-
 pub(crate) fn current_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1085,6 +1075,9 @@ mod tests {
         if let Some(r) = relay {
             net.peer_list.update_relay("device-a1b2c3d4", r);
         }
+        drop(net);
+        let pk = crate::test_support::identity_with_key([7u8; 32]).public_key_base64();
+        state.encryption.lock().await.add_peer("device-a1b2c3d4", &pk).unwrap();
     }
 
     /// IPv4/UDP 172.22.144.209:5000 → 172.22.178.196:25565.
@@ -1097,7 +1090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_goes_via_peer_relay_as_msst_data() {
+    async fn outbound_goes_via_peer_relay_as_wireguard() {
         let state = test_state().await;
         let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         add_peer(&state, Some(&relay.local_addr().unwrap().to_string())).await;
@@ -1109,10 +1102,12 @@ mod tests {
         let mut buf = [0u8; 2048];
         let (n, _) = relay.recv_from(&mut buf).await.unwrap();
         let frame = msst_packet::MsstPacket::decode(&buf[..n]).unwrap();
-        assert_eq!(frame.packet_type, msst_packet::TYPE_DATA);
+        assert_eq!(frame.packet_type, msst_packet::TYPE_WG);
         assert_eq!(msst_packet::decode_id(frame.src_id), "device-11111111");
         assert_eq!(msst_packet::decode_id(frame.dst_id), "device-a1b2c3d4");
-        assert_eq!(frame.payload, pkt); // plaintext IP, same as 3.0.x
+        // No session yet: a handshake initiation; the packet waits for it.
+        assert_eq!(frame.payload[0], 1);
+        assert!(!frame.payload.windows(4).any(|w| w == b"ping"));
 
         // The flow was recorded: the reply counts as related traffic.
         let ct = state.conn_track.lock().unwrap();
@@ -1142,6 +1137,13 @@ mod tests {
         assert_eq!(route_outbound_packet(&udp_packet(), &state).await, None);
         // Garbage.
         assert_eq!(route_outbound_packet(&[0x00, 0x01], &state).await, None);
+        // Reachable, but no public key: nothing is sent unencrypted.
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        state.net.write().await.relay_addr = Some(relay.local_addr().unwrap().to_string());
+        state.encryption.lock().await.remove_peer("device-a1b2c3d4");
+        assert_eq!(route_outbound_packet(&udp_packet(), &state).await, None);
+        let mut buf = [0u8; 64];
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), relay.recv_from(&mut buf)).await.is_err());
     }
 
     // ── Data-plane encryption: two Cores through a forwarding relay ──────
@@ -1219,34 +1221,31 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(300), core.tun.recv()).await.ok().flatten()
     }
 
-    #[tokio::test]
-    async fn peers_negotiate_wireguard_through_a_relay() {
-        use msst_core_state::encryption::EncState;
-        let mut a = wg_core("a", 0x11).await;
-        let mut b = wg_core("b", 0x22).await;
-        let (relay, seen) = forwarding_relay(vec![
+    async fn relay_pair(a: &WgCore, b: &WgCore) -> (std::net::SocketAddr, Forwarded) {
+        forwarding_relay(vec![
             (msst_packet::encode_id(&a.id.device.id), a.state.udp_socket.local_addr().unwrap()),
             (msst_packet::encode_id(&b.id.device.id), b.state.udp_socket.local_addr().unwrap()),
         ])
-        .await;
+        .await
+    }
+
+    #[tokio::test]
+    async fn peers_talk_wireguard_through_a_relay() {
+        use msst_core_state::encryption::EncState;
+        let mut a = wg_core("a", 0x11).await;
+        let mut b = wg_core("b", 0x22).await;
+        let (relay, seen) = relay_pair(&a, &b).await;
         know(&a, &b, relay).await;
         know(&b, &a, relay).await;
         let mut events = a.state.subscribe_events();
         let (a4, b4) = (a.id.virtual_ips().0, b.id.virtual_ips().0);
 
-        // First packet: delivered in plaintext while the handshake runs.
+        // First packet: waits for the handshake, then arrives encrypted.
         let ping = icmp_echo(&a4, &b4);
         assert_eq!(route_outbound_packet(&ping, &a.state).await, Some(relay));
         assert_eq!(recv_tun(&mut b).await, Some(ping.clone()));
-        let mut ok = false;
-        for _ in 0..50 {
-            if enc_state(&a, &b).await == Some(EncState::Encrypted) && enc_state(&b, &a).await == Some(EncState::Encrypted) {
-                ok = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(ok, "a: {:?}, b: {:?}", enc_state(&a, &b).await, enc_state(&b, &a).await);
+        assert_eq!(enc_state(&a, &b).await, Some(EncState::Encrypted));
+        assert!(crate::test_support::eventually(|| b.state.encryption.try_lock().is_ok_and(|e| e.state(&a.id.device.id) == Some(EncState::Encrypted))).await);
         let mut changes = Vec::new();
         while let Ok(e) = events.try_recv() {
             if let msst_ipc_protocol::IpcEvent::EncryptionChanged { new_state, .. } = e {
@@ -1254,23 +1253,31 @@ mod tests {
             }
         }
         assert_eq!(changes, ["handshaking", "encrypted"]);
+        // Only WireGuard ever crossed the relay.
+        assert!(seen.lock().unwrap().iter().all(|t| *t == msst_packet::TYPE_WG));
 
-        // Now encrypted only: the relay sees TYPE_WG, never TYPE_DATA.
         seen.lock().unwrap().clear();
         route_outbound_packet(&ping, &a.state).await;
         assert_eq!(recv_tun(&mut b).await, Some(ping.clone()));
         assert_eq!(*seen.lock().unwrap(), [msst_packet::TYPE_WG]);
 
-        // Plaintext claiming to come from a is dropped by b.
-        let forged = msst_packet::build_data(&a.id.device.id, &b.id.device.id, &ping);
-        a.state.udp_socket.send_to(&forged, b.state.udp_socket.local_addr().unwrap()).await.unwrap();
+        // Plaintext frames (the retired 0x04) and raw IP are ignored.
+        let b_addr = b.state.udp_socket.local_addr().unwrap();
+        let plain = msst_packet::MsstPacket {
+            version: msst_packet::VERSION, packet_type: 0x04, flags: 0,
+            src_id: msst_packet::encode_id(&a.id.device.id), dst_id: msst_packet::encode_id(&b.id.device.id),
+            payload: ping.clone(),
+        }
+        .encode();
+        a.state.udp_socket.send_to(&plain, b_addr).await.unwrap();
+        a.state.udp_socket.send_to(&ping, b_addr).await.unwrap();
         assert_eq!(recv_tun(&mut b).await, None);
 
         // A decrypted packet must carry a's own address.
         route_outbound_packet(&icmp_echo("172.22.9.9", &b4), &a.state).await;
         assert_eq!(recv_tun(&mut b).await, None);
 
-        // The other direction is encrypted too.
+        // The other direction.
         let back = icmp_echo(&b4, &a4);
         seen.lock().unwrap().clear();
         route_outbound_packet(&back, &b.state).await;
@@ -1280,29 +1287,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encryption_off_stays_plaintext() {
-        let mut a = wg_core("off-a", 0x33).await;
-        let mut b = wg_core("off-b", 0x44).await;
-        let (relay, seen) = forwarding_relay(vec![
-            (msst_packet::encode_id(&a.id.device.id), a.state.udp_socket.local_addr().unwrap()),
-            (msst_packet::encode_id(&b.id.device.id), b.state.udp_socket.local_addr().unwrap()),
-        ])
-        .await;
+    async fn handshake_from_an_unknown_key_is_ignored() {
+        use msst_core_state::encryption::EncState;
+        let a = wg_core("unk-a", 0x33).await;
+        let mut b = wg_core("unk-b", 0x44).await;
+        let (relay, seen) = relay_pair(&a, &b).await;
+        // a knows b, but b has no key for a.
         know(&a, &b, relay).await;
-        know(&b, &a, relay).await;
-        b.state.net_settings.write().await.data_encryption = crate::net_settings::EncryptionPolicy::Off;
-        b.state.apply_net_settings().await;
-
         let ping = icmp_echo(&a.id.virtual_ips().0, &b.id.virtual_ips().0);
         for _ in 0..3 {
             route_outbound_packet(&ping, &a.state).await;
-            assert_eq!(recv_tun(&mut b).await, Some(ping.clone()));
         }
-        // a tried once (one initiation, then plaintext); b never answered.
-        let types = seen.lock().unwrap().clone();
-        assert_eq!(types.iter().filter(|t| **t == msst_packet::TYPE_WG).count(), 1);
-        assert_eq!(types.iter().filter(|t| **t == msst_packet::TYPE_DATA).count(), 3);
-        assert_eq!(recv_tun(&mut a).await, None);
+        assert_eq!(recv_tun(&mut b).await, None);
+        // One initiation, the packets queued; nothing in plaintext.
+        assert_eq!(*seen.lock().unwrap(), [msst_packet::TYPE_WG]);
+        assert_eq!(enc_state(&a, &b).await, Some(EncState::Handshaking));
     }
 
     // ── Relay selection against a fake coordinator + fake relay ──────────

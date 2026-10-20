@@ -20,7 +20,7 @@
             "chosen": "relay",
             "device_id": "device-0000000b",
             "display_name": "Bob PC",
-            "encryption": "unknown"
+            "encryption": "no_key"
           }
         ]
       },

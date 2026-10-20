@@ -3,7 +3,7 @@
 //! ```text
 //! [magic:   4 bytes] "MSST"
 //! [version: 1 byte ] currently 1
-//! [type:    1 byte ] 0x01=register 0x02=keepalive 0x04=data
+//! [type:    1 byte ] 0x01=register 0x02=keepalive
 //!                    0x05=relay-ping 0x06=p2p-ping 0x07=p2p-pong
 //!                    0x08=discovery-register 0x09=discovery-data
 //!                    0x0A..0x0C=secure discovery (`sdisc`)
@@ -25,7 +25,6 @@ pub const VERSION: u8 = 1;
 
 pub const TYPE_REGISTER: u8 = 0x01;
 pub const TYPE_KEEPALIVE: u8 = 0x02;
-pub const TYPE_DATA: u8 = 0x04;
 pub const TYPE_RELAY_PING: u8 = 0x05;
 pub const TYPE_P2P_PING: u8 = 0x06;
 pub const TYPE_P2P_PONG: u8 = 0x07;
@@ -89,11 +88,6 @@ impl MsstPacket {
         })
     }
 
-    /// Returns `true` if this is a data packet carrying an IP payload.
-    pub fn is_data(&self) -> bool {
-        self.packet_type == TYPE_DATA
-    }
-
     /// Returns `true` if this is a P2P ping.
     pub fn is_p2p_ping(&self) -> bool {
         self.packet_type == TYPE_P2P_PING
@@ -109,7 +103,6 @@ impl MsstPacket {
         match self.packet_type {
             TYPE_REGISTER => "register",
             TYPE_KEEPALIVE => "keepalive",
-            TYPE_DATA => "data",
             TYPE_RELAY_PING => "relay-ping",
             TYPE_P2P_PING => "p2p-ping",
             TYPE_P2P_PONG => "p2p-pong",
@@ -240,19 +233,6 @@ pub fn build_relay_ping(device_id: &str) -> Vec<u8> {
     .encode()
 }
 
-/// Build a data packet carrying an IP payload.
-pub fn build_data(src_id: &str, dst_id: &str, ip_payload: &[u8]) -> Vec<u8> {
-    MsstPacket {
-        version: VERSION,
-        packet_type: TYPE_DATA,
-        flags: 0,
-        src_id: encode_id(src_id),
-        dst_id: encode_id(dst_id),
-        payload: ip_payload.to_vec(),
-    }
-    .encode()
-}
-
 /// Build a `TYPE_WG` frame carrying one WireGuard message.
 pub fn build_wg(src_id: &str, dst_id: &str, wg_message: &[u8]) -> Vec<u8> {
     MsstPacket {
@@ -278,7 +258,7 @@ mod tests {
     fn encode_decode_round_trip() {
         let pkt = MsstPacket {
             version: VERSION,
-            packet_type: TYPE_DATA,
+            packet_type: TYPE_WG,
             flags: 0,
             src_id: encode_id("device-aabbccdd"),
             dst_id: encode_id("device-11223344"),
@@ -358,12 +338,13 @@ mod tests {
     }
 
     #[test]
-    fn build_data_packet() {
-        let ip_data = vec![0x45, 0, 0, 20]; // minimal IPv4 header start
-        let pkt_bytes = build_data("device-aabbccdd", "device-11223344", &ip_data);
-        let pkt = MsstPacket::decode(&pkt_bytes).unwrap();
-        assert_eq!(pkt.packet_type, TYPE_DATA);
-        assert_eq!(pkt.payload, ip_data);
+    fn build_wg_packet() {
+        let msg = vec![4, 0, 0, 0, 1, 2, 3];
+        let pkt = MsstPacket::decode(&build_wg("device-aabbccdd", "device-11223344", &msg)).unwrap();
+        assert_eq!(pkt.packet_type, TYPE_WG);
+        assert_eq!(pkt.dst_id, encode_id("device-11223344"));
+        assert_eq!(pkt.payload, msg);
+        assert_eq!(pkt.type_name(), "wireguard");
     }
 
     #[test]
@@ -377,7 +358,6 @@ mod tests {
             payload: vec![],
         };
         assert_eq!(pkt.type_name(), "relay-ping");
-        assert!(!pkt.is_data());
         assert!(!pkt.is_p2p_ping());
     }
 }

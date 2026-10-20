@@ -280,8 +280,8 @@ pub enum IpcEvent {
         endpoint: Option<String>,
     },
 
-    /// A peer's data-plane encryption state changed.  States are
-    /// `unknown`, `handshaking`, `encrypted` or `plaintext` (see
+    /// A peer's WireGuard session state changed.  States are `unknown`,
+    /// `handshaking`, `encrypted` or `failed` (see
     /// `docs/DATA_PLANE_ENCRYPTION.md`).
     EncryptionChanged {
         device_id: String,
