@@ -249,18 +249,6 @@ async fn inbound_loop(
                             execute_scheduler_action(&action, &state, &udp).await;
                         }
                     }
-                    msst_packet::TYPE_DISCOVERY_DATA => {
-                        // Room discovery broadcast forwarded by the relay.
-                        // Unauthenticated: refused once secure discovery is
-                        // in use (only verified 0x0C on UDP 21032 then).
-                        if state.net.read().await.relay_pub_key.is_some() {
-                            debug!("inbound: dropped legacy discovery data (secure discovery in use)");
-                            continue;
-                        }
-                        if let Some(ip) = crate::discovery::inbound_discovery_payload(&pkt.payload) {
-                            let _ = tun_tx.send(ip).await;
-                        }
-                    }
                     msst_packet::TYPE_RELAY_PING => {
                         // The relay echoed one of our RTT pings; match by source.
                         let src = msst_core_state::net::relay::unmap_addr(src);

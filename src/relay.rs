@@ -33,13 +33,13 @@ struct RelayEntry {
 
 impl RelayEntry {
     /// The advertised key, if well-formed.  A malformed key is treated as
-    /// absent (legacy discovery), never as a failure of the relay.
+    /// absent (no game discovery), never as a failure of the relay.
     fn key(&self) -> Option<[u8; 32]> {
         let raw = STANDARD.decode(self.pub_key.as_deref()?).ok()?;
         match raw.try_into() {
             Ok(k) => Some(k),
             Err(_) => {
-                warn!("relay: {} advertises a malformed pub_key — using legacy discovery", self.addr);
+                warn!("relay: {} advertises a malformed pub_key — no game discovery through it", self.addr);
                 None
             }
         }
@@ -106,7 +106,7 @@ async fn key_for_preferred(relays: &[RelayEntry], pref: &str, target: SocketAddr
 /// unresponsive preferred relay falls through to auto-selection (silently
 /// pinning to a dead relay would break all relay-routed traffic).  Its key
 /// comes from the relay list too; if the list is unavailable, or doesn't
-/// include it, it is used without one (legacy discovery).
+/// include it, it is used without one (no game discovery).
 pub async fn select_best_relay(
     http: &reqwest::Client,
     coord_url: &str,

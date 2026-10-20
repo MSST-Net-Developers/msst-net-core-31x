@@ -2,10 +2,9 @@
 //! interactive authorization flow (ported from 3.0.x `deliver_inbound` /
 //! `trigger_interactive_auth` / `auth_decision`).
 //!
-//! Every IP packet that arrives from the network — MSST data frames, raw IP
-//! datagrams and WireGuard-decrypted packets alike — goes through
-//! [`deliver_inbound`].  Nothing reaches the TUN without passing the
-//! pipeline.
+//! Every IP packet from a peer (decrypted from its WireGuard session, see
+//! [`from_peer_address`]) goes through [`deliver_inbound`].  The only other
+//! way into the TUN is verified discovery broadcasts (`crate::discovery`).
 
 use crate::state::CoreState;
 use msst_acl_engine::{Action, Direction, FirewallRule, PermissionGroup, Protocol, ProtocolPort};

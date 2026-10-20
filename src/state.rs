@@ -49,7 +49,7 @@ pub struct NetState {
     /// The relay server address we're registered with (numeric `IP:port`).
     pub relay_addr: Option<String>,
     /// The secure-discovery key `GET /relays` advertised for `relay_addr`
-    /// (sdisc v1).  `None`: the relay doesn't support it — legacy discovery.
+    /// (sdisc v1).  `None`: the relay doesn't support it — no game discovery.
     /// Always set together with `relay_addr`.
     pub relay_pub_key: Option<[u8; 32]>,
     /// Peers' announced direct endpoints (P2P candidates), from room

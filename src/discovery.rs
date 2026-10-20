@@ -1,36 +1,23 @@
-//! Game discovery proxy — UDP 21032 (ported from 3.0.x `net/discovery.rs`).
+//! Game discovery proxy — UDP 21032.
 //!
 //! Carries IPv4 multicast/broadcast (Minecraft Java LAN 224.0.2.60, mDNS
 //! 224.0.0.251, subnet broadcasts) between members of a room so LAN game
-//! discovery works over the virtual network.
+//! discovery works over the virtual network.  It uses secure discovery
+//! (sdisc v1, see `crate::sdisc`) only, so it needs a relay that advertised
+//! a `pub_key` in `GET /relays` (`NetState::relay_pub_key`); with any other
+//! relay there is no game discovery (`GetRelays`: `sdisc.active = false`).
 //!
 //! - **Outbound** (only while in a room): discovery packets read from the
 //!   TUN — and, on Unix desktops, broadcasts this machine sends on its
 //!   physical LAN (rewritten into MSST space) — are de-duplicated,
-//!   rate-limited (10/s) and sent to the relay as `TYPE_DISCOVERY_DATA`
-//!   with the room ID.
-//! - **Inbound**: the relay delivers them as raw IPv4 on UDP 21032 or as
-//!   `TYPE_DISCOVERY_DATA` on the main port.  They are injected into the TUN
-//!   without ACL evaluation (3.0.x design) — but, unlike 3.0.x, only if the
-//!   destination really is a discovery target, so these paths can't be used
-//!   to inject unicast traffic past the firewall.
-//! - **Registration**: `TYPE_DISCOVERY_REGISTER` from UDP 21032 to the relay
-//!   every 25 s so it learns that socket's NAT mapping.
-//!
-//! ## Secure discovery (sdisc v1, see `crate::sdisc`)
-//!
-//! Used whenever the current relay advertised a `pub_key` in `GET /relays`
-//! (`NetState::relay_pub_key`); otherwise everything above applies as in
-//! 3.0.x.  In secure mode:
-//!
-//! - outbound packets go as authenticated `0x0B`, registration as `0x0A`
-//!   (only while in a room: on join, ~1 s later, then every 25 s);
-//! - UDP 21032 accepts only `0x0C` from that relay that passes the tag,
-//!   recipient and counter checks; bare IPv4 is dropped, and so is
-//!   `TYPE_DISCOVERY_DATA` on the main port;
-//! - `0x0C` whose original sender the relay could not verify (legacy sender,
-//!   relay in `optional` mode) is accepted and counted
-//!   (`SdiscStats::rx_unverified_sender`).
+//!   rate-limited (10/s) and sent to the relay as authenticated `0x0B`.
+//! - **Registration**: `0x0A` from UDP 21032 to the relay (on join, ~1 s
+//!   later, then every 25 s) so it learns that socket's NAT mapping.
+//! - **Inbound**: UDP 21032 accepts only `0x0C` from that relay that passes
+//!   the tag, recipient and counter checks and whose original sender the
+//!   relay authenticated (flag bit 0).  The payload must be a discovery
+//!   packet; it is then injected into the TUN without ACL evaluation, so
+//!   this path can't be used to inject unicast traffic past the firewall.
 //!
 //! Every outcome is counted in [`SdiscStats`] (reported by `GetRelays`).
 //!
@@ -40,7 +27,6 @@
 use crate::ippkt;
 use crate::sdisc::{self, DropReason, RegisterSchedule, SdiscKeys};
 use crate::state::CoreState;
-use msst_core_state::net::msst_packet::{encode_id, MsstPacket, TYPE_DISCOVERY_DATA, TYPE_DISCOVERY_REGISTER, VERSION};
 use msst_core_state::net::relay::map_send_addr;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -54,7 +40,6 @@ use tracing::{debug, info, warn};
 
 pub const DISCOVERY_PORT: u16 = 21032;
 const DISCOVERY_MULTICAST: &[Ipv4Addr] = &[Ipv4Addr::new(224, 0, 2, 60), Ipv4Addr::new(224, 0, 0, 251)];
-const REGISTER_INTERVAL: Duration = Duration::from_secs(25);
 /// Registration loop tick (secure registration needs the 1 s early retry).
 const REGISTER_TICK: Duration = Duration::from_secs(1);
 /// Minimum interval between warnings about dropped secure packets.
@@ -73,25 +58,6 @@ pub fn is_discovery_target(dst: Ipv4Addr) -> bool {
 /// Whether `data` is an IPv4 packet to a discovery target.
 pub fn is_ipv4_discovery_packet(data: &[u8]) -> bool {
     data.len() >= 20 && data[0] >> 4 == 4 && is_discovery_target(Ipv4Addr::new(data[16], data[17], data[18], data[19]))
-}
-
-/// Handle an inbound `TYPE_DISCOVERY_DATA` payload
-/// (`[room_id_len: 1][room_id][IPv4 packet]`): returns the IPv4 packet to
-/// inject, if it is a discovery packet.
-pub fn inbound_discovery_payload(payload: &[u8]) -> Option<Vec<u8>> {
-    let room_len = *payload.first()? as usize;
-    let ip = payload.get(1 + room_len..)?;
-    is_ipv4_discovery_packet(ip).then(|| ip.to_vec())
-}
-
-/// Build the outbound `TYPE_DISCOVERY_DATA` frame.
-pub fn build_discovery_data(device_id: &str, room_id: &str, ip_pkt: &[u8]) -> Vec<u8> {
-    let room = &room_id.as_bytes()[..room_id.len().min(255)];
-    let mut payload = Vec::with_capacity(1 + room.len() + ip_pkt.len());
-    payload.push(room.len() as u8);
-    payload.extend_from_slice(room);
-    payload.extend_from_slice(ip_pkt);
-    MsstPacket { version: VERSION, packet_type: TYPE_DISCOVERY_DATA, flags: 0, src_id: encode_id(device_id), dst_id: [0; 8], payload }.encode()
 }
 
 /// Start the proxy.  Returns the sender the outbound path feeds (TUN
@@ -130,8 +96,6 @@ pub struct SdiscStats {
     pub tx_register: AtomicU64,
     pub tx_data: AtomicU64,
     pub rx_accepted: AtomicU64,
-    /// Accepted 0x0C whose original sender the relay did not verify.
-    pub rx_unverified_sender: AtomicU64,
     pub drop_not_deliver: AtomicU64,
     pub drop_malformed: AtomicU64,
     pub drop_bad_tag: AtomicU64,
@@ -140,6 +104,8 @@ pub struct SdiscStats {
     pub drop_replay: AtomicU64,
     /// Verified, but the payload is not a discovery packet.
     pub drop_not_discovery: AtomicU64,
+    /// Verified, but the relay could not authenticate the original sender.
+    pub drop_unverified_sender: AtomicU64,
 }
 
 impl SdiscStats {
@@ -161,7 +127,6 @@ impl SdiscStats {
             "tx_register": g(&self.tx_register),
             "tx_data": g(&self.tx_data),
             "rx_accepted": g(&self.rx_accepted),
-            "rx_unverified_sender": g(&self.rx_unverified_sender),
             "drop": {
                 "not_deliver": g(&self.drop_not_deliver),
                 "malformed": g(&self.drop_malformed),
@@ -170,6 +135,7 @@ impl SdiscStats {
                 "stale": g(&self.drop_stale),
                 "replay": g(&self.drop_replay),
                 "not_discovery": g(&self.drop_not_discovery),
+                "unverified_sender": g(&self.drop_unverified_sender),
             },
         })
     }
@@ -258,23 +224,25 @@ fn unix_ms() -> u64 {
 /// Verify a datagram received on UDP 21032 in secure mode.  Returns the
 /// IPv4 discovery packet to inject; updates the replay state and counters.
 /// `Err(Some(reason))`: failed verification; `Err(None)`: verified, but not
-/// a discovery packet.  Every drop is counted here.
+/// a discovery packet or from a sender the relay could not authenticate.
+/// Every drop is counted here.
 fn accept_secure(session: &mut Bound, stats: &SdiscStats, pkt: &[u8], now_ms: u64) -> Result<Vec<u8>, Option<DropReason>> {
     let d = sdisc::verify_deliver(&session.keys, session.own_id, pkt, now_ms, session.rx_last).map_err(|r| {
         stats.count_drop(r);
         Some(r)
     })?;
     session.rx_last = d.counter;
+    if !d.sender_verified {
+        // The relay forwarded a sender it could not authenticate.
+        stats.drop_unverified_sender.fetch_add(1, Ordering::Relaxed);
+        debug!("discovery: dropped 0x0C from unverified sender {:016x}", d.sender);
+        return Err(None);
+    }
     if !is_ipv4_discovery_packet(d.ipv4) {
         stats.drop_not_discovery.fetch_add(1, Ordering::Relaxed);
         return Err(None);
     }
     stats.rx_accepted.fetch_add(1, Ordering::Relaxed);
-    if !d.sender_verified {
-        // Legacy sender (relay in optional mode): accepted by local policy.
-        stats.rx_unverified_sender.fetch_add(1, Ordering::Relaxed);
-        debug!("discovery: accepted 0x0C from unverified sender {:016x}", d.sender);
-    }
     Ok(d.ipv4.to_vec())
 }
 
@@ -290,10 +258,14 @@ async fn rx_loop(sock: Arc<UdpSocket>, tun_tx: mpsc::Sender<Vec<u8>>, state: Arc
             }
         };
         let ctx = secure_ctx(&state).await;
-        let pkt = if let Some(relay_pk) = ctx.relay_pk {
-            if !ensure_keys(&state, &secure, &relay_pk, &ctx.device_id).await {
-                continue;
-            }
+        let Some(relay_pk) = ctx.relay_pk else {
+            debug!("discovery: dropped {} B from {} (relay has no secure discovery)", len, src);
+            continue;
+        };
+        if !ensure_keys(&state, &secure, &relay_pk, &ctx.device_id).await {
+            continue;
+        }
+        let pkt = {
             let mut s = secure.lock().unwrap();
             let Some(bound) = s.current(&relay_pk, &ctx.device_id) else { continue };
             match accept_secure(bound, &state.sdisc_stats, &buf[..len], unix_ms()) {
@@ -303,17 +275,11 @@ async fn rx_loop(sock: Arc<UdpSocket>, tun_tx: mpsc::Sender<Vec<u8>>, state: Arc
                     if r == DropReason::Stale && s.should_warn(Instant::now()) {
                         warn!("discovery: dropping secure discovery packets with stale timestamps — is the system clock off by more than {} s?", sdisc::MAX_CLOCK_SKEW_MS / 1000);
                     } else {
-                        debug!("discovery: secure mode dropped {} B from {} ({})", len, src, r.as_str());
+                        debug!("discovery: dropped {} B from {} ({})", len, src, r.as_str());
                     }
                     continue;
                 }
             }
-        } else {
-            if !is_ipv4_discovery_packet(&buf[..len]) {
-                debug!("discovery: dropped non-discovery packet ({} B) from {}", len, src);
-                continue;
-            }
-            buf[..len].to_vec()
         };
         if tun_tx.send(pkt).await.is_err() {
             break;
@@ -356,7 +322,8 @@ async fn tx_loop(mut rx: mpsc::Receiver<Vec<u8>>, sock: Arc<UdpSocket>, state: A
     let mut st = TxState::default();
     while let Some(mut pkt) = rx.recv().await {
         let SecureCtx { relay, relay_pk, room, device_id } = secure_ctx(&state).await;
-        let (Some(relay), Some(room)) = (relay, room) else { continue };
+        // Discovery needs a relay with secure discovery.
+        let (Some(relay), Some(room), Some(relay_pk)) = (relay, room, relay_pk) else { continue };
         if device_id.is_empty() {
             continue;
         }
@@ -368,23 +335,19 @@ async fn tx_loop(mut rx: mpsc::Receiver<Vec<u8>>, sock: Arc<UdpSocket>, state: A
         if st.is_duplicate(&device_id, &pkt, now) || st.is_rate_limited(&device_id, now) {
             continue;
         }
-        let frame = match relay_pk {
-            None => build_discovery_data(&device_id, &room, &pkt),
-            Some(relay_pk) => {
-                if !ensure_keys(&state, &secure, &relay_pk, &device_id).await {
-                    continue;
-                }
-                let mut s = secure.lock().unwrap();
-                let counter = s.next_counter();
-                let Some(bound) = s.current(&relay_pk, &device_id) else { continue };
-                // Never downgraded to 0x09: an invalid room ID just isn't sent.
-                let Some(frame) = sdisc::build_client_packet(&bound.keys, bound.own_id, counter, &room, Some(&pkt)) else {
-                    debug!("discovery: room ID {:?} not valid for secure discovery", room);
-                    continue;
-                };
-                state.sdisc_stats.tx_data.fetch_add(1, Ordering::Relaxed);
-                frame
-            }
+        if !ensure_keys(&state, &secure, &relay_pk, &device_id).await {
+            continue;
+        }
+        let frame = {
+            let mut s = secure.lock().unwrap();
+            let counter = s.next_counter();
+            let Some(bound) = s.current(&relay_pk, &device_id) else { continue };
+            let Some(frame) = sdisc::build_client_packet(&bound.keys, bound.own_id, counter, &room, Some(&pkt)) else {
+                debug!("discovery: room ID {:?} not valid for secure discovery", room);
+                continue;
+            };
+            state.sdisc_stats.tx_data.fetch_add(1, Ordering::Relaxed);
+            frame
         };
         let Some(target) = crate::relay::resolve_addr(&relay).await else { continue };
         if let Err(e) = sock.send_to(&frame, map_send_addr(target)).await {
@@ -393,47 +356,35 @@ async fn tx_loop(mut rx: mpsc::Receiver<Vec<u8>>, sock: Arc<UdpSocket>, state: A
     }
 }
 
-/// Legacy: `TYPE_DISCOVERY_REGISTER` every 25 s whenever a relay is known.
-/// Secure: `0x0A` per [`RegisterSchedule`], only while in a room (the relay
-/// finds our key through the room's peer list).
+/// `0x0A` per [`RegisterSchedule`], only while in a room (the relay finds
+/// our key through the room's peer list).
 async fn registration_loop(sock: Arc<UdpSocket>, state: Arc<CoreState>, secure: Arc<Mutex<SecureSession>>) {
     let mut ticker = tokio::time::interval(REGISTER_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut legacy_next = Instant::now();
     let mut schedule = RegisterSchedule::default();
     let start = Instant::now();
     loop {
         ticker.tick().await;
         let SecureCtx { relay, relay_pk, room, device_id: id } = secure_ctx(&state).await;
         let now_ms = start.elapsed().as_millis() as u64;
-        let pkt = match relay_pk {
-            None => {
-                schedule.poll(None, now_ms);
-                let now = Instant::now();
-                if relay.is_none() || id.is_empty() || now < legacy_next {
-                    continue;
-                }
-                legacy_next = now + REGISTER_INTERVAL;
-                MsstPacket { version: VERSION, packet_type: TYPE_DISCOVERY_REGISTER, flags: 0, src_id: encode_id(&id), dst_id: [0; 8], payload: vec![] }.encode()
-            }
-            Some(relay_pk) => {
-                // Next legacy register goes out immediately if the relay
-                // loses its key.
-                legacy_next = Instant::now();
-                let target = match (&relay, &room) {
-                    (Some(r), Some(room)) if !id.is_empty() => Some((r.clone(), room.clone(), relay_pk)),
-                    _ => None,
-                };
-                if !schedule.poll(target, now_ms) || !ensure_keys(&state, &secure, &relay_pk, &id).await {
-                    continue;
-                }
-                let mut s = secure.lock().unwrap();
-                let counter = s.next_counter();
-                let Some(bound) = s.current(&relay_pk, &id) else { continue };
-                let Some(pkt) = sdisc::build_client_packet(&bound.keys, bound.own_id, counter, room.as_deref().unwrap_or(""), None) else { continue };
-                state.sdisc_stats.tx_register.fetch_add(1, Ordering::Relaxed);
-                pkt
-            }
+        let target = match (&relay, &room, relay_pk) {
+            (Some(r), Some(room), Some(pk)) if !id.is_empty() => Some((r.clone(), room.clone(), pk)),
+            _ => None,
+        };
+        let Some(relay_pk) = relay_pk else {
+            schedule.poll(None, now_ms);
+            continue;
+        };
+        if !schedule.poll(target, now_ms) || !ensure_keys(&state, &secure, &relay_pk, &id).await {
+            continue;
+        }
+        let pkt = {
+            let mut s = secure.lock().unwrap();
+            let counter = s.next_counter();
+            let Some(bound) = s.current(&relay_pk, &id) else { continue };
+            let Some(pkt) = sdisc::build_client_packet(&bound.keys, bound.own_id, counter, room.as_deref().unwrap_or(""), None) else { continue };
+            state.sdisc_stats.tx_register.fetch_add(1, Ordering::Relaxed);
+            pkt
         };
         let Some(relay) = relay else { continue };
         let Some(target) = crate::relay::resolve_addr(&relay).await else { continue };
@@ -545,20 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn inbound_payload_only_admits_discovery_packets() {
-        let mc = udp_to(Ipv4Addr::new(224, 0, 2, 60));
-        let frame = build_discovery_data("device-00000001", "space-1", &mc);
-        let pkt = MsstPacket::decode(&frame).unwrap();
-        assert_eq!(pkt.packet_type, TYPE_DISCOVERY_DATA);
-        assert_eq!(inbound_discovery_payload(&pkt.payload).unwrap(), mc);
-        // A unicast packet smuggled in the same frame is refused.
-        let unicast = udp_to(Ipv4Addr::new(172, 22, 0, 1));
-        let frame = build_discovery_data("device-00000001", "space-1", &unicast);
-        assert!(inbound_discovery_payload(&MsstPacket::decode(&frame).unwrap().payload).is_none());
-        assert!(inbound_discovery_payload(&[5, 1]).is_none());
-    }
-
-    #[test]
     fn physical_broadcast_rewrite() {
         let mut p = udp_to(Ipv4Addr::new(192, 168, 1, 255));
         assert!(needs_msst_rewrite(&p));
@@ -611,18 +548,18 @@ mod tests {
         assert_eq!(accept_secure(&mut session, &stats, &p1, now_ms).unwrap(), mc);
         // Replayed → dropped; replay state unchanged by it.
         assert_eq!(accept_secure(&mut session, &stats, &p1, now_ms), Err(Some(DropReason::Replay)));
-        // Unverified original sender (legacy, relay optional): accepted, counted.
+        // Original sender not authenticated by the relay: dropped, counted.
         let p2 = deliver(&keys, 8, 0, (now_ms << 16) + 1, &mc);
-        assert_eq!(accept_secure(&mut session, &stats, &p2, now_ms).unwrap(), mc);
+        assert_eq!(accept_secure(&mut session, &stats, &p2, now_ms), Err(None));
         // Verified frame carrying unicast: refused (no ACL bypass).
         let p3 = deliver(&keys, 7, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + 2, &udp_to(Ipv4Addr::new(172, 22, 0, 1)));
         assert_eq!(accept_secure(&mut session, &stats, &p3, now_ms), Err(None));
-        // Bare IPv4 (3.0.x delivery) is not accepted in secure mode.
+        // Bare IPv4 is not accepted.
         assert_eq!(accept_secure(&mut session, &stats, &mc, now_ms), Err(Some(DropReason::NotDeliver)));
 
         let snap = stats.snapshot();
-        assert_eq!(snap["rx_accepted"], 2);
-        assert_eq!(snap["rx_unverified_sender"], 1);
+        assert_eq!(snap["rx_accepted"], 1);
+        assert_eq!(snap["drop"]["unverified_sender"], 1);
         assert_eq!(snap["drop"]["replay"], 1);
         assert_eq!(snap["drop"]["not_discovery"], 1);
         assert_eq!(snap["drop"]["not_deliver"], 1);

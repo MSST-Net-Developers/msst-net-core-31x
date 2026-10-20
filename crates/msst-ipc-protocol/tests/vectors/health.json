@@ -19,8 +19,6 @@
         "generation": 0,
         "ipc_role": "admin",
         "is_authenticated": false,
-        "local_device_id": "device-00000001",
-        "local_user_id": "user-00000001",
         "peer_count": 1,
         "ping_enabled": false,
         "relay": "198.51.100.1:7000",

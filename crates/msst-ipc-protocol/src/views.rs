@@ -38,10 +38,6 @@ pub struct Health {
     pub peer_count: u64,
     pub rule_count: u64,
     pub ping_enabled: bool,
-    /// 3.1.0-alpha name of `device_id`, kept for compatibility.
-    pub local_device_id: String,
-    /// 3.1.0-alpha name of `user_id`, kept for compatibility.
-    pub local_user_id: String,
 }
 
 /// One node in `GetNodes`.

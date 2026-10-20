@@ -3,12 +3,9 @@
 //! These types match the Coordinator 3.1.x `hub.go` protocol exactly.
 //! Field names and JSON shapes are verified against the Go source.
 //!
-//! ## Compatibility notes
+//! ## Notes
 //!
-//! - `registered_payload.ipv6` is `Option` for backward compatibility with
-//!   3.0.x coordinators that don't send it.
-//! - `registered_payload.user_handle` and `user_display_name` are `Option`
-//!   because non-OIDC coordinators may not send them.
+//! - 3.0.x coordinators are not supported.
 //! - `room_state_data` does NOT include a `relay` field (removed in 3.1.x
 //!   coordinator).  The client should obtain relay info from `/relays`.
 
@@ -67,18 +64,14 @@ pub struct ClientMessage {
 /// }
 /// ```
 ///
-/// `ipv6`, `user_handle`, `user_display_name` are `Option` for backward
-/// compatibility with 3.0.x coordinators.
+/// No field is `omitempty`, so all are required (empty when unset).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredPayload {
     pub hostname: String,
     pub ipv4: String,
-    #[serde(default)]
-    pub ipv6: Option<String>,
-    #[serde(default)]
-    pub user_handle: Option<String>,
-    #[serde(default)]
-    pub user_display_name: Option<String>,
+    pub ipv6: String,
+    pub user_handle: String,
+    pub user_display_name: String,
 }
 
 /// The `room_state` message payload.
@@ -136,7 +129,7 @@ pub struct NodeEvent {
 /// The `member_joined` / `member_left` message payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberEvent {
-    /// Not sent inside `data` by 3.0.x coordinators (envelope `room_id`).
+    /// Falls back to the envelope's `room_id` (`WSMessage.RoomID`).
     #[serde(default)]
     pub room_id: Option<String>,
     pub device_id: String,

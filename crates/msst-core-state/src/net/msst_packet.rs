@@ -5,9 +5,10 @@
 //! [version: 1 byte ] currently 1
 //! [type:    1 byte ] 0x01=register 0x02=keepalive
 //!                    0x05=relay-ping 0x06=p2p-ping 0x07=p2p-pong
-//!                    0x08=discovery-register 0x09=discovery-data
 //!                    0x0A..0x0C=secure discovery (`sdisc`)
-//!                    0x0D=WireGuard message (data-plane encryption)
+//!                    0x0D=WireGuard message (all peer data)
+//!                    retired, never sent or accepted: 0x04 plaintext
+//!                    data, 0x08/0x09 unauthenticated discovery
 //! [flags:   1 byte ] 0
 //! [src_id:  8 bytes] sender device ID (big-endian u64, lower 32 bits)
 //! [dst_id:  8 bytes] destination device ID (zeros for broadcast types)
@@ -28,8 +29,6 @@ pub const TYPE_KEEPALIVE: u8 = 0x02;
 pub const TYPE_RELAY_PING: u8 = 0x05;
 pub const TYPE_P2P_PING: u8 = 0x06;
 pub const TYPE_P2P_PONG: u8 = 0x07;
-pub const TYPE_DISCOVERY_REGISTER: u8 = 0x08;
-pub const TYPE_DISCOVERY_DATA: u8 = 0x09;
 /// One WireGuard message (see `docs/DATA_PLANE_ENCRYPTION.md`).
 pub const TYPE_WG: u8 = 0x0D;
 
@@ -106,8 +105,6 @@ impl MsstPacket {
             TYPE_RELAY_PING => "relay-ping",
             TYPE_P2P_PING => "p2p-ping",
             TYPE_P2P_PONG => "p2p-pong",
-            TYPE_DISCOVERY_REGISTER => "discovery-register",
-            TYPE_DISCOVERY_DATA => "discovery-data",
             TYPE_WG => "wireguard",
             _ => "unknown",
         }
@@ -118,12 +115,9 @@ impl MsstPacket {
 // ID encoding/decoding
 // ---------------------------------------------------------------------------
 
-/// Extract the 8-char hex suffix from a device ID.
+/// Extract the 8-char hex suffix from a `device-XXXXXXXX` ID.
 pub fn extract_hex(device_id: &str) -> &str {
-    device_id
-        .strip_prefix("device-")
-        .or_else(|| device_id.strip_prefix("dev-"))
-        .unwrap_or(device_id)
+    device_id.strip_prefix("device-").unwrap_or(device_id)
 }
 
 /// Encode a device ID into 8 bytes (big-endian u64).
@@ -300,7 +294,6 @@ mod tests {
     #[test]
     fn extract_hex_variants() {
         assert_eq!(extract_hex("device-aabbccdd"), "aabbccdd");
-        assert_eq!(extract_hex("dev-aabbccdd"), "aabbccdd");
         assert_eq!(extract_hex("aabbccdd"), "aabbccdd");
     }
 

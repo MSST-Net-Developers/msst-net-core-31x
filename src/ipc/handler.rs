@@ -174,8 +174,6 @@ async fn handle_health(state: &Arc<CoreState>, session: &Session) -> IpcResponse
         peer_count: net.peer_list.len() as u64,
         rule_count: net.acl_rules.len() as u64,
         ping_enabled: net.ping_enabled,
-        local_device_id: net.local_device_id.clone(),
-        local_user_id: net.local_user_id.clone(),
     })
 }
 

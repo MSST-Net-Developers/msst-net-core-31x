@@ -1,9 +1,9 @@
-//! Virtual address derivation — ported verbatim from 3.0.x `ip.rs`.
+//! Virtual address derivation (unchanged since 3.0.x).
 //!
 //! Every device's private IPv4 / IPv6 ULA address is derived
-//! deterministically from the 8-hex-char suffix of its device ID, so the
-//! derivation MUST stay bit-for-bit identical to 3.0.x: peers running 3.0.x
-//! compute the same addresses for us independently.
+//! deterministically from the 8-hex-char suffix of its device ID.  Peers and
+//! the coordinator compute the same addresses independently, and devices
+//! upgraded from 3.0.x keep theirs, so the derivation MUST NOT change.
 
 use tracing::debug;
 
@@ -46,14 +46,11 @@ pub fn is_msst_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
-/// Extract the 8-char hex suffix from a device ID, handling both the current
-/// `device-XXXXXXXX` format and the legacy `dev-XXXXXXXX` format.
-/// If neither prefix matches, the input is returned as-is (best-effort).
+/// Extract the 8-char hex suffix from a `device-XXXXXXXX` ID.  Without the
+/// prefix the input is returned as-is (best-effort).  3.0.x `dev-` IDs are
+/// migrated when the identity is loaded.
 pub fn extract_hex(device_id: &str) -> &str {
-    device_id
-        .strip_prefix("device-")
-        .or_else(|| device_id.strip_prefix("dev-"))
-        .unwrap_or(device_id)
+    device_id.strip_prefix("device-").unwrap_or(device_id)
 }
 
 /// Derives IPv4 and IPv6 addresses from the device ID hex string (8 hex chars, no prefix).
@@ -124,7 +121,6 @@ mod tests {
     #[test]
     fn extract_hex_prefixes() {
         assert_eq!(extract_hex("device-a1b2c3d4"), "a1b2c3d4");
-        assert_eq!(extract_hex("dev-a1b2c3d4"), "a1b2c3d4");
         assert_eq!(extract_hex("a1b2c3d4"), "a1b2c3d4");
     }
 }

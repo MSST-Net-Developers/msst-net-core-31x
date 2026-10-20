@@ -128,6 +128,12 @@ Add `"async": true` to a command request:
     and `last_handshake_at` (Unix seconds) while a session exists;
   - new event `EncryptionChanged {device_id, old_state, new_state}` with
     the session states (`unknown`, `handshaking`, `encrypted`, `failed`).
+- **Secure discovery only** (`GetRelays.secure_discovery`): with a relay
+  that has no `pub_key` there is no game discovery (`active: false`).
+  `0x0C` from a sender the relay did not verify is now dropped:
+  `rx_unverified_sender` is replaced by `drop.unverified_sender`.
+- **Removed from `Health`:** `local_device_id` and `local_user_id`
+  (3.1.0-alpha aliases); use `device_id` and `user_id`.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`
   and `NodeStateChanged` (previously `""` was passed through); a peer
   without a device ID is ignored instead of failing the whole

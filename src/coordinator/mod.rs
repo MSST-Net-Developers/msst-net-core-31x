@@ -816,9 +816,9 @@ impl CoordinatorClient {
                 Ok(Some(CoordinatorEvent::Registered {
                     hostname: data.hostname,
                     ipv4: data.ipv4,
-                    ipv6: data.ipv6.unwrap_or_default(),
-                    user_handle: data.user_handle.unwrap_or_default(),
-                    user_display_name: data.user_display_name.unwrap_or_default(),
+                    ipv6: data.ipv6,
+                    user_handle: data.user_handle,
+                    user_display_name: data.user_display_name,
                 }))
             }
             "room_state" => {
@@ -1046,17 +1046,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_registered_without_ipv6() {
-        // 3.0.x coordinators don't send ipv6 — should default to empty.
+    fn parse_registered_requires_all_fields() {
+        // A 3.0.x coordinator (no ipv6) is not supported.
         let client = make_client();
         let json = r#"{"type":"registered","data":{"hostname":"pc.abjust.ezplay.msst.net","ipv4":"172.22.1.1","user_handle":"abjust","user_display_name":"Abjust"}}"#;
-        let event = client.parse_incoming(json).unwrap().unwrap();
-        match event {
-            CoordinatorEvent::Registered { ipv6, .. } => {
-                assert_eq!(ipv6, ""); // graceful default
-            }
-            _ => panic!("expected Registered"),
-        }
+        assert!(client.parse_incoming(json).is_err());
     }
 
     #[test]
@@ -1289,9 +1283,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_member_events_3_0_x_shape() {
+    fn parse_member_events_with_envelope_room_id() {
         let client = make_client();
-        // 3.0.x coordinators send the full peer and no room_id in data.
+        // The full peer, and the room in the envelope only.
         let json = r#"{"type":"member_joined","room_id":"space-1","data":{"device_id":"device-aabbccdd","public_key":"pk","ipv4":"172.22.1.1","ipv6":"fd22:2222:2222:2222::aabb:ccdd","hostname":"h","endpoints":["relay:1.2.3.4:7000"],"is_authenticated":true}}"#;
         match client.parse_incoming(json).unwrap().unwrap() {
             CoordinatorEvent::MemberJoined { room_id, peer } => {
