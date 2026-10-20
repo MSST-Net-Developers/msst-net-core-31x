@@ -123,7 +123,7 @@ verifier = 71e7aa44e64ecd1cb0ddbc6049b81a191738151aa8e662402735e1a6a6224dab
 }
 ```
 
-Coordinator 校验：公钥对应的中转已登记且在线、`features` 含 `sreg1` 与 `sdisc1`、密码校验通过、满足 `require_room_password`。任一不满足就拒绝建房，并返回可区分的错误码：`relay_unknown`、`relay_offline`、`relay_unsupported`、`relay_password_required`、`relay_password_wrong`、`room_password_required`。
+Coordinator 校验：公钥对应的中转已登记且在线、`features` 含 `sreg1` 与 `sdisc1`、密码校验通过、满足 `require_room_password`。任一不满足就拒绝建房，并返回可区分的错误码：`invalid_relay`、`relay_offline`、`relay_unsupported`、`relay_password_required`、`relay_password_wrong`、`room_password_required`。中转按公钥查找，房间中转的地址取中转登记时上报的地址。接口细节、校验顺序与 HTTP 状态见 `ROOM_RELAY_SERVER_3.1.md` CR4。
 
 官方中转同样可以被指定，此时只需地址（或中转 ID）与公钥，没有密码。
 
