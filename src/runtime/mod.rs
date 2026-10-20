@@ -471,8 +471,11 @@ async fn coordinator_event_loop(
                     .update_room_contact(&device_id, None, current_unix());
                 let mut net = state.net.write().await;
                 net.room_peers.insert(device_id.clone());
+                let own = net.local_device_id == device_id;
                 drop(net);
-                state.scheduler.lock().await.ensure_peer(&device_id);
+                if !own {
+                    state.scheduler.lock().await.ensure_peer(&device_id);
+                }
             }
 
             // ── Member left ───────────────────────────────────────────────

@@ -140,6 +140,7 @@ dependencies = [
  "ip_network",
  "ip_network_table",
  "libc",
+ "mock_instant",
  "nix 0.31.3",
  "parking_lot",
  "portable-atomic",
@@ -941,6 +942,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock_instant"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9366861eb2a2c436c20b12c8dbec5f798cea6b47ad99216be0282942e2c81ea0"
+
+[[package]]
 name = "msst-acl-engine"
 version = "3.1.0-alpha.1"
 dependencies = [
@@ -955,6 +962,7 @@ dependencies = [
  "base64 0.22.1",
  "boringtun",
  "if-addrs",
+ "mock_instant",
  "msst-acl-engine",
  "rand 0.8.8",
  "serde",

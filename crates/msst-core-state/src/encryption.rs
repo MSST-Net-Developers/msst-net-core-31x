@@ -323,15 +323,25 @@ impl EncryptionEngine {
         let mut out = Vec::new();
         let Self { sessions, buf, changes, .. } = self;
         for (id, s) in sessions.iter_mut() {
-            if s.state == EncState::Unknown {
-                continue;
-            }
+            // Every session, idle ones included: boringtun's clock only
+            // advances in `update_timers`, and the next handshake and
+            // session are timestamped with it.  Skipping idle peers left
+            // the clock stale, so a session established after a long idle
+            // period looked old and was erased at the next tick
+            // (`REJECT_AFTER_TIME * 3`), and a handshake we started was
+            // given up at once (`REKEY_ATTEMPT_TIME`).  An idle session has
+            // nothing to send, so this starts no handshakes.
             match s.tunn.update_timers(buf) {
                 TunnResult::WriteToNetwork(p) => out.push((id.clone(), p.to_vec())),
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                    // Idle session erased, or retries given up.
-                    let new = if s.state == EncState::Encrypted { EncState::Unknown } else { EncState::Failed };
-                    transition(changes, id, s, new);
+                    // Idle session erased, or retries given up.  Already
+                    // idle or failed: boringtun repeats this until the next
+                    // handshake, nothing changed.
+                    match s.state {
+                        EncState::Encrypted => transition(changes, id, s, EncState::Unknown),
+                        EncState::Handshaking => transition(changes, id, s, EncState::Failed),
+                        EncState::Unknown | EncState::Failed => {}
+                    }
                 }
                 _ => {}
             }
@@ -554,5 +564,43 @@ mod tests {
         let ct = sent(a.outbound("b", &pkt, T0));
         assert_eq!(ct.len(), pkt.len() + 32);
         assert_eq!(b.inbound("a", &ct, T0).packet, Some(pkt));
+    }
+
+    /// A session established after the peers were idle for longer than
+    /// boringtun's expiry times survives the next ticks (the timers of idle
+    /// sessions are driven too, so boringtun's clock is current).
+    #[test]
+    fn session_after_long_idle_is_kept() {
+        use mock_instant::MockClock;
+        use std::time::Duration;
+
+        let (mut a, mut b) = pair();
+        // Ten minutes of ticks without traffic: > REJECT_AFTER_TIME * 3
+        // (540 s) and > REKEY_ATTEMPT_TIME (90 s).
+        let mut now = T0;
+        for _ in 0..600 {
+            MockClock::advance(Duration::from_secs(1));
+            now += 1;
+            assert!(a.tick(now).is_empty() && b.tick(now).is_empty(), "idle sessions send nothing");
+        }
+        assert_eq!((a.state("b"), b.state("a")), (Some(EncState::Unknown), Some(EncState::Unknown)));
+
+        let init = sent(a.outbound("b", &ipv4([10, 0, 0, 1], [10, 0, 0, 2], b"hi"), now));
+        assert_eq!(exchange(&mut a, &mut b, vec![init]).len(), 1, "queued packet delivered");
+        assert_eq!((a.state("b"), b.state("a")), (Some(EncState::Encrypted), Some(EncState::Encrypted)));
+
+        for _ in 0..5 {
+            MockClock::advance(Duration::from_secs(1));
+            now += 1;
+            for (_, m) in a.tick(now) {
+                exchange(&mut a, &mut b, vec![m]);
+            }
+            for (_, m) in b.tick(now) {
+                exchange_named(&mut b, "b", &mut a, "a", vec![m]);
+            }
+        }
+        assert_eq!((a.state("b"), b.state("a")), (Some(EncState::Encrypted), Some(EncState::Encrypted)), "{:?}", a.take_changes());
+        let data = sent(a.outbound("b", &ipv4([10, 0, 0, 1], [10, 0, 0, 2], b"still"), now));
+        assert_eq!(exchange(&mut a, &mut b, vec![data]).len(), 1, "session still usable");
     }
 }

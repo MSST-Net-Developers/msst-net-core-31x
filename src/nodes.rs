@@ -136,6 +136,12 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         warn!("nodes: ignoring a peer without a device ID ({:?}, {:?})", p.ipv4, p.ipv6);
         return false;
     }
+    // The coordinator lists this device too (room_state, /nodes/by-user);
+    // it is not a peer: no path probing, session or node entry for it.
+    if state.net.read().await.local_device_id == p.device_id {
+        debug!("nodes: ignoring our own device {} in peer data", p.device_id);
+        return false;
+    }
     let (Ok(ipv4), Ok(ipv6)) = (p.ipv4.parse::<IpAddr>(), p.ipv6.parse::<IpAddr>()) else {
         debug!("nodes: ignoring {} with invalid addresses ({:?}, {:?})", p.device_id, p.ipv4, p.ipv6);
         return false;
@@ -385,6 +391,17 @@ mod tests {
             }
         }
         assert_eq!(added, Some(None), "empty name is reported as null");
+    }
+
+    #[tokio::test]
+    async fn own_device_is_not_a_peer() {
+        let (state, _rx) = crate::test_support::core_state("nodes-self").await;
+        let own = state.net.read().await.local_device_id.clone();
+        assert!(!own.is_empty());
+        let p = PeerData { device_id: &own, ipv4: "172.22.1.1", ipv6: "fd22:2222:2222:2222::1", ..Default::default() };
+        assert!(!apply_peer(&state, p).await);
+        assert!(!state.net.read().await.peer_list.contains(&own));
+        assert!(!state.encryption.lock().await.has_peer(&own));
     }
 
     #[test]
