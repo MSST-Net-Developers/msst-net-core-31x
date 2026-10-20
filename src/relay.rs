@@ -29,6 +29,9 @@ struct RelayEntry {
     /// sdisc v1.
     #[serde(default)]
     pub_key: Option<String>,
+    /// Protocol features, e.g. `["sdisc1", "sreg1"]`; absent = none.
+    #[serde(default)]
+    features: Vec<String>,
 }
 
 impl RelayEntry {
@@ -39,10 +42,17 @@ impl RelayEntry {
         match raw.try_into() {
             Ok(k) => Some(k),
             Err(_) => {
-                warn!("relay: {} advertises a malformed pub_key — no game discovery through it", self.addr);
+                warn!("relay: {} advertises a malformed pub_key — no game discovery or authenticated registration through it", self.addr);
                 None
             }
         }
+    }
+
+    /// The selection result for this entry reached at `addr`.
+    fn selected(&self, addr: SocketAddr) -> SelectedRelay {
+        let pub_key = self.key();
+        let sreg = pub_key.is_some() && self.features.iter().any(|f| f == crate::sreg::FEATURE);
+        SelectedRelay { addr: addr.to_string(), pub_key, sreg }
     }
 }
 
@@ -51,8 +61,12 @@ impl RelayEntry {
 pub struct SelectedRelay {
     /// Numeric `IP:port`.
     pub addr: String,
-    /// Secure-discovery key from `GET /relays` (pinned for this selection).
+    /// The relay's key from `GET /relays` (pinned for this selection): used
+    /// by secure discovery and authenticated registration.
     pub pub_key: Option<[u8; 32]>,
+    /// Register with `0x0E` (sreg v1): the relay lists `sreg1` in its
+    /// `features` and has a valid `pub_key`.
+    pub sreg: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,15 +98,15 @@ async fn fetch_relays(http: &reqwest::Client, coord_url: &str) -> Result<Vec<Rel
     Ok(resp.json::<RelaysResponse>().await?.relays)
 }
 
-/// The key the relay list advertises for a preferred relay reached at
-/// `target`: matched by address string, else by resolved address.
-async fn key_for_preferred(relays: &[RelayEntry], pref: &str, target: SocketAddr) -> Option<[u8; 32]> {
+/// The relay list entry for a preferred relay reached at `target`: matched
+/// by address string, else by resolved address.
+async fn entry_for_preferred<'a>(relays: &'a [RelayEntry], pref: &str, target: SocketAddr) -> Option<&'a RelayEntry> {
     if let Some(e) = relays.iter().find(|e| e.addr == pref) {
-        return e.key();
+        return Some(e);
     }
     for e in relays {
         if resolve_addr(&e.addr).await == Some(target) {
-            return e.key();
+            return Some(e);
         }
     }
     None
@@ -121,14 +135,14 @@ pub async fn select_best_relay(
         match probe_relay(pref, src_id).await {
             Some((target, rtt)) => {
                 info!("relay: preferred relay {} reachable at {} ({:.1} ms)", pref, target, rtt);
-                let pub_key = match &listed {
-                    Ok(relays) => key_for_preferred(relays, pref, target).await,
+                let unlisted = SelectedRelay { addr: target.to_string(), pub_key: None, sreg: false };
+                return Ok(match &listed {
+                    Ok(relays) => entry_for_preferred(relays, pref, target).await.map_or(unlisted, |e| e.selected(target)),
                     Err(e) => {
-                        warn!("relay: relay list unavailable ({}) — preferred relay used without a discovery key", e);
-                        None
+                        warn!("relay: relay list unavailable ({}) — preferred relay used without a key", e);
+                        unlisted
                     }
-                };
-                return Ok(SelectedRelay { addr: target.to_string(), pub_key });
+                });
             }
             None => warn!(
                 "relay: preferred relay {} did not respond — falling back to auto-selection",
@@ -152,25 +166,26 @@ pub async fn select_best_relay(
         })
         .collect();
 
-    let mut best: Option<(SocketAddr, f64, Option<[u8; 32]>)> = None;
+    let mut best: Option<(SelectedRelay, f64)> = None;
     for h in handles {
         if let Ok((relay, Some((target, rtt)))) = h.await {
             info!("relay: {} ({}) avg RTT {:.1} ms", relay.addr, target, rtt);
-            if best.is_none_or(|(_, b, _)| rtt < b) {
-                best = Some((target, rtt, relay.key()));
+            if best.as_ref().is_none_or(|(_, b)| rtt < *b) {
+                best = Some((relay.selected(target), rtt));
             }
         }
     }
     match best {
         None => anyhow::bail!("could not reach any relay server"),
-        Some((addr, rtt, pub_key)) => {
+        Some((selected, rtt)) => {
             info!(
-                "relay: selected {} ({:.1} ms, secure discovery {})",
-                addr,
+                "relay: selected {} ({:.1} ms, secure discovery {}, registration {})",
+                selected.addr,
                 rtt,
-                if pub_key.is_some() { "available" } else { "unavailable" }
+                if selected.pub_key.is_some() { "available" } else { "unavailable" },
+                if selected.sreg { "sreg1" } else { "legacy" }
             );
-            Ok(SelectedRelay { addr: addr.to_string(), pub_key })
+            Ok(selected)
         }
     }
 }
@@ -426,15 +441,15 @@ mod tests {
         use serde_json::json;
         let relay = echo_relay().await;
         let key = STANDARD.encode([5u8; 32]);
-        let listed = json!({ "relays": [{ "addr": relay.to_string(), "pub_key": key }] });
+        let listed = json!({ "relays": [{ "addr": relay.to_string(), "pub_key": key, "features": ["sdisc1", "sreg1"] }] });
         let coord = FakeCoordinator::start(move |_| (200, listed.clone()), |_| vec![]).await;
         let http = reqwest::Client::new();
 
         let auto = select_best_relay(&http, &coord.url, "device-11111111", None).await.unwrap();
-        assert_eq!(auto, SelectedRelay { addr: relay.to_string(), pub_key: Some([5u8; 32]) });
-        // Preferred relay: key looked up in the same list.
+        assert_eq!(auto, SelectedRelay { addr: relay.to_string(), pub_key: Some([5u8; 32]), sreg: true });
+        // Preferred relay: key and features looked up in the same list.
         let pref = select_best_relay(&http, &coord.url, "device-11111111", Some(&relay.to_string())).await.unwrap();
-        assert_eq!(pref.pub_key, Some([5u8; 32]));
+        assert_eq!((pref.pub_key, pref.sreg), (Some([5u8; 32]), true));
     }
 
     #[tokio::test]
@@ -444,15 +459,33 @@ mod tests {
         let relay = echo_relay().await;
         let coord = FakeCoordinator::start(|_| (200, json!({ "relays": [{ "addr": "127.0.0.1:9", "pub_key": STANDARD.encode([5u8; 32]) }] })), |_| vec![]).await;
         let pref = select_best_relay(&reqwest::Client::new(), &coord.url, "device-11111111", Some(&relay.to_string())).await.unwrap();
-        assert_eq!(pref, SelectedRelay { addr: relay.to_string(), pub_key: None });
+        assert_eq!(pref, SelectedRelay { addr: relay.to_string(), pub_key: None, sreg: false });
     }
 
     #[test]
     fn malformed_key_is_legacy() {
-        let e = |k: Option<&str>| RelayEntry { addr: "r".into(), pub_key: k.map(str::to_string) };
+        let e = |k: Option<&str>| RelayEntry { addr: "r".into(), pub_key: k.map(str::to_string), features: vec!["sreg1".into()] };
         assert_eq!(e(None).key(), None);
         assert_eq!(e(Some("AAAA")).key(), None);
         assert_eq!(e(Some("not base64!")).key(), None);
         assert_eq!(e(Some(&STANDARD.encode([5u8; 32]))).key(), Some([5u8; 32]));
+        // sreg needs both the feature and a valid key.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(!e(Some("AAAA")).selected(addr).sreg);
+        assert!(e(Some(&STANDARD.encode([5u8; 32]))).selected(addr).sreg);
+    }
+
+    #[test]
+    fn features_are_optional_in_the_relay_list() {
+        let key = STANDARD.encode([5u8; 32]);
+        let list: RelaysResponse = serde_json::from_value(serde_json::json!({ "relays": [
+            { "addr": "a:1", "pub_key": key },
+            { "addr": "b:1", "pub_key": key, "features": ["sdisc1"] },
+            { "addr": "c:1", "pub_key": key, "features": ["sdisc1", "sreg1"] },
+        ] }))
+        .unwrap();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let sreg: Vec<bool> = list.relays.iter().map(|e| e.selected(addr).sreg).collect();
+        assert_eq!(sreg, [false, false, true]);
     }
 }

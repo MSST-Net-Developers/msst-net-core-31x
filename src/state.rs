@@ -48,10 +48,13 @@ pub struct NetState {
     pub ping_enabled: bool,
     /// The relay server address we're registered with (numeric `IP:port`).
     pub relay_addr: Option<String>,
-    /// The secure-discovery key `GET /relays` advertised for `relay_addr`
-    /// (sdisc v1).  `None`: the relay doesn't support it — no game discovery.
-    /// Always set together with `relay_addr`.
+    /// The key `GET /relays` advertised for `relay_addr` (sdisc v1 and
+    /// sreg v1).  `None`: the relay doesn't support them — no game
+    /// discovery.  Always set together with `relay_addr`.
     pub relay_pub_key: Option<[u8; 32]>,
+    /// Register with `relay_addr` using `0x0E` (sreg v1) instead of
+    /// `0x01`/`0x02`.  Always set together with `relay_addr`.
+    pub relay_sreg: bool,
     /// Peers' announced direct endpoints (P2P candidates), from room
     /// state, node fetches and node events.
     pub peer_endpoints: HashMap<String, Vec<std::net::SocketAddr>>,
@@ -75,6 +78,7 @@ impl NetState {
             ping_enabled: false,
             relay_addr: None,
             relay_pub_key: None,
+            relay_sreg: false,
             relay_rtt: crate::relay::RelayRttTracker::default(),
             peer_endpoints: HashMap::new(),
             coord_url: String::new(),
@@ -156,6 +160,12 @@ pub struct CoreState {
     pub discovery_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// Secure-discovery (sdisc v1) counters.
     pub sdisc_stats: crate::discovery::SdiscStats,
+    /// Registration with the current relay (sreg v1 key, counter, schedule).
+    pub relay_reg: std::sync::Mutex<crate::sreg::Registration>,
+    /// Unix time a P2P pong last came back through our own relay — proof
+    /// that the relay's binding for us works (it only forwards `0x06` from
+    /// the bound address).  0 = never.
+    pub relay_path_ok_at: std::sync::atomic::AtomicI64,
     /// Per-peer traffic counters (hot path; `std` lock + atomics).
     pub traffic: crate::diagnostics::TrafficMap,
     /// Diagnostic ping jobs.
@@ -211,6 +221,8 @@ impl CoreState {
             metrics: std::sync::OnceLock::new(),
             discovery_tx: std::sync::OnceLock::new(),
             sdisc_stats: Default::default(),
+            relay_reg: Default::default(),
+            relay_path_ok_at: std::sync::atomic::AtomicI64::new(0),
             room_waiter: std::sync::Mutex::new(None),
             stun_waiters: std::sync::Mutex::new(HashMap::new()),
             endpoint_history: std::sync::Mutex::new(Default::default()),

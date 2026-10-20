@@ -194,6 +194,14 @@ pub async fn relays(state: &CoreState) -> Result<Value, IpcError> {
         let mut sd = state.sdisc_stats.snapshot();
         sd["active"] = json!(net.relay_pub_key.is_some());
         body["secure_discovery"] = sd;
+        // Registration with the current relay (sreg v1 or legacy 0x01/0x02).
+        let tx_sreg = state.relay_reg.lock().unwrap_or_else(|e| e.into_inner()).tx_sreg;
+        let path_ok = state.relay_path_ok_at.load(std::sync::atomic::Ordering::Relaxed);
+        body["registration"] = json!({
+            "mode": if net.relay_sreg { "sreg1" } else { "legacy" },
+            "tx_sreg": tx_sreg,
+            "last_relay_path_ok_at": (path_ok > 0).then_some(path_ok),
+        });
     }
     Ok(body)
 }

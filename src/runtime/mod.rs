@@ -238,6 +238,10 @@ async fn inbound_loop(
                         let src_addr = msst_core_state::net::relay::unmap_addr(src);
                         let relay_rtt = {
                             let net = state.net.read().await;
+                            // Back through our own relay: its binding for us works.
+                            if net.relay_addr.as_deref().and_then(|r| r.parse().ok()) == Some(src_addr) {
+                                state.relay_path_ok_at.store(now, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let peer_relay = net.peer_list.get(&peer_id)
                                 .and_then(|e| e.preferred_relay.as_deref());
                             net.relay_rtt.for_peer(peer_relay, net.relay_addr.as_deref())
@@ -743,9 +747,12 @@ fn spawn_relay_selection(
                     let addr = selected.addr.clone();
                     let changed = {
                         let mut net = state.net.write().await;
-                        let changed = net.relay_addr.as_deref() != Some(addr.as_str()) || net.relay_pub_key != selected.pub_key;
+                        let changed = net.relay_addr.as_deref() != Some(addr.as_str())
+                            || net.relay_pub_key != selected.pub_key
+                            || net.relay_sreg != selected.sreg;
                         net.relay_addr = Some(addr.clone());
                         net.relay_pub_key = selected.pub_key;
+                        net.relay_sreg = selected.sreg;
                         changed
                     };
                     if changed {
@@ -784,6 +791,7 @@ pub(crate) async fn select_relay_now(state: &Arc<CoreState>, client: &Coordinato
         let mut net = state.net.write().await;
         net.relay_addr = Some(addr.clone());
         net.relay_pub_key = selected.pub_key;
+        net.relay_sreg = selected.sreg;
         drop(net);
         state.next_generation();
     }
@@ -791,34 +799,70 @@ pub(crate) async fn select_relay_now(state: &Arc<CoreState>, client: &Coordinato
     Ok(addr)
 }
 
+/// (Re)register with our relay: the first packet now, the rest from
+/// [`relay_keepalive_loop`] (sreg v1: again 1 s and 3 s later, then every
+/// keepalive interval — see `crate::sreg`).
 async fn register_with_relay(state: &Arc<CoreState>, relay_addr: &str, device_id: &str) {
     let Some(target) = crate::relay::resolve_addr(relay_addr).await else {
         warn!("relay: cannot resolve {}", relay_addr);
         return;
     };
-    let pkt = relay::build_relay_register(device_id);
+    let sreg = state.net.read().await.relay_sreg;
+    state.relay_reg.lock().unwrap_or_else(|e| e.into_inner()).restart(current_time_ms(), sreg);
+    let Some(pkt) = relay_registration_packet(state, device_id, true).await else { return };
     match state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
-        Ok(_) => info!("relay: registered with {}", relay_addr),
+        Ok(_) => info!("relay: registered with {} ({})", relay_addr, if sreg { "sreg1" } else { "legacy" }),
         Err(e) => warn!("relay: register with {} failed: {}", relay_addr, e),
     }
 }
 
-/// Refresh the relay's address mapping for us.
+/// The next registration packet for our relay: `0x0E` (sreg v1), else the
+/// legacy `0x01` register (`first`) or `0x02` keepalive.  A relay that
+/// takes `0x0E` never gets `0x01`/`0x02` (it would drop them).
+async fn relay_registration_packet(state: &Arc<CoreState>, device_id: &str, first: bool) -> Option<Vec<u8>> {
+    if device_id.is_empty() {
+        return None;
+    }
+    let (sreg, relay_pk) = {
+        let net = state.net.read().await;
+        (net.relay_sreg, net.relay_pub_key)
+    };
+    if !sreg {
+        return Some(if first { relay::build_relay_register(device_id) } else { relay::build_relay_keepalive(device_id) });
+    }
+    let sk = state.identity.read().await.as_ref()?.secret_key;
+    let pkt = state
+        .relay_reg
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .packet(&sk, crate::sdisc::wire_id(device_id), &relay_pk?, current_time_ms());
+    if pkt.is_none() {
+        warn!("relay: the relay's key is invalid (low-order) — cannot register");
+    }
+    pkt
+}
+
+/// Keep the relay's binding for us alive: checks every second whether the
+/// registration schedule (`crate::sreg::Registration::due`) wants a packet.
 async fn relay_keepalive_loop(state: Arc<CoreState>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        ticker.tick().await;
         // Re-read every cycle so a settings change applies without restart.
-        let secs = state.net_settings.read().await.relay_keepalive_secs().max(1);
-        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        let interval_ms = state.net_settings.read().await.relay_keepalive_secs().max(1) * 1000;
         let (relay_addr, device_id) = {
             let net = state.net.read().await;
             (net.relay_addr.clone(), net.local_device_id.clone())
         };
         let Some(relay_addr) = relay_addr else { continue };
-        if let Some(target) = crate::relay::resolve_addr(&relay_addr).await {
-            let pkt = relay::build_relay_keepalive(&device_id);
-            if let Err(e) = state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
-                warn!("relay: keepalive to {} failed: {}", relay_addr, e);
-            }
+        if !state.relay_reg.lock().unwrap_or_else(|e| e.into_inner()).due(current_time_ms(), interval_ms) {
+            continue;
+        }
+        let Some(target) = crate::relay::resolve_addr(&relay_addr).await else { continue };
+        let Some(pkt) = relay_registration_packet(&state, &device_id, false).await else { continue };
+        if let Err(e) = state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
+            warn!("relay: keepalive to {} failed: {}", relay_addr, e);
         }
     }
 }
@@ -1293,6 +1337,60 @@ mod tests {
     }
 
     // ── Relay selection against a fake coordinator + fake relay ──────────
+
+    /// Datagrams a fake relay receives within `window`.
+    async fn collect(relay: &tokio::net::UdpSocket, window: std::time::Duration) -> Vec<Vec<u8>> {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 256];
+        let end = tokio::time::Instant::now() + window;
+        while let Ok(Ok((n, _))) = tokio::time::timeout_at(end, relay.recv_from(&mut buf)).await {
+            got.push(buf[..n].to_vec());
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn sreg_relay_gets_authenticated_registrations_only() {
+        let state = test_state().await;
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_pk = *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2u8; 32])).as_bytes();
+        {
+            let mut net = state.net.write().await;
+            net.relay_addr = Some(relay.local_addr().unwrap().to_string());
+            net.relay_pub_key = Some(relay_pk);
+            net.relay_sreg = true;
+        }
+        let keepalive = tokio::spawn(relay_keepalive_loop(state.clone()));
+        register_with_relay(&state, &relay.local_addr().unwrap().to_string(), "device-11111111").await;
+        // Immediately, then again about 1 s later (the relay may have
+        // dropped the first while fetching our key).
+        let got = collect(&relay, std::time::Duration::from_millis(1600)).await;
+        keepalive.abort();
+        assert_eq!(got.len(), 2, "{:?}", got);
+        let id = crate::sdisc::wire_id("device-11111111");
+        let key = crate::sreg::derive_key(&[1u8; 32], id, &relay_pk).unwrap();
+        let mut last = 0;
+        for p in &got {
+            assert_eq!((p.len(), p[5]), (crate::sreg::PACKET_LEN, crate::sreg::TYPE_SREG));
+            let counter = u64::from_be_bytes(p[23..31].try_into().unwrap());
+            assert!(counter > last);
+            last = counter;
+            assert_eq!(*p, crate::sreg::build_packet(&key, id, counter), "tag verifies");
+        }
+        let diag = state.relay_reg.lock().unwrap().tx_sreg;
+        assert_eq!(diag, 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_relay_still_gets_register() {
+        let state = test_state().await;
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        state.net.write().await.relay_addr = Some(relay.local_addr().unwrap().to_string());
+        register_with_relay(&state, &relay.local_addr().unwrap().to_string(), "device-11111111").await;
+        let got = collect(&relay, std::time::Duration::from_millis(200)).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0][5], msst_packet::TYPE_REGISTER);
+    }
 
     #[tokio::test]
     async fn relay_selection_picks_echoing_relay() {

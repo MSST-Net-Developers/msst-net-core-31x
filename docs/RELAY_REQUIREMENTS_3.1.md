@@ -48,8 +48,9 @@ Both send to the relay address listed in `GET /relays` (`addr`).
 
 | Type | Name | From → to | Relay must |
 |---|---|---|---|
-| `0x01` | register | client:21031 → relay | Record `src_id` → source address. Sent once after relay selection (and on every coordinator reconnect). Empty payload. |
-| `0x02` | keepalive | client:21031 → relay | Refresh the `src_id` → address mapping. Every 25 s by default (user setting 5–30 s). Empty payload. |
+| `0x0E` | sreg register | client:21031 → relay | Only to relays whose `/relays` entry has `"sreg1"` in `features` and a valid `pub_key` (see "Registration" below). Replaces `0x01` and `0x02`. |
+| `0x01` | register | client:21031 → relay | Other relays only. Record `src_id` → source address. Sent after every relay selection (and on every coordinator reconnect). Empty payload. |
+| `0x02` | keepalive | client:21031 → relay | Other relays only. Refresh the `src_id` → address mapping. Every 25 s by default (user setting 5–30 s). Empty payload. |
 | `0x05` | relay ping | client:21031 → relay | **Echo the datagram unchanged** back to its source, from the same socket. Every 5 s; the client measures RTT and matches replies by source address. |
 | `0x06` | p2p ping | client → relay → peer | Forward unchanged to the address registered for `dst_id`. 12-byte payload. Used to measure the relay path RTT. |
 | `0x07` | p2p pong | peer → relay → client | Same as `0x06`. |
@@ -64,7 +65,7 @@ bare IPv4 on UDP 21032 any more.
 
 ### Forwarding `0x0D` (the important one)
 
-- Look up `dst_id` in the registrations (`0x01` / `0x02`), send the whole
+- Look up `dst_id` in the registrations (`0x0E`, or `0x01` / `0x02`), send the whole
   datagram there, byte for byte (header included).  Do not inspect, modify,
   decrypt or reorder the payload.  Unknown `dst_id` → drop silently.
 - **The sender is often not registered with this relay.**  A client sends
@@ -96,14 +97,24 @@ traffic at all from 3.1.x clients.
 Each entry must carry `addr` and `pub_key` (base64 X25519, 32 bytes).
 Unchanged otherwise.
 
+## Registration (sreg v1)
+
+Implemented as specified in the relay's `REGISTRATION_AUTH.md`:
+
+- Mode per relay, decided at selection from `GET /relays`: `features`
+  contains `"sreg1"` **and** `pub_key` is a valid 32-byte key → `0x0E`;
+  otherwise the legacy `0x01` / `0x02`.  A relay that takes `0x0E` never
+  gets `0x01` / `0x02`, and the client never falls back at runtime.
+- `k_reg` per (relay key, device), salt `msst-sreg-v1`; a low-order relay
+  key (all-zero shared secret) makes the relay unusable for registration.
+- Counter `max(last + 1, now_ms << 16)`, strictly increasing.
+- Schedule after every relay selection or change and every coordinator
+  reconnect: immediately, ~1 s, ~3 s, then every keepalive interval.
+- Success shows up as relay-path `0x06` / `0x07` round trips through the
+  client's own relay (`GetRelays.registration.last_relay_path_ok_at`).
+
 ## Recommended (not required by 3.1.x clients)
 
-- **Bind `0x01` / `0x02` to the device key.**  Registration is currently
-  unauthenticated: anyone can register someone else's `device_id` and
-  divert its traffic.  WireGuard keeps the content confidential and
-  authentic, so this is a denial of service, not a data leak.  An sdisc-
-  style tag on register/keepalive would close it; it needs a matching
-  client change (ask the Core maintainers).
 - Drop non-MSST datagrams and unknown types early, and count them.
 - Per-source rate limits on `0x05` and on unknown `dst_id`.
 

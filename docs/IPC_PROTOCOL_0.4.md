@@ -132,6 +132,12 @@ Add `"async": true` to a command request:
   that has no `pub_key` there is no game discovery (`active: false`).
   `0x0C` from a sender the relay did not verify is now dropped:
   `rx_unverified_sender` is replaced by `drop.unverified_sender`.
+- **`GetRelays.registration`** (relay registration, see
+  `docs/RELAY_REQUIREMENTS_3.1.md`): `mode` (`"sreg1"` — authenticated
+  `0x0E` — or `"legacy"`), `tx_sreg` (`0x0E` packets sent) and
+  `last_relay_path_ok_at` (Unix seconds a relay-path probe last came back
+  through our relay, proving its binding works; `null` if never).  Relay
+  list entries may carry `features` (passed through from the coordinator).
 - **Removed from `Health`:** `local_device_id` and `local_user_id`
   (3.1.0-alpha aliases); use `device_id` and `user_id`.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`
