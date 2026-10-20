@@ -619,7 +619,13 @@ mod tests {
 
     async fn test_state() -> (Arc<CoreState>, Arc<CoreState>) {
         let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let state = Arc::new(CoreState::new(udp, std::env::temp_dir()));
+        // Own data directory: commands persist settings, and parallel tests
+        // sharing one would race on the files.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("msst-ipc-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(CoreState::new(udp, dir));
         (state.clone(), state)
     }
 

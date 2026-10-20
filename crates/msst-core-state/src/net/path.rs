@@ -3,12 +3,16 @@
 //! Manages the path selection for each peer:
 //!
 //! ```text
-//! Relay ──(candidates available)──────────────────► Probing
-//!   ▲                                                   │
-//!   │ (all fail after hold)                             │ (≥5 ok pongs, rtt ≤ relay)
-//!   │                                                   ▼
-//!   └──────────────────────────────────────────────── Direct
+//! Relay ──(candidates, backoff elapsed)───────────► Probing
+//!   ▲  ▲                                                │
+//!   │  └──(all fail after hold → backoff)───────────────┤
+//!   │                                                   │ (≥5 ok pongs, rtt ≤ relay)
+//!   │ (no pong / loss / sustained RTT spike)            ▼
+//!   └──────────────────────────────────────────────── Direct ⟲ (better candidate)
 //! ```
+//!
+//! Mode names on the wire (IPC `PathChanged`, path view, metrics) are
+//! [`PeerPathMode::name`]: `relay`, `probing`, `direct`.
 //!
 //! The path state is pure data — the actual probing/keepalive logic lives
 //! in the runtime's path monitor loop.  This module provides:
@@ -33,8 +37,10 @@ pub const MAX_CONSECUTIVE_NO_PONG: u8 = 3;
 pub const LOSS_WINDOW_SIZE: usize = 20;
 /// Loss rate above this triggers downgrade (after hold expires).
 pub const LOSS_RATE_THRESHOLD: f64 = 0.20;
-/// RTT spike factor: current > baseline * factor → downgrade.
+/// RTT spike factor: current > baseline * factor counts as a spike.
 pub const RTT_SPIKE_FACTOR: f64 = 3.0;
+/// Consecutive spikes before downgrading (one sample is just jitter).
+pub const RTT_SPIKE_CONSECUTIVE: u8 = 3;
 /// Minimum RTT baseline for spike detection (ms).
 pub const RTT_MIN_BASELINE_MS: f64 = 5.0;
 /// EWMA smoothing factor for RTT (TCP-style).
@@ -45,6 +51,16 @@ pub const MIN_PROBE_OK: u32 = 5;
 pub const UPGRADE_RTT_FACTOR: f64 = 1.0;
 /// While probing, measure the end-to-end relay path RTT this often (3.0.x).
 pub const RELAY_PATH_PROBE_INTERVAL_MS: u64 = 2000;
+/// While direct, probe the other candidates this often (3.0.x).
+pub const BG_PROBE_INTERVAL_MS: u64 = 5000;
+/// Switch to another direct candidate when its RTT is at most this
+/// fraction of the active one's.
+pub const SWITCH_RTT_FACTOR: f64 = 0.5;
+/// After a probe round in which every candidate failed, wait this long
+/// before probing again; doubled per further failed round …
+pub const PROBE_BACKOFF_BASE_SECS: i64 = 30;
+/// … up to this.
+pub const PROBE_BACKOFF_MAX_SECS: i64 = 600;
 
 /// Whether `addr` is a private (RFC 1918) LAN address.  A responding LAN
 /// candidate is always preferred over the relay (3.0.x `is_lan_endpoint`).
@@ -69,6 +85,29 @@ pub enum PeerPathMode {
     Probing,
     /// Direct P2P connection is active.
     Direct { endpoint: SocketAddr },
+}
+
+impl PeerPathMode {
+    /// The mode's wire name: `relay`, `probing` or `direct`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PeerPathMode::Relay => "relay",
+            PeerPathMode::Probing => "probing",
+            PeerPathMode::Direct { .. } => "direct",
+        }
+    }
+
+    /// The active endpoint in Direct mode.
+    pub fn endpoint(&self) -> Option<SocketAddr> {
+        match self {
+            PeerPathMode::Direct { endpoint } => Some(*endpoint),
+            _ => None,
+        }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, PeerPathMode::Direct { .. })
+    }
 }
 
 // ── PeerPath ──────────────────────────────────────────────────────────────
@@ -97,6 +136,8 @@ pub struct PeerPath {
     pub loss_window: VecDeque<bool>,
     /// Consecutive keepalive pongs missed.
     pub consecutive_no_pong: u8,
+    /// Consecutive RTT spikes on the active endpoint.
+    pub consecutive_spikes: u8,
     /// EWMA RTT baseline (ms) for the active direct path.
     pub rtt_baseline_ms: Option<f64>,
     /// Sequence counter for pings.
@@ -113,6 +154,14 @@ pub struct PeerPath {
     pub relay_path_rtt_ms: Option<f64>,
     /// Last relay-path probe sent (ms).
     pub last_relay_path_probe_ms: u64,
+
+    // ── Probe backoff (bounded retries for unreachable peers) ─────────────
+    /// Probe rounds in a row in which every candidate failed.
+    pub probe_failures: u32,
+    /// No new probe round before this timestamp (Unix seconds).
+    pub next_probe_at: i64,
+    /// The candidates of the last failed round: new ones are probed at once.
+    pub failed_candidates: Vec<SocketAddr>,
 }
 
 impl PeerPath {
@@ -127,6 +176,7 @@ impl PeerPath {
             pending_pings: HashMap::new(),
             loss_window: VecDeque::new(),
             consecutive_no_pong: 0,
+            consecutive_spikes: 0,
             rtt_baseline_ms: None,
             next_seq: 0,
             last_keepalive_sent_ms: 0,
@@ -134,15 +184,19 @@ impl PeerPath {
             relay_path_pending: HashSet::new(),
             relay_path_rtt_ms: None,
             last_relay_path_probe_ms: 0,
+            probe_failures: 0,
+            next_probe_at: 0,
+            failed_candidates: Vec::new(),
         }
     }
 
     /// Transition to Relay mode: start the hold timer, reset all state
-    /// (3.0.x `set_relay`).
+    /// except the probe backoff (3.0.x `set_relay`).
     pub fn set_relay(&mut self, now_unix: i64) {
         self.mode = PeerPathMode::Relay;
         self.hold_until = now_unix + HOLD_DURATION_SECS;
         self.consecutive_no_pong = 0;
+        self.consecutive_spikes = 0;
         self.loss_window.clear();
         self.rtt_baseline_ms = None;
         self.pending_pings.clear();
@@ -181,9 +235,53 @@ impl PeerPath {
         self.probe_rtt_ms.retain(|ep, _| ep != &endpoint);
         self.pending_pings.clear();
         self.consecutive_no_pong = 0;
+        self.consecutive_spikes = 0;
         self.loss_window.clear();
+        self.last_bg_probe_sent_ms = 0;
+        self.reset_backoff();
         // Avoid seq collisions with lingering probe pings.
         self.next_seq = self.next_seq.wrapping_add(0x1000);
+    }
+
+    /// A probe round failed on every candidate: back off before the next
+    /// one (30 s, 60 s, … up to 10 min).
+    pub fn note_probe_failure(&mut self, candidates: &[SocketAddr], now_unix: i64) {
+        self.probe_failures = self.probe_failures.saturating_add(1);
+        let shift = (self.probe_failures - 1).min(16);
+        let wait = (PROBE_BACKOFF_BASE_SECS << shift).min(PROBE_BACKOFF_MAX_SECS);
+        self.next_probe_at = now_unix + wait;
+        self.failed_candidates = candidates.to_vec();
+    }
+
+    /// Forget the probe backoff (new information: a working path, new
+    /// candidates, a punch request, a network change).
+    pub fn reset_backoff(&mut self) {
+        self.probe_failures = 0;
+        self.next_probe_at = 0;
+        self.failed_candidates.clear();
+    }
+
+    /// Whether a new probe round may start with these candidates.
+    pub fn may_probe(&self, candidates: &[SocketAddr], now_unix: i64) -> bool {
+        !candidates.is_empty() && (now_unix >= self.next_probe_at || candidates != self.failed_candidates)
+    }
+
+    /// Whether the background-probed `candidate` is clearly better than
+    /// the active direct endpoint: a LAN address replacing a non-LAN one,
+    /// or at most [`SWITCH_RTT_FACTOR`] of its RTT; either way after
+    /// [`MIN_PROBE_OK`] consecutive pongs.
+    pub fn should_switch(&self, candidate: SocketAddr) -> bool {
+        let Some(active) = self.mode.endpoint() else { return false };
+        if candidate == active || self.probe_consecutive_ok.get(&candidate).copied().unwrap_or(0) < MIN_PROBE_OK {
+            return false;
+        }
+        if is_lan_endpoint(candidate) != is_lan_endpoint(active) {
+            return is_lan_endpoint(candidate);
+        }
+        match (self.probe_rtt_ms.get(&candidate), self.rtt_baseline_ms) {
+            (Some(&rtt), Some(base)) => rtt <= SWITCH_RTT_FACTOR * base,
+            _ => false,
+        }
     }
 
     /// Returns `true` if the hold timer is still active.

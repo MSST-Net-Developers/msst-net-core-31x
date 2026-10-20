@@ -104,6 +104,7 @@ impl Core {
 
         if metrics {
             let m = Arc::new(observability::metrics::CoreMetrics::new());
+            let _ = state.metrics.set(m.clone());
             let port = config.metrics_port;
             background.push(tokio::spawn(async move { observability::start_metrics_server(m, port).await }));
             info!("Prometheus metrics on http://127.0.0.1:{}/metrics", port);

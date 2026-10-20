@@ -269,11 +269,15 @@ pub enum IpcEvent {
     },
 
     // ── Path events ─────────────────────────────────────────────────────────
-    /// A peer's path mode changed (relay → probing → direct, etc.).
+    /// A peer's path mode changed.  Modes are `relay`, `probing` or
+    /// `direct`; `endpoint` is the direct endpoint (`direct` only — a
+    /// `direct` → `direct` change is a switch to another endpoint).
     PathChanged {
         device_id: String,
         old_mode: String,
         new_mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
     },
 
     // ── ACL events ──────────────────────────────────────────────────────────
@@ -482,6 +486,7 @@ mod tests {
                 device_id: "device-deadbeef".into(),
                 old_mode: "relay".into(),
                 new_mode: "direct".into(),
+                endpoint: Some("203.0.113.7:21031".into()),
             },
         });
     }

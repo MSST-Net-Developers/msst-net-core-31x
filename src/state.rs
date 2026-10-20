@@ -150,6 +150,8 @@ pub struct CoreState {
     pub room_waiter: crate::rooms::RoomWaiter,
     /// Local DNS resolver (set when the TUN is up).
     pub dns: std::sync::OnceLock<Arc<crate::dns::DnsResolver>>,
+    /// Prometheus metrics, when enabled (`--metrics`).
+    pub metrics: std::sync::OnceLock<Arc<crate::observability::metrics::CoreMetrics>>,
     /// Outbound discovery-proxy queue (set when the TUN is up).
     pub discovery_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// Secure-discovery (sdisc v1) counters.
@@ -206,6 +208,7 @@ impl CoreState {
             room_cache_members: std::sync::Mutex::new(HashSet::new()),
             rule_ref_devices: std::sync::Mutex::new(HashSet::new()),
             dns: std::sync::OnceLock::new(),
+            metrics: std::sync::OnceLock::new(),
             discovery_tx: std::sync::OnceLock::new(),
             sdisc_stats: Default::default(),
             room_waiter: std::sync::Mutex::new(None),

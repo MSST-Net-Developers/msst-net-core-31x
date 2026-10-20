@@ -109,6 +109,17 @@ Add `"async": true` to a command request:
   refused or could not be reached (e.g. an unauthenticated device on a
   coordinator with OIDC enabled: `POST /device/register` needs a token);
   it is sent with the next registration (WS reconnect).
+- **`PathChanged` mode names are always `relay`, `probing` or `direct`**
+  (pong-driven changes used to send Rust debug text such as `Probing` /
+  `Direct { endpoint: … }`).  New optional `endpoint` (`"ip:port"`) when
+  the new mode is `direct`; `direct` → `direct` means the direct path
+  switched to a better endpoint.  The punch-triggered `relay` → `probing`
+  transition is now reported too.
+- **`GetPathView`:** a direct peer also lists its background-probed
+  candidates; a peer whose probes keep failing has `probe_failures` and
+  `next_probe_at` (Unix seconds — no probing before then: 30 s after the
+  first failed round, doubling up to 10 min; new peer endpoints, a
+  `punch_request` or a network change probe at once).
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`
   and `NodeStateChanged` (previously `""` was passed through); a peer
   without a device ID is ignored instead of failing the whole

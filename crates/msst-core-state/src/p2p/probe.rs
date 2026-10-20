@@ -1,59 +1,53 @@
 //! Probe manager — P2P probe sending, tracking, and pong handling.
 //!
 //! Manages the lifecycle of P2P probes:
-//! - Send probe pings to candidate endpoints
+//! - Send probe pings to candidate endpoints (with backoff after a round
+//!   in which every candidate failed)
 //! - Track in-flight probes (seq → target + timestamp)
 //! - Process pong responses (update RTT, consecutive_ok, miss counts)
-//! - Detect upgrade eligibility (Relay → Probing → Direct)
-//! - Detect downgrade necessity (Direct → Relay)
+//! - Upgrade (Relay → Probing → Direct), switch to a better direct
+//!   candidate, downgrade (Direct → Relay)
 //!
-//! This module is **data + logic** — it doesn't own the UDP socket.
-//! The caller (Core runtime) reads the probe results and sends packets.
+//! This module is **data + logic** — it doesn't own the UDP socket.  It
+//! only mutates [`PeerPath`]; the caller detects mode changes by comparing
+//! the mode before and after, and sends the returned pings.
 
 use crate::net::msst_packet;
-use crate::net::path::{
-    self, PeerPath, PeerPathMode, HOLD_DURATION_SECS, MAX_CONSECUTIVE_NO_PONG,
-    MAX_PROBE_MISS, MIN_PROBE_OK, UPGRADE_RTT_FACTOR,
-};
+use crate::net::path::{self, PeerPath, PeerPathMode, MAX_CONSECUTIVE_NO_PONG, MAX_PROBE_MISS};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
-// ---------------------------------------------------------------------------
-// ProbeAction — what the caller should do
-// ---------------------------------------------------------------------------
+/// Pings to send: (target, packet).
+pub type Pings = Vec<(SocketAddr, Vec<u8>)>;
 
-/// An action the caller should take after processing a probe cycle.
-#[derive(Debug, Clone)]
-pub enum ProbeAction {
-    /// Send these P2P ping packets to the given addresses.
-    SendPings { packets: Vec<(SocketAddr, Vec<u8>)> },
-    /// The path mode changed — caller should update state and notify.
-    ModeChanged {
-        peer_id: String,
-        old_mode: String,
-        new_mode: String,
-    },
-    /// Downgrade to relay — path is unreachable.
-    DowngradeToRelay { peer_id: String },
+/// Network settings that shape path decisions (3.0.x semantics).
+#[derive(Debug, Clone, Copy)]
+pub struct PathPolicy {
+    /// Direct-path keepalive interval (seconds).
+    pub keepalive_secs: i64,
+    /// Never start probing; abandon an ongoing probe; no background probes.
+    pub disable_p2p: bool,
+    /// Freeze the path: no upgrade, no downgrade, no switch (a direct path
+    /// keeps its keepalive bookkeeping).
+    pub lock_path: bool,
+}
+
+impl Default for PathPolicy {
+    fn default() -> Self {
+        PathPolicy { keepalive_secs: 1, disable_p2p: false, lock_path: false }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Probe tick — called once per second per peer
 // ---------------------------------------------------------------------------
 
-/// Process one probe cycle for a peer.
+/// Process one probe cycle for a peer and return the pings to send.
 ///
-/// Called by the path monitor every second.  Returns a list of actions
-/// the caller should execute (send packets, notify mode changes).
-///
-/// `now_unix` — current Unix timestamp (seconds)
-/// `now_ms` — current Unix timestamp (milliseconds, for ping payload)
-/// `local_id` — our device ID
-/// `peer_id` — the peer's device ID
-/// `pp` — the peer's path state (mutable)
-/// `candidates` — known endpoints for this peer (sorted IPv6-first)
-/// `relay_rtt_ms` — EWMA relay RTT for upgrade comparison (if known)
-/// `keepalive_interval_secs` — how often to send keepalive pings
+/// `candidates` — the peer's announced endpoints (sorted IPv6-first);
+/// `relay_rtt_ms` — EWMA RTT to the relay (upgrade baseline estimate);
+/// `relay_addr` — the relay used to measure the end-to-end relay path.
+#[allow(clippy::too_many_arguments)]
 pub fn probe_tick(
     now_unix: i64,
     now_ms: u64,
@@ -61,59 +55,48 @@ pub fn probe_tick(
     peer_id: &str,
     pp: &mut PeerPath,
     candidates: &[SocketAddr],
-    relay_rtt_ms: Option<f64>,
-    keepalive_interval_secs: i64,
     relay_addr: Option<SocketAddr>,
-) -> Vec<ProbeAction> {
-    let mut actions = Vec::new();
+    policy: &PathPolicy,
+) -> Pings {
+    let mut pkts = Vec::new();
+    let ping = |pp: &mut PeerPath, pkts: &mut Pings, target: SocketAddr, tracked: bool| {
+        let seq = pp.next_seq;
+        pp.next_seq = pp.next_seq.wrapping_add(1);
+        if tracked {
+            pp.pending_pings.insert(seq, (target, now_ms));
+        }
+        pkts.push((target, msst_packet::build_p2p_ping(local_id, peer_id, seq, now_ms)));
+        seq
+    };
 
     match pp.mode.clone() {
         PeerPathMode::Relay => {
-            // Start probing if candidates are available.
-            if !candidates.is_empty() {
-                pp.start_probing(candidates.to_vec(), now_unix);
-                actions.push(ProbeAction::ModeChanged {
-                    peer_id: peer_id.to_string(),
-                    old_mode: "relay".to_string(),
-                    new_mode: "probing".to_string(),
-                });
-                // Also send the first round of probe pings immediately.
-                let mut pkts = Vec::new();
-                for &candidate in candidates {
-                    let seq = pp.next_seq;
-                    pp.next_seq = pp.next_seq.wrapping_add(1);
-                    pp.pending_pings.insert(seq, (candidate, now_ms));
-                    pkts.push((candidate, msst_packet::build_p2p_ping(local_id, peer_id, seq, now_ms)));
-                }
-                if !pkts.is_empty() {
-                    actions.push(ProbeAction::SendPings { packets: pkts });
-                }
+            if policy.disable_p2p || policy.lock_path || !pp.may_probe(candidates, now_unix) {
+                return pkts;
+            }
+            if candidates != pp.failed_candidates.as_slice() {
+                pp.reset_backoff(); // new endpoints: probe them at once
+            }
+            pp.start_probing(candidates.to_vec(), now_unix);
+            // Send the first round of probe pings immediately.
+            for &candidate in candidates {
+                ping(pp, &mut pkts, candidate, true);
             }
         }
 
         PeerPathMode::Probing => {
+            if policy.disable_p2p {
+                pp.set_relay(now_unix);
+                return pkts;
+            }
+            if policy.lock_path {
+                return pkts;
+            }
             // Follow the peer's announced endpoints (3.0.x).
             if !candidates.is_empty() && pp.probe_candidates != candidates {
-                let old_miss = std::mem::take(&mut pp.probe_miss);
-                pp.probe_candidates = candidates.to_vec();
-                pp.probe_miss = candidates.iter().map(|&ep| (ep, old_miss.get(&ep).copied().unwrap_or(0))).collect();
-                pp.probe_consecutive_ok.retain(|ep, _| candidates.contains(ep));
-                pp.probe_rtt_ms.retain(|ep, _| candidates.contains(ep));
+                sync_candidates(pp, candidates.to_vec());
             }
-
-            // Expire timed-out probe pings → increment miss counter.
-            let expired: Vec<u32> = pp.pending_pings.iter()
-                .filter(|(_, (_, sent_ms))| now_ms.saturating_sub(*sent_ms) > path::PING_TIMEOUT_MS)
-                .map(|(&seq, _)| seq)
-                .collect();
-
-            for seq in expired {
-                if let Some((target, _)) = pp.pending_pings.remove(&seq) {
-                    *pp.probe_miss.entry(target).or_insert(0) =
-                        pp.probe_miss.get(&target).copied().unwrap_or(0).saturating_add(1);
-                    pp.probe_consecutive_ok.insert(target, 0);
-                }
-            }
+            expire_probes(pp, now_ms, None);
 
             // Check if all candidates failed (or none are left).
             if pp.all_probes_failed() {
@@ -122,33 +105,20 @@ pub fn probe_tick(
                     for miss in pp.probe_miss.values_mut() { *miss = 0; }
                     for ok in pp.probe_consecutive_ok.values_mut() { *ok = 0; }
                 } else {
+                    let tried = pp.probe_candidates.clone();
                     pp.set_relay(now_unix);
-                    actions.push(ProbeAction::DowngradeToRelay {
-                        peer_id: peer_id.to_string(),
-                    });
-                    actions.push(ProbeAction::ModeChanged {
-                        peer_id: peer_id.to_string(),
-                        old_mode: "probing".to_string(),
-                        new_mode: "relay".to_string(),
-                    });
-                    return actions;
+                    pp.note_probe_failure(&tried, now_unix);
+                    return pkts;
                 }
             }
 
             // Send probe pings to live candidates.
-            let in_flight: HashSet<SocketAddr> =
-                pp.pending_pings.values().map(|(ep, _)| *ep).collect();
-
-            let mut pkts = Vec::new();
-            for &candidate in candidates {
+            let in_flight: HashSet<SocketAddr> = pp.pending_pings.values().map(|(ep, _)| *ep).collect();
+            for candidate in pp.probe_candidates.clone() {
                 let miss = pp.probe_miss.get(&candidate).copied().unwrap_or(0);
-                if miss >= MAX_PROBE_MISS || in_flight.contains(&candidate) {
-                    continue;
+                if miss < MAX_PROBE_MISS && !in_flight.contains(&candidate) {
+                    ping(pp, &mut pkts, candidate, true);
                 }
-                let seq = pp.next_seq;
-                pp.next_seq = pp.next_seq.wrapping_add(1);
-                pp.pending_pings.insert(seq, (candidate, now_ms));
-                pkts.push((candidate, msst_packet::build_p2p_ping(local_id, peer_id, seq, now_ms)));
             }
             // Measure the end-to-end relay path (us → relay → peer → relay →
             // us) as the upgrade baseline: a P2P ping addressed to the peer,
@@ -157,14 +127,9 @@ pub fn probe_tick(
                 if now_ms.saturating_sub(pp.last_relay_path_probe_ms) >= path::RELAY_PATH_PROBE_INTERVAL_MS {
                     pp.last_relay_path_probe_ms = now_ms;
                     pp.relay_path_pending.clear(); // drop a stale in-flight probe
-                    let seq = pp.next_seq;
-                    pp.next_seq = pp.next_seq.wrapping_add(1);
+                    let seq = ping(pp, &mut pkts, relay, false);
                     pp.relay_path_pending.insert(seq);
-                    pkts.push((relay, msst_packet::build_p2p_ping(local_id, peer_id, seq, now_ms)));
                 }
-            }
-            if !pkts.is_empty() {
-                actions.push(ProbeAction::SendPings { packets: pkts });
             }
         }
 
@@ -176,62 +141,86 @@ pub fn probe_tick(
                 })
                 .map(|(&seq, _)| seq)
                 .collect();
-
             for seq in expired_active {
                 pp.pending_pings.remove(&seq);
                 pp.push_loss(false);
                 pp.consecutive_no_pong = pp.consecutive_no_pong.saturating_add(1);
             }
+            // Background probes to the other candidates.
+            expire_probes(pp, now_ms, Some(endpoint));
 
-            // Check downgrade conditions (after hold expires).
-            if !pp.hold_active(now_unix) {
-                // High loss rate.
-                if pp.loss_rate() > path::LOSS_RATE_THRESHOLD
+            if !policy.lock_path {
+                // Unreachable: immediate downgrade (bypasses hold).
+                if pp.consecutive_no_pong >= MAX_CONSECUTIVE_NO_PONG {
+                    pp.set_relay(now_unix);
+                    return pkts;
+                }
+                // High loss rate (after hold expires).
+                if !pp.hold_active(now_unix)
+                    && pp.loss_rate() > path::LOSS_RATE_THRESHOLD
                     && pp.loss_window.len() >= path::LOSS_WINDOW_SIZE
                 {
                     pp.set_relay(now_unix);
-                    actions.push(ProbeAction::DowngradeToRelay {
-                        peer_id: peer_id.to_string(),
-                    });
-                    actions.push(ProbeAction::ModeChanged {
-                        peer_id: peer_id.to_string(),
-                        old_mode: "direct".to_string(),
-                        new_mode: "relay".to_string(),
-                    });
-                    return actions;
+                    return pkts;
                 }
             }
 
-            // Unreachable: immediate downgrade (bypasses hold).
-            if pp.consecutive_no_pong >= MAX_CONSECUTIVE_NO_PONG {
-                pp.set_relay(now_unix);
-                actions.push(ProbeAction::DowngradeToRelay {
-                    peer_id: peer_id.to_string(),
-                });
-                actions.push(ProbeAction::ModeChanged {
-                    peer_id: peer_id.to_string(),
-                    old_mode: "direct".to_string(),
-                    new_mode: "relay".to_string(),
-                });
-                return actions;
-            }
-
             // Send keepalive ping if interval elapsed.
-            let keepalive_ms = (keepalive_interval_secs * 1000) as u64;
+            let keepalive_ms = (policy.keepalive_secs.max(1) * 1000) as u64;
             if now_ms.saturating_sub(pp.last_keepalive_sent_ms) >= keepalive_ms {
                 pp.last_keepalive_sent_ms = now_ms;
-                let seq = pp.next_seq;
-                pp.next_seq = pp.next_seq.wrapping_add(1);
-                pp.pending_pings.insert(seq, (endpoint, now_ms));
-                let pkt = msst_packet::build_p2p_ping(local_id, peer_id, seq, now_ms);
-                actions.push(ProbeAction::SendPings {
-                    packets: vec![(endpoint, pkt)],
-                });
+                ping(pp, &mut pkts, endpoint, true);
+            }
+
+            // Background probing (3.0.x): keep measuring the peer's other
+            // endpoints so a better one can take over (`process_pong`).
+            if !policy.disable_p2p {
+                let others: Vec<SocketAddr> = candidates.iter().copied().filter(|&ep| ep != endpoint).collect();
+                if pp.probe_candidates != others {
+                    sync_candidates(pp, others);
+                }
+                if !pp.probe_candidates.is_empty()
+                    && now_ms.saturating_sub(pp.last_bg_probe_sent_ms) >= path::BG_PROBE_INTERVAL_MS
+                {
+                    pp.last_bg_probe_sent_ms = now_ms;
+                    let in_flight: HashSet<SocketAddr> = pp.pending_pings.values().map(|(ep, _)| *ep).collect();
+                    for candidate in pp.probe_candidates.clone() {
+                        let miss = pp.probe_miss.get(&candidate).copied().unwrap_or(0);
+                        if miss < MAX_PROBE_MISS && !in_flight.contains(&candidate) {
+                            ping(pp, &mut pkts, candidate, true);
+                        }
+                    }
+                }
             }
         }
     }
 
-    actions
+    pkts
+}
+
+/// Replace the probe candidates, keeping the statistics of known ones.
+fn sync_candidates(pp: &mut PeerPath, candidates: Vec<SocketAddr>) {
+    let old_miss = std::mem::take(&mut pp.probe_miss);
+    pp.probe_miss = candidates.iter().map(|&ep| (ep, old_miss.get(&ep).copied().unwrap_or(0))).collect();
+    pp.probe_consecutive_ok.retain(|ep, _| candidates.contains(ep));
+    pp.probe_rtt_ms.retain(|ep, _| candidates.contains(ep));
+    pp.probe_candidates = candidates;
+}
+
+/// Expire timed-out probe pings (all but those to `except`, the active
+/// endpoint): a miss, and the candidate's success streak is broken.
+fn expire_probes(pp: &mut PeerPath, now_ms: u64, except: Option<SocketAddr>) {
+    let expired: Vec<u32> = pp.pending_pings.iter()
+        .filter(|(_, (addr, sent_ms))| Some(*addr) != except && now_ms.saturating_sub(*sent_ms) > path::PING_TIMEOUT_MS)
+        .map(|(&seq, _)| seq)
+        .collect();
+    for seq in expired {
+        if let Some((target, _)) = pp.pending_pings.remove(&seq) {
+            let miss = pp.probe_miss.entry(target).or_insert(0);
+            *miss = miss.saturating_add(1);
+            pp.probe_consecutive_ok.insert(target, 0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,24 +229,25 @@ pub fn probe_tick(
 
 /// Process a P2P pong received from a peer.
 ///
-/// Updates RTT, consecutive_ok, loss window, and may trigger path upgrade.
-/// Returns `true` if the path mode changed.
+/// Updates RTT, consecutive_ok and the loss window, and may upgrade
+/// (Probing → Direct), switch the direct endpoint, or downgrade on a
+/// sustained RTT spike.  With `lock_path` only statistics change.
 pub fn process_pong(
-    peer_id: &str,
     pp: &mut PeerPath,
     src: SocketAddr,
     seq: u32,
     rtt_ms: f64,
     relay_rtt_ms: Option<f64>,
     now_unix: i64,
-) -> bool {
+    lock_path: bool,
+) {
     // Relay-path probe answered (via the relay): update its RTT (3.0.x).
     if pp.relay_path_pending.remove(&seq) {
         pp.relay_path_rtt_ms = Some(match pp.relay_path_rtt_ms {
             None => rtt_ms,
             Some(p) => path::RTT_EWMA_ALPHA * rtt_ms + (1.0 - path::RTT_EWMA_ALPHA) * p,
         });
-        return false;
+        return;
     }
 
     // Must match a pending ping.
@@ -267,54 +257,50 @@ pub fn process_pong(
         // the LAN address.  Credit src if it is a known candidate; otherwise
         // ignore the pong (the ping stays consumed, as in 3.0.x).
         Some(_) if pp.probe_candidates.contains(&src) => {}
-        _ => return false,
+        _ => return,
     }
+    let may_change = !lock_path && !pp.hold_active(now_unix);
 
     match pp.mode.clone() {
-        PeerPathMode::Probing => {
-            // Update per-candidate stats.
-            *pp.probe_consecutive_ok.entry(src).or_insert(0) += 1;
-            let ewma = pp.probe_rtt_ms.entry(src).or_insert(rtt_ms);
-            *ewma = path::RTT_EWMA_ALPHA * rtt_ms + (1.0 - path::RTT_EWMA_ALPHA) * *ewma;
-            pp.probe_miss.insert(src, 0);
-
-            let ok = pp.probe_consecutive_ok.get(&src).copied().unwrap_or(0);
-
-            // Check upgrade eligibility.
-            if !pp.hold_active(now_unix) && pp.can_upgrade(src, relay_rtt_ms) {
-                let p2p_rtt = pp.probe_rtt_ms.get(&src).copied().unwrap_or(rtt_ms);
-                pp.set_direct(src, now_unix);
-                pp.rtt_baseline_ms = Some(p2p_rtt);
-                return true;
-            }
-            false
-        }
-
         PeerPathMode::Direct { endpoint } if endpoint == src => {
             // Active endpoint: quality monitoring.
             pp.push_loss(true);
             pp.consecutive_no_pong = 0;
-            let spike = pp.is_rtt_spike(rtt_ms);
-            pp.update_rtt(rtt_ms);
-            // An RTT spike is a quality signal, so it respects the hold timer
-            // (only sustained missing pongs bypass it) — 3.0.x.
-            if spike && !pp.hold_active(now_unix) {
-                pp.set_relay(now_unix);
-                return true;
+            if pp.is_rtt_spike(rtt_ms) {
+                // A spike sample is kept out of the baseline; only a
+                // sustained spike is a quality signal, and it respects the
+                // hold timer (only missing pongs bypass it).
+                pp.consecutive_spikes = pp.consecutive_spikes.saturating_add(1);
+                if may_change && pp.consecutive_spikes >= path::RTT_SPIKE_CONSECUTIVE {
+                    pp.set_relay(now_unix);
+                }
+            } else {
+                pp.consecutive_spikes = 0;
+                pp.update_rtt(rtt_ms);
             }
-            false
         }
 
-        PeerPathMode::Direct { .. } => {
-            // Background probe pong from non-active candidate.
+        PeerPathMode::Probing | PeerPathMode::Direct { .. } => {
+            // A probe (Probing) or background probe (Direct) answered.
             *pp.probe_consecutive_ok.entry(src).or_insert(0) += 1;
             let ewma = pp.probe_rtt_ms.entry(src).or_insert(rtt_ms);
             *ewma = path::RTT_EWMA_ALPHA * rtt_ms + (1.0 - path::RTT_EWMA_ALPHA) * *ewma;
             pp.probe_miss.insert(src, 0);
-            false
+            if !may_change {
+                return;
+            }
+            let upgrade = match pp.mode {
+                PeerPathMode::Probing => pp.can_upgrade(src, relay_rtt_ms),
+                _ => pp.should_switch(src),
+            };
+            if upgrade {
+                let p2p_rtt = pp.probe_rtt_ms.get(&src).copied().unwrap_or(rtt_ms);
+                pp.set_direct(src, now_unix);
+                pp.rtt_baseline_ms = Some(p2p_rtt);
+            }
         }
 
-        _ => false,
+        PeerPathMode::Relay => {}
     }
 }
 
@@ -325,6 +311,7 @@ pub fn process_pong(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::path::{HOLD_DURATION_SECS, MIN_PROBE_OK, PROBE_BACKOFF_BASE_SECS, PROBE_BACKOFF_MAX_SECS, RTT_SPIKE_CONSECUTIVE};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     fn v4(port: u16) -> SocketAddr {
@@ -335,72 +322,125 @@ mod tests {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(172, 22, 2, 1), port))
     }
 
+    fn public(port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), port))
+    }
+
+    fn lan(port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 5), port))
+    }
+
+    const P: PathPolicy = PathPolicy { keepalive_secs: 1, disable_p2p: false, lock_path: false };
+
+    fn tick(pp: &mut PeerPath, now: i64, candidates: &[SocketAddr]) -> Pings {
+        probe_tick(now, now as u64 * 1000, "local", "peer", pp, candidates, None, &P)
+    }
+
+    /// Answer the ping `seq` (sent to `to`) from `from`.
+    fn pong(pp: &mut PeerPath, to: SocketAddr, from: SocketAddr, rtt: f64, now: i64) {
+        let seq = pp.next_seq;
+        pp.next_seq += 1;
+        pp.pending_pings.insert(seq, (to, 0));
+        process_pong(pp, from, seq, rtt, None, now, false);
+    }
+
+    /// Let every probe ping time out, `rounds` times.
+    fn fail_probes(pp: &mut PeerPath, mut now: i64, candidates: &[SocketAddr], rounds: usize) -> i64 {
+        for _ in 0..rounds {
+            tick(pp, now, candidates);
+            now += 3;
+        }
+        now
+    }
+
     #[test]
     fn relay_starts_probing_when_candidates_available() {
         let mut pp = PeerPath::new();
-        let actions = probe_tick(
-            1000, 1_000_000, "local", "peer", &mut pp,
-            &[v4(12345)], None, 1, None,
-        );
+        let pings = tick(&mut pp, 1000, &[v4(12345)]);
         assert_eq!(pp.mode, PeerPathMode::Probing);
-        assert!(actions.iter().any(|a| matches!(a, ProbeAction::ModeChanged { .. })));
+        assert_eq!(pings.len(), 1, "first round sent at once");
     }
 
     #[test]
     fn relay_no_candidates_stays_relay() {
         let mut pp = PeerPath::new();
-        let actions = probe_tick(
-            1000, 1_000_000, "local", "peer", &mut pp,
-            &[], None, 1, None,
-        );
+        assert!(tick(&mut pp, 1000, &[]).is_empty());
         assert_eq!(pp.mode, PeerPathMode::Relay);
-        assert!(actions.is_empty());
-    }
-
-    #[test]
-    fn probing_sends_pings() {
-        let mut pp = PeerPath::new();
-        pp.start_probing(vec![v4(12345), v4b(54321)], 1000);
-        let actions = probe_tick(
-            1000, 1_000_000, "local", "peer", &mut pp,
-            &[v4(12345), v4b(54321)], None, 1, None,
-        );
-        let ping_count: usize = actions.iter().map(|a| match a {
-            ProbeAction::SendPings { packets } => packets.len(),
-            _ => 0,
-        }).sum();
-        assert!(ping_count > 0);
     }
 
     #[test]
     fn probing_no_duplicate_pings() {
         let mut pp = PeerPath::new();
         pp.start_probing(vec![v4(12345)], 1000);
-        // First tick sends a ping.
-        probe_tick(1000, 1_000_000, "local", "peer", &mut pp, &[v4(12345)], None, 1, None);
-        // Second tick should NOT send another ping (one already in flight).
-        let actions = probe_tick(1001, 1_001_000, "local", "peer", &mut pp, &[v4(12345)], None, 1, None);
-        let ping_count: usize = actions.iter().map(|a| match a {
-            ProbeAction::SendPings { packets } => packets.len(),
-            _ => 0,
-        }).sum();
-        assert_eq!(ping_count, 0);
+        assert_eq!(tick(&mut pp, 1000, &[v4(12345)]).len(), 1);
+        // One already in flight.
+        assert!(tick(&mut pp, 1001, &[v4(12345)]).is_empty());
     }
 
     #[test]
-    fn probing_downgrades_after_all_fail() {
+    fn failed_probe_rounds_back_off_exponentially() {
+        let c = [v4(12345)];
+        let mut pp = PeerPath::new();
+        tick(&mut pp, 1000, &c);
+        // 3 misses (one ping in flight, 2 s timeout) → relay, back off 30 s.
+        let now = fail_probes(&mut pp, 1001, &c, MAX_PROBE_MISS as usize + 1);
+        assert_eq!(pp.mode, PeerPathMode::Relay);
+        assert_eq!((pp.probe_failures, pp.next_probe_at - now + 3), (1, PROBE_BACKOFF_BASE_SECS));
+        // No probing during the backoff …
+        assert!(tick(&mut pp, now + 10, &c).is_empty());
+        assert_eq!(pp.mode, PeerPathMode::Relay);
+        // … then one more round; it fails once the hold expires → 60 s.
+        let start = pp.next_probe_at;
+        tick(&mut pp, start, &c);
+        assert_eq!(pp.mode, PeerPathMode::Probing);
+        let mut now = start + 1;
+        while pp.mode == PeerPathMode::Probing {
+            tick(&mut pp, now, &c);
+            now += 3;
+        }
+        assert_eq!(pp.probe_failures, 2);
+        assert_eq!(pp.next_probe_at - (now - 3), 2 * PROBE_BACKOFF_BASE_SECS);
+        // Capped.
+        for _ in 0..10 {
+            pp.note_probe_failure(&c, 0);
+        }
+        assert_eq!(pp.next_probe_at, PROBE_BACKOFF_MAX_SECS);
+    }
+
+    #[test]
+    fn new_candidates_skip_the_backoff() {
+        let mut pp = PeerPath::new();
+        pp.note_probe_failure(&[v4(1)], 1000);
+        assert!(tick(&mut pp, 1001, &[v4(1)]).is_empty());
+        tick(&mut pp, 1001, &[v4(2)]);
+        assert_eq!(pp.mode, PeerPathMode::Probing);
+        assert_eq!(pp.probe_failures, 0);
+    }
+
+    #[test]
+    fn upgrade_resets_backoff() {
+        let mut pp = PeerPath::new();
+        pp.note_probe_failure(&[v4(1)], 0);
+        pp.start_probing(vec![v4(12345)], 1000);
+        for _ in 0..MIN_PROBE_OK {
+            pong(&mut pp, v4(12345), v4(12345), 20.0, 1031);
+        }
+        assert_eq!(pp.mode, PeerPathMode::Direct { endpoint: v4(12345) });
+        assert_eq!((pp.probe_failures, pp.next_probe_at), (0, 0));
+    }
+
+    #[test]
+    fn pong_upgrades_from_probing() {
         let mut pp = PeerPath::new();
         pp.start_probing(vec![v4(12345)], 1000);
-        // Simulate MAX_PROBE_MISS consecutive misses.
-        for _ in 0..MAX_PROBE_MISS {
-            pp.probe_miss.insert(v4(12345), MAX_PROBE_MISS - 1);
-            let _ = probe_tick(1000, 1_000_000, "local", "peer", &mut pp, &[v4(12345)], None, 1, None);
+        for i in 0..MIN_PROBE_OK {
+            pp.pending_pings.insert(i, (v4(12345), 1_030_000));
+            process_pong(&mut pp, v4(12345), i, 20.0, Some(50.0), 1031, false);
+            if i < MIN_PROBE_OK - 1 {
+                assert_eq!(pp.mode, PeerPathMode::Probing, "not yet at pong {}", i);
+            }
         }
-        // Force all misses.
-        pp.probe_miss.insert(v4(12345), MAX_PROBE_MISS);
-        let actions = probe_tick(1031, 1_031_000, "local", "peer", &mut pp, &[v4(12345)], None, 1, None);
-        assert!(actions.iter().any(|a| matches!(a, ProbeAction::DowngradeToRelay { .. })));
-        assert_eq!(pp.mode, PeerPathMode::Relay);
+        assert_eq!(pp.mode, PeerPathMode::Direct { endpoint: v4(12345) });
     }
 
     #[test]
@@ -408,15 +448,7 @@ mod tests {
         let mut pp = PeerPath::new();
         pp.set_direct(v4(12345), 1000);
         pp.last_keepalive_sent_ms = 0;
-        let actions = probe_tick(
-            1001, 1_001_000, "local", "peer", &mut pp,
-            &[v4(12345)], None, 1, None,
-        );
-        let ping_count: usize = actions.iter().map(|a| match a {
-            ProbeAction::SendPings { packets } => packets.len(),
-            _ => 0,
-        }).sum();
-        assert_eq!(ping_count, 1);
+        assert_eq!(tick(&mut pp, 1001, &[v4(12345)]).len(), 1);
     }
 
     #[test]
@@ -424,31 +456,28 @@ mod tests {
         let mut pp = PeerPath::new();
         pp.set_direct(v4(12345), 1000);
         pp.consecutive_no_pong = MAX_CONSECUTIVE_NO_PONG - 1;
-        // One more miss triggers downgrade.
         pp.pending_pings.insert(99, (v4(12345), 500_000)); // expired
-        let actions = probe_tick(
-            1001, 1_001_000, "local", "peer", &mut pp,
-            &[v4(12345)], None, 1, None,
-        );
-        assert!(actions.iter().any(|a| matches!(a, ProbeAction::DowngradeToRelay { .. })));
+        tick(&mut pp, 1001, &[v4(12345)]);
         assert_eq!(pp.mode, PeerPathMode::Relay);
+        assert_eq!(pp.probe_failures, 0, "a downgrade is not a failed probe round");
     }
 
     #[test]
-    fn pong_upgrades_from_probing() {
+    fn lock_path_freezes_direct() {
         let mut pp = PeerPath::new();
-        pp.start_probing(vec![v4(12345)], 1000);
-        // Simulate MIN_PROBE_OK successful pongs after hold expires.
-        for i in 0..MIN_PROBE_OK {
-            pp.pending_pings.insert(i, (v4(12345), 1_030_000));
-            let changed = process_pong(
-                "peer", &mut pp, v4(12345), i, 20.0, Some(50.0), 1031,
-            );
-            if i < MIN_PROBE_OK - 1 {
-                assert!(!changed, "should not upgrade at pong {}", i);
-            }
+        pp.set_direct(v4(12345), 1000);
+        pp.consecutive_no_pong = MAX_CONSECUTIVE_NO_PONG;
+        let locked = PathPolicy { lock_path: true, ..P };
+        probe_tick(1100, 1_100_000, "local", "peer", &mut pp, &[v4(12345)], None, &locked);
+        assert!(pp.mode.is_direct());
+        pp.rtt_baseline_ms = Some(10.0);
+        for _ in 0..RTT_SPIKE_CONSECUTIVE {
+            let seq = pp.next_seq;
+            pp.next_seq += 1;
+            pp.pending_pings.insert(seq, (v4(12345), 0));
+            process_pong(&mut pp, v4(12345), seq, 100.0, None, 1100, true);
         }
-        assert_eq!(pp.mode, PeerPathMode::Direct { endpoint: v4(12345) });
+        assert!(pp.mode.is_direct());
     }
 
     #[test]
@@ -456,8 +485,7 @@ mod tests {
         let mut pp = PeerPath::new();
         pp.set_direct(v4(12345), 1000);
         pp.consecutive_no_pong = 2;
-        pp.pending_pings.insert(42, (v4(12345), 999_000));
-        process_pong("peer", &mut pp, v4(12345), 42, 15.0, None, 1000);
+        pong(&mut pp, v4(12345), v4(12345), 15.0, 1000);
         assert_eq!(pp.consecutive_no_pong, 0);
     }
 
@@ -468,8 +496,7 @@ mod tests {
         pp.pending_pings.insert(42, (v4(12345), 999_000));
         // Pong from an unknown address — ignored (the ping is consumed and
         // will not be mis-counted as a later timeout, as in 3.0.x).
-        let changed = process_pong("peer", &mut pp, v4b(54321), 42, 15.0, None, 1000);
-        assert!(!changed);
+        process_pong(&mut pp, v4b(54321), 42, 15.0, None, 1000, false);
         assert!(!pp.pending_pings.contains_key(&42));
         assert_eq!(pp.loss_window.len(), 0);
     }
@@ -478,25 +505,74 @@ mod tests {
     fn relay_path_pong_updates_baseline_only() {
         let mut pp = PeerPath::new();
         pp.relay_path_pending.insert(7);
-        assert!(!process_pong("peer", &mut pp, v4(12345), 7, 80.0, None, 1000));
+        process_pong(&mut pp, v4(12345), 7, 80.0, None, 1000, false);
         assert_eq!(pp.relay_path_rtt_ms, Some(80.0));
         assert_eq!(pp.mode, PeerPathMode::Relay);
     }
 
     #[test]
-    fn rtt_spike_downgrades_after_hold() {
+    fn only_a_sustained_rtt_spike_downgrades() {
         let mut pp = PeerPath::new();
         pp.set_direct(v4(12345), 1000);
         pp.rtt_baseline_ms = Some(20.0);
-        // Within the hold period: no downgrade.
-        pp.pending_pings.insert(1, (v4(12345), 0));
-        assert!(!process_pong("peer", &mut pp, v4(12345), 1, 100.0, None, 1001));
-        assert!(matches!(pp.mode, PeerPathMode::Direct { .. }));
-        // After the hold period: a spike (> 3 × baseline) downgrades.
-        pp.rtt_baseline_ms = Some(20.0);
-        pp.pending_pings.insert(2, (v4(12345), 0));
-        assert!(process_pong("peer", &mut pp, v4(12345), 2, 100.0, None, 1000 + HOLD_DURATION_SECS));
+        let after_hold = 1000 + HOLD_DURATION_SECS;
+        // Within the hold period: no downgrade, however many spikes.
+        for _ in 0..RTT_SPIKE_CONSECUTIVE {
+            pong(&mut pp, v4(12345), v4(12345), 100.0, 1001);
+        }
+        assert!(pp.mode.is_direct());
+        // After it: isolated spikes are jitter …
+        pp.consecutive_spikes = 0;
+        for _ in 0..3 {
+            for _ in 1..RTT_SPIKE_CONSECUTIVE {
+                pong(&mut pp, v4(12345), v4(12345), 100.0, after_hold);
+            }
+            pong(&mut pp, v4(12345), v4(12345), 20.0, after_hold);
+        }
+        assert!(pp.mode.is_direct());
+        assert!(pp.rtt_baseline_ms.unwrap() < 21.0, "spikes stay out of the baseline");
+        // … a sustained one downgrades.
+        for _ in 0..RTT_SPIKE_CONSECUTIVE {
+            pong(&mut pp, v4(12345), v4(12345), 100.0, after_hold);
+        }
         assert_eq!(pp.mode, PeerPathMode::Relay);
+    }
+
+    #[test]
+    fn direct_background_probes_and_switches_to_lan() {
+        let (active, other) = (public(40000), lan(21031));
+        let mut pp = PeerPath::new();
+        pp.set_direct(active, 1000);
+        pp.rtt_baseline_ms = Some(30.0);
+        pp.last_keepalive_sent_ms = u64::MAX / 2; // no keepalive in the way
+        let pings = tick(&mut pp, 1001, &[active, other]);
+        assert_eq!(pings.iter().map(|(t, _)| *t).collect::<Vec<_>>(), [other], "background probe");
+        assert_eq!(pp.probe_candidates, [other]);
+        // Answers during the hold only update statistics.
+        for _ in 0..MIN_PROBE_OK {
+            pong(&mut pp, other, other, 25.0, 1002);
+        }
+        assert_eq!(pp.mode.endpoint(), Some(active));
+        // After it, the LAN candidate takes over.
+        pong(&mut pp, other, other, 25.0, 1000 + HOLD_DURATION_SECS);
+        assert_eq!(pp.mode.endpoint(), Some(other));
+    }
+
+    #[test]
+    fn direct_switches_only_to_a_much_faster_candidate() {
+        let (active, other) = (public(40000), public(40001));
+        let mut pp = PeerPath::new();
+        pp.set_direct(active, 0);
+        pp.rtt_baseline_ms = Some(30.0);
+        pp.probe_candidates = vec![other];
+        for _ in 0..MIN_PROBE_OK + 2 {
+            pong(&mut pp, other, other, 20.0, 1000);
+        }
+        assert_eq!(pp.mode.endpoint(), Some(active), "20 ms vs 30 ms is not worth a switch");
+        for _ in 0..40 {
+            pong(&mut pp, other, other, 10.0, 1000);
+        }
+        assert_eq!(pp.mode.endpoint(), Some(other));
     }
 
     #[test]
@@ -504,17 +580,18 @@ mod tests {
         let mut pp = PeerPath::new();
         pp.start_probing(vec![v4(12345)], 1000);
         let relay: SocketAddr = "198.51.100.1:7000".parse().unwrap();
-        let actions = probe_tick(1001, 1_001_000, "local", "peer", &mut pp, &[v4(12345)], None, 1, Some(relay));
-        let to_relay = actions.iter().any(|a| matches!(a, ProbeAction::SendPings { packets } if packets.iter().any(|(t, _)| *t == relay)));
-        assert!(to_relay);
+        let pings = probe_tick(1001, 1_001_000, "local", "peer", &mut pp, &[v4(12345)], Some(relay), &P);
+        assert!(pings.iter().any(|(t, _)| *t == relay));
         assert_eq!(pp.relay_path_pending.len(), 1);
     }
 
     #[test]
-    fn pong_unknown_seq_ignored() {
+    fn disable_p2p_reverts_probing_without_backoff() {
         let mut pp = PeerPath::new();
-        pp.set_direct(v4(12345), 1000);
-        let changed = process_pong("peer", &mut pp, v4(12345), 999, 15.0, None, 1000);
-        assert!(!changed);
+        pp.start_probing(vec![v4(12345)], 1000);
+        let off = PathPolicy { disable_p2p: true, ..P };
+        probe_tick(1001, 1_001_000, "local", "peer", &mut pp, &[v4(12345)], None, &off);
+        assert_eq!((pp.mode.clone(), pp.probe_failures), (PeerPathMode::Relay, 0));
+        assert!(probe_tick(1002, 1_002_000, "local", "peer", &mut pp, &[v4(12345)], None, &off).is_empty());
     }
 }

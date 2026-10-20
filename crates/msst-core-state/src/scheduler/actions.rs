@@ -23,11 +23,13 @@ pub enum SchedulerAction {
         plaintext: Vec<u8>,
         target: SocketAddr,
     },
-    /// A peer's path mode changed (relay → probing → direct or vice versa).
+    /// A peer's path mode (or direct endpoint) changed.  Modes are
+    /// `relay`, `probing` or `direct`; `endpoint` is the direct endpoint.
     PathModeChanged {
         peer_id: String,
         old_mode: String,
         new_mode: String,
+        endpoint: Option<SocketAddr>,
     },
     /// Trigger STUN endpoint detection.
     DetectEndpoints,

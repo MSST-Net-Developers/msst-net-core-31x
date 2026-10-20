@@ -107,8 +107,26 @@ impl P2PScheduler {
         for pp in self.paths.values_mut() {
             if !pp.mode.is_direct() {
                 pp.hold_until = 0;
+                pp.reset_backoff();
             }
         }
+    }
+
+    fn policy(&self) -> probe::PathPolicy {
+        probe::PathPolicy { keepalive_secs: self.keepalive_secs, disable_p2p: self.disable_p2p, lock_path: self.lock_path }
+    }
+
+    /// Number of peers per mode: (relay, probing, direct).
+    pub fn mode_counts(&self) -> (usize, usize, usize) {
+        let mut c = (0, 0, 0);
+        for pp in self.paths.values() {
+            match pp.mode {
+                PeerPathMode::Relay => c.0 += 1,
+                PeerPathMode::Probing => c.1 += 1,
+                PeerPathMode::Direct { .. } => c.2 += 1,
+            }
+        }
+        c
     }
 
     /// Full path state of every tracked peer (diagnostics).
@@ -138,7 +156,7 @@ impl P2PScheduler {
         now_ms: u64,
         peer_endpoints: &HashMap<String, Vec<SocketAddr>>,
         peer_relays: &HashMap<String, SocketAddr>,
-        relay_rtt: &HashMap<String, f64>,
+        _relay_rtt: &HashMap<String, f64>,
     ) -> Vec<SchedulerAction> {
         let mut actions = Vec::new();
 
@@ -149,103 +167,24 @@ impl P2PScheduler {
         }
 
         // ── Per-peer path processing ──────────────────────────────────────
+        let policy = self.policy();
         let peer_ids: Vec<String> = self.paths.keys().cloned().collect();
         for peer_id in peer_ids {
-            let candidates = peer_endpoints
-                .get(&peer_id)
-                .cloned()
-                .unwrap_or_default();
-
-            let relay_rtt_ms = peer_relays
-                .get(&peer_id)
-                .and_then(|r| relay_rtt.get(&r.to_string()).copied());
-
-            let pp = match self.paths.get_mut(&peer_id) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // Skip peers in Relay mode that have no candidates — nothing to do.
-            // Skip peers already in Probing/Direct — probe_tick handles them.
-            if matches!(pp.mode, PeerPathMode::Relay) && candidates.is_empty() {
-                continue;
-            }
-
-            // Network settings (3.0.x semantics):
-            // - disable_p2p: never start probing; abandon an ongoing probe.
-            // - lock_path: freeze the path — no upgrade, no downgrade
-            //   (a direct path keeps sending keepalives).
-            match pp.mode {
-                PeerPathMode::Relay if self.disable_p2p || self.lock_path => continue,
-                PeerPathMode::Probing if self.disable_p2p => {
-                    info!("disable_p2p: reverting {} from probing to relay", peer_id);
-                    pp.set_relay(now_unix);
-                    actions.push(SchedulerAction::PathModeChanged {
-                        peer_id: peer_id.clone(),
-                        old_mode: "probing".into(),
-                        new_mode: "relay".into(),
-                    });
-                    continue;
-                }
-                PeerPathMode::Probing if self.lock_path => continue,
-                _ => {}
-            }
-            let locked_snapshot = (self.lock_path && pp.mode.is_direct()).then(|| pp.clone());
-
-            let old_mode = format!("{:?}", pp.mode);
-
-            let probe_actions = probe::probe_tick(
+            let candidates = peer_endpoints.get(&peer_id).map(Vec::as_slice).unwrap_or_default();
+            let Some(pp) = self.paths.get_mut(&peer_id) else { continue };
+            let before = pp.mode.clone();
+            let pings = probe::probe_tick(
                 now_unix,
                 now_ms,
                 &self.local_device_id,
                 &peer_id,
                 pp,
-                &candidates,
-                relay_rtt_ms,
-                self.keepalive_secs,
+                candidates,
                 peer_relays.get(&peer_id).copied(),
+                &policy,
             );
-
-            // Locked direct path: keep the keepalive/loss bookkeeping but undo
-            // any downgrade decision.
-            let probe_actions = match locked_snapshot {
-                Some(snapshot) if !pp.mode.is_direct() => {
-                    let mut kept = snapshot;
-                    kept.loss_window = pp.loss_window.clone();
-                    kept.consecutive_no_pong = pp.consecutive_no_pong;
-                    *pp = kept;
-                    probe_actions
-                        .into_iter()
-                        .filter(|a| matches!(a, probe::ProbeAction::SendPings { .. }))
-                        .collect()
-                }
-                _ => probe_actions,
-            };
-
-            // Convert probe actions to scheduler actions.
-            for pa in probe_actions {
-                match pa {
-                    probe::ProbeAction::SendPings { packets } => {
-                        for (addr, pkt) in packets {
-                            actions.push(SchedulerAction::UdpSend {
-                                data: pkt,
-                                target: addr,
-                            });
-                        }
-                    }
-                    probe::ProbeAction::ModeChanged { peer_id, old_mode, new_mode } => {
-                        info!("P2P: {} mode changed {} → {}", peer_id, old_mode, new_mode);
-                        actions.push(SchedulerAction::PathModeChanged {
-                            peer_id,
-                            old_mode,
-                            new_mode,
-                        });
-                    }
-                    probe::ProbeAction::DowngradeToRelay { peer_id } => {
-                        warn!("P2P: {} downgraded to relay", peer_id);
-                    }
-                }
-            }
+            actions.extend(pings.into_iter().map(|(target, data)| SchedulerAction::UdpSend { data, target }));
+            actions.extend(mode_change(&peer_id, &before, pp));
         }
 
         actions
@@ -271,11 +210,15 @@ impl P2PScheduler {
         // Start probing (transitions from Relay → Probing, clears pending_pings).
         if let Some(pp) = self.paths.get_mut(peer_id) {
             if !pp.mode.is_direct() && !self.disable_p2p && !self.lock_path {
+                let before = pp.mode.clone();
                 pp.start_probing(endpoints.to_vec(), now_unix);
                 // Coordinator-triggered probe: upgrade as soon as the
-                // criteria are met (3.0.x `trigger_probe`).
+                // criteria are met (3.0.x `trigger_probe`), regardless of
+                // an earlier probe backoff.
                 pp.hold_until = 0;
+                pp.reset_backoff();
                 info!("P2P: started probing {} after punch ({} candidate(s))", peer_id, endpoints.len());
+                actions.extend(mode_change(peer_id, &before, pp));
             }
         }
 
@@ -320,23 +263,9 @@ impl P2PScheduler {
         let mut actions = Vec::new();
 
         if let Some(pp) = self.paths.get_mut(peer_id) {
-            // A frozen non-direct path must not be upgraded by a late pong.
-            if self.lock_path && !pp.mode.is_direct() {
-                return actions;
-            }
-            let old_mode = format!("{:?}", pp.mode);
-            let changed = probe::process_pong(
-                peer_id, pp, src, seq, rtt_ms, relay_rtt_ms, now_unix,
-            );
-            if changed {
-                let new_mode = format!("{:?}", pp.mode);
-                info!("P2P: {} upgraded {} → {}", peer_id, old_mode, new_mode);
-                actions.push(SchedulerAction::PathModeChanged {
-                    peer_id: peer_id.to_string(),
-                    old_mode,
-                    new_mode,
-                });
-            }
+            let before = pp.mode.clone();
+            probe::process_pong(pp, src, seq, rtt_ms, relay_rtt_ms, now_unix, self.lock_path);
+            actions.extend(mode_change(peer_id, &before, pp));
         }
 
         actions
@@ -416,10 +345,28 @@ impl P2PScheduler {
     }
 }
 
-impl PeerPathMode {
-    fn is_direct(&self) -> bool {
-        matches!(self, PeerPathMode::Direct { .. })
+/// The `PathModeChanged` action for a transition, if the mode (or the
+/// direct endpoint) changed.  The only place mode changes are reported, so
+/// every one uses the same names ([`PeerPathMode::name`]).
+fn mode_change(peer_id: &str, before: &PeerPathMode, pp: &PeerPath) -> Option<SchedulerAction> {
+    if *before == pp.mode {
+        return None;
     }
+    let (old_mode, new_mode) = (before.name(), pp.mode.name());
+    match (&pp.mode, pp.probe_failures) {
+        (PeerPathMode::Relay, n) if n > 0 && *before == PeerPathMode::Probing => {
+            warn!("P2P: {} probing → relay; no candidate answered ({} round(s) in a row), next probe at {}", peer_id, n, pp.next_probe_at);
+        }
+        (PeerPathMode::Relay, _) if before.is_direct() => warn!("P2P: {} downgraded direct → relay", peer_id),
+        _ => info!("P2P: {} {} → {}{}", peer_id, old_mode, new_mode,
+            pp.mode.endpoint().map(|e| format!(" ({})", e)).unwrap_or_default()),
+    }
+    Some(SchedulerAction::PathModeChanged {
+        peer_id: peer_id.to_string(),
+        old_mode: old_mode.to_string(),
+        new_mode: new_mode.to_string(),
+        endpoint: pp.mode.endpoint(),
+    })
 }
 
 // ===========================================================================
@@ -663,7 +610,7 @@ mod tests {
         let ep = v4(172, 22, 2, 1, 12345);
 
         // 1. Punch request → starts probing + sends punch packets.
-        let _ = s.handle_punch_request(peer, &[ep], 1000, 1_000_000);
+        let mut changes = mode_changes(&s.handle_punch_request(peer, &[ep], 1000, 1_000_000));
         assert!(matches!(s.path_mode(peer), Some(PeerPathMode::Probing)));
 
         // 2. Collect enough pongs across multiple ticks to reach MIN_PROBE_OK (5).
@@ -688,7 +635,7 @@ mod tests {
             }).collect();
             // Send pongs for all sent pings.
             for seq in &sent_seqs {
-                let _ = s.handle_pong(peer, ep, *seq, 15.0, Some(30.0), after_hold);
+                changes.extend(mode_changes(&s.handle_pong(peer, ep, *seq, 15.0, Some(30.0), after_hold)));
                 total_ok += 1;
             }
             if matches!(s.path_mode(peer), Some(PeerPathMode::Direct { .. })) {
@@ -701,5 +648,42 @@ mod tests {
             total_ok,
             s.path_mode(peer)
         );
+        // Every change reported once, with the wire names.
+        assert_eq!(changes, [
+            ("relay".to_string(), "probing".to_string(), None),
+            ("probing".to_string(), "direct".to_string(), Some(ep)),
+        ]);
+
+        // 3. The direct path goes silent → one downgrade, same names.
+        s.set_keepalive_secs(1);
+        let mut down = Vec::new();
+        for t in 0..10 {
+            let now = after_hold + 10 + t;
+            down.extend(mode_changes(&s.tick(now, now as u64 * 1000, &HashMap::new(), &HashMap::new(), &HashMap::new())));
+        }
+        assert_eq!(down, [("direct".to_string(), "relay".to_string(), None)]);
+    }
+
+    fn mode_changes(actions: &[SchedulerAction]) -> Vec<(String, String, Option<SocketAddr>)> {
+        actions.iter().filter_map(|a| match a {
+            SchedulerAction::PathModeChanged { old_mode, new_mode, endpoint, .. } => Some((old_mode.clone(), new_mode.clone(), *endpoint)),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn network_change_clears_probe_backoff() {
+        let mut s = make_scheduler();
+        let peer = "device-11223344";
+        s.ensure_peer(peer);
+        s.paths.get_mut(peer).unwrap().note_probe_failure(&[v4(203, 0, 113, 7, 1)], 1000);
+        let mut endpoints = HashMap::new();
+        endpoints.insert(peer.to_string(), vec![v4(203, 0, 113, 7, 1)]);
+        s.tick(1001, 1_001_000, &endpoints, &HashMap::new(), &HashMap::new());
+        assert_eq!(s.path_mode(peer), Some(&PeerPathMode::Relay));
+        s.clear_hold_timers();
+        let changes = mode_changes(&s.tick(1002, 1_002_000, &endpoints, &HashMap::new(), &HashMap::new()));
+        assert_eq!(changes, [("relay".to_string(), "probing".to_string(), None)]);
+        assert_eq!(s.mode_counts(), (0, 1, 0));
     }
 }

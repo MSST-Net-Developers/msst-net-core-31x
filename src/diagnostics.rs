@@ -105,22 +105,37 @@ pub async fn path_view(state: &CoreState) -> Value {
                         })
                         .collect(),
                 ),
-                PeerPathMode::Direct { endpoint } => (
-                    format!("direct:{}", endpoint),
-                    vec![json!({
+                PeerPathMode::Direct { endpoint } => {
+                    let mut c = vec![json!({
                         "addr": endpoint.to_string(),
                         "rtt_ms": pp.rtt_baseline_ms,
                         "loss_rate": pp.loss_rate(),
                         "status": "direct",
-                    })],
-                ),
+                    })];
+                    // Background-probed alternatives.
+                    c.extend(pp.probe_candidates.iter().map(|ep| {
+                        let failed = pp.probe_miss.get(ep).copied().unwrap_or(0) >= MAX_PROBE_MISS;
+                        json!({
+                            "addr": ep.to_string(),
+                            "rtt_ms": pp.probe_rtt_ms.get(ep),
+                            "status": if failed { "fail" } else { "probing" },
+                        })
+                    }));
+                    (format!("direct:{}", endpoint), c)
+                }
             };
-            json!({
+            let mut v = json!({
                 "device_id": id,
                 "display_name": net.peer_list.get(id).and_then(|e| e.display_name.clone()),
                 "chosen": chosen,
                 "candidates": candidates,
-            })
+            });
+            // Unreachable peer: when the next probe round may start.
+            if pp.probe_failures > 0 {
+                v["probe_failures"] = json!(pp.probe_failures);
+                v["next_probe_at"] = json!(pp.next_probe_at);
+            }
+            v
         })
         .collect();
     json!({ "peers": peers })

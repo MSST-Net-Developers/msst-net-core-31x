@@ -872,14 +872,19 @@ async fn execute_scheduler_action(
                 debug!("scheduler: UDP send to {} failed: {}", target, e);
             }
         }
-        SchedulerAction::PathModeChanged { peer_id, old_mode, new_mode } => {
-            info!("P2P: {} path {} → {}", peer_id, old_mode, new_mode);
+        SchedulerAction::PathModeChanged { peer_id, old_mode, new_mode, endpoint } => {
+            // Logged by the scheduler.  Traffic counters describe one path.
             crate::diagnostics::reset_traffic(state, peer_id);
+            if let Some(m) = state.metrics.get() {
+                let (relay, probing, direct) = state.scheduler.lock().await.mode_counts();
+                m.update_path_modes(relay as i64, probing as i64, direct as i64);
+            }
             state.next_generation();
             state.emit_ipc_event(msst_ipc_protocol::IpcEvent::PathChanged {
                 device_id: peer_id.clone(),
                 old_mode: old_mode.clone(),
                 new_mode: new_mode.clone(),
+                endpoint: endpoint.map(|e| e.to_string()),
             });
         }
         SchedulerAction::DetectEndpoints => {
