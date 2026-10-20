@@ -15,14 +15,6 @@ pub enum SchedulerAction {
         data: Vec<u8>,
         target: SocketAddr,
     },
-    /// Send a WireGuard-encrypted packet directly to a peer.
-    /// The runtime should encrypt the payload via EncryptionEngine
-    /// and send the raw ciphertext via UDP.
-    WgEncryptedSend {
-        peer_id: String,
-        plaintext: Vec<u8>,
-        target: SocketAddr,
-    },
     /// A peer's path mode (or direct endpoint) changed.  Modes are
     /// `relay`, `probing` or `direct`; `endpoint` is the direct endpoint.
     PathModeChanged {

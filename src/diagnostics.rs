@@ -81,6 +81,8 @@ pub async fn traffic_view(state: &CoreState) -> Value {
 /// `GetPathView` / `GetPaths` (3.0.x `GET /net/path-view`): per peer, the
 /// chosen path and its candidates.
 pub async fn path_view(state: &CoreState) -> Value {
+    let now = crate::runtime::current_unix();
+    let enc_views = state.encryption.lock().await.views(now);
     let sched = state.scheduler.lock().await;
     let net = state.net.read().await;
     let peers: Vec<Value> = sched
@@ -130,6 +132,15 @@ pub async fn path_view(state: &CoreState) -> Value {
                 "chosen": chosen,
                 "candidates": candidates,
             });
+            // Data-plane encryption (no session: no key from the coordinator).
+            let ev = enc_views.get(id);
+            v["encryption"] = json!(ev.map_or("unknown", |e| e.state.name()));
+            if let Some(t) = ev.and_then(|e| e.last_handshake_at) {
+                v["last_handshake_at"] = json!(t);
+            }
+            if let Some(t) = ev.and_then(|e| e.next_retry_at) {
+                v["next_retry_at"] = json!(t);
+            }
             // Unreachable peer: when the next probe round may start.
             if pp.probe_failures > 0 {
                 v["probe_failures"] = json!(pp.probe_failures);

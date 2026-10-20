@@ -284,33 +284,27 @@ impl P2PScheduler {
         peer_relay: Option<SocketAddr>,
         own_relay: Option<SocketAddr>,
     ) -> Option<(SocketAddr, Vec<u8>)> {
-        let mode = self.paths.get(dst_device_id).map(|pp| pp.mode.clone());
-        let mode = mode.unwrap_or(PeerPathMode::Relay);
+        let target = self.route_target(dst_device_id, peer_relay, own_relay)?;
+        Some((target, router::build_data_frame(&self.local_device_id, dst_device_id, ip_payload)))
+    }
 
-        let target = router::route_outbound(&mode, peer_relay, own_relay);
-
-        match target {
-            router::RouteTarget::Direct { endpoint } => {
-                let frame = router::build_data_frame(&self.local_device_id, dst_device_id, ip_payload);
-                Some((endpoint, frame))
-            }
-            router::RouteTarget::Relay { relay_addr } => {
-                let frame = router::build_data_frame(&self.local_device_id, dst_device_id, ip_payload);
-                Some((relay_addr, frame))
-            }
+    /// Where frames to a peer go now: its direct endpoint, else the relay.
+    pub fn route_target(
+        &self,
+        dst_device_id: &str,
+        peer_relay: Option<SocketAddr>,
+        own_relay: Option<SocketAddr>,
+    ) -> Option<SocketAddr> {
+        let mode = self.paths.get(dst_device_id).map(|pp| &pp.mode).unwrap_or(&PeerPathMode::Relay);
+        match router::route_outbound(mode, peer_relay, own_relay) {
+            router::RouteTarget::Direct { endpoint } => Some(endpoint),
+            router::RouteTarget::Relay { relay_addr } => Some(relay_addr),
             router::RouteTarget::NoRoute => None,
         }
     }
 
-    /// Route an outbound packet via WireGuard encryption.
-    ///
-    /// Returns `Some((endpoint, wg_ciphertext))` if:
-    /// - The path is in Direct mode (we have a known endpoint)
-    /// - The caller has a WG session for this peer
-    ///
-    /// Returns `None` if WG direct routing is not available (caller
-    /// should fall back to MSST-framed routing).
-    pub fn route_outbound_wg(
+    /// The peer's direct endpoint, if its path is direct.
+    pub fn direct_endpoint(
         &self,
         dst_device_id: &str,
     ) -> Option<SocketAddr> {

@@ -22,12 +22,10 @@
 //!                         └─ remove peers with no active reasons
 //! ```
 
-pub mod handshake;
 pub mod liveness;
 pub mod node_cache;
 
 use crate::peer_list::PeerList;
-use handshake::{HandshakeAction, HandshakeTracker};
 use liveness::LivenessTracker;
 use node_cache::NodeCache;
 use std::net::IpAddr;
@@ -104,13 +102,13 @@ pub struct RoomPeerInfo {
 
 /// Orchestrates peer lifecycle: discovery, liveness, and eviction.
 ///
-/// Owns a `NodeCache`, `LivenessTracker`, and `HandshakeTracker`.
+/// Owns a `NodeCache` and a `LivenessTracker`.  WireGuard sessions are
+/// owned by `EncryptionEngine`; this only reports when to add/remove them.
 /// Operates on a `PeerList` (passed by reference) so that state ownership
 /// stays clear.
 pub struct PeerManager {
     cache: NodeCache,
     liveness: LivenessTracker,
-    pub handshakes: HandshakeTracker,
 }
 
 impl PeerManager {
@@ -118,7 +116,6 @@ impl PeerManager {
         PeerManager {
             cache: NodeCache::new(),
             liveness: LivenessTracker::new(),
-            handshakes: HandshakeTracker::new(),
         }
     }
 
@@ -141,16 +138,10 @@ impl PeerManager {
                 for peer in peers {
                     self.upsert_from_room(peer, peer_list, now_unix);
                     if let Some(pk) = &peer.public_key {
-                        // Register with handshake tracker.
-                        let action = self.handshakes.register_peer(
-                            &peer.device_id, pk, now_unix,
-                        );
-                        if let HandshakeAction::AddSession { device_id, public_key_b64 } = action {
-                            effects.push(PeerSideEffect::WgAddPeer {
-                                device_id,
-                                public_key_b64,
-                            });
-                        }
+                        effects.push(PeerSideEffect::WgAddPeer {
+                            device_id: peer.device_id.clone(),
+                            public_key_b64: pk.clone(),
+                        });
                     }
                     if let Some(relay) = &peer.preferred_relay {
                         peer_list.update_relay(&peer.device_id, relay);
@@ -161,12 +152,7 @@ impl PeerManager {
             PeerEvent::RoomPeerLeft { device_id } => {
                 self.cache.mark_left_room(device_id, now_unix);
                 // Remove WG session when peer leaves room.
-                if let Some(action) = self.handshakes.remove_peer(device_id) {
-                    if let HandshakeAction::RemoveSession { device_id } = action {
-                        return vec![PeerSideEffect::WgRemovePeer { device_id }];
-                    }
-                }
-                vec![]
+                vec![PeerSideEffect::WgRemovePeer { device_id: device_id.clone() }]
             }
             PeerEvent::RoomLeft { room_id: _ } => {
                 self.cache.clear_all_room_membership(now_unix);
@@ -263,7 +249,6 @@ impl PeerManager {
     /// Record that we saw a packet from this peer (any traffic).
     pub fn touch_seen(&mut self, device_id: &str, now_unix: i64) {
         self.liveness.touch(device_id, now_unix);
-        self.handshakes.touch_activity(device_id, now_unix);
     }
 
     /// Record that we communicated with this peer (ACL-allowed traffic).
@@ -310,20 +295,10 @@ impl PeerManager {
         let mut effects = Vec::new();
         for id in &expired {
             self.liveness.remove(id);
-            if let Some(action) = self.handshakes.remove_peer(id) {
-                if let HandshakeAction::RemoveSession { device_id } = action {
-                    effects.push(PeerSideEffect::WgRemovePeer { device_id });
-                }
-            }
+            effects.push(PeerSideEffect::WgRemovePeer { device_id: id.clone() });
             info!("peer_mgmt: evicted {}", id);
         }
         (expired, effects)
-    }
-
-    /// Check for WireGuard handshake timeouts.
-    /// Returns actions the caller should execute (retry or give up).
-    pub fn check_handshake_timeouts(&mut self, now_unix: i64) -> Vec<HandshakeAction> {
-        self.handshakes.check_timeouts(now_unix)
     }
 
     // ── Cache persistence ─────────────────────────────────────────────────

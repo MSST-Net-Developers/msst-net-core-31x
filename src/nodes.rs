@@ -174,10 +174,14 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         dns.invalidate(h);
     }
     if !p.public_key.is_empty() {
-        if let Err(e) = state.encryption.lock().await.add_peer(p.device_id, p.public_key) {
-            warn!("nodes: WG add_peer failed for {}: {}", p.device_id, e);
-        }
-        state.peers.lock().await.handshakes.register_peer(p.device_id, p.public_key, now);
+        let changes = {
+            let mut enc = state.encryption.lock().await;
+            if let Err(e) = enc.add_peer(p.device_id, p.public_key) {
+                warn!("nodes: WG add_peer failed for {}: {}", p.device_id, e);
+            }
+            enc.take_changes()
+        };
+        state.emit_encryption_changes(changes);
     }
     if let Some(e) = changed {
         state.next_generation();

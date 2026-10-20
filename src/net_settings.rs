@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tracing::warn;
 
+pub use msst_core_state::encryption::EncryptionPolicy;
+
 pub const FILE: &str = "net_settings.json";
 /// Accepted TUN MTU range: IPv6 requires ≥ 1280; 1500 is the Ethernet MTU.
 pub const MTU_RANGE: std::ops::RangeInclusive<u64> = 1280..=1500;
@@ -48,6 +50,9 @@ pub struct NetworkSettings {
     pub keepalive_secs: Option<u32>,
     #[serde(default)]
     pub linux_dns_mode: LinuxDnsMode,
+    /// Data-plane encryption policy (`prefer` or `off`).
+    #[serde(default)]
+    pub data_encryption: EncryptionPolicy,
 }
 
 impl NetworkSettings {
@@ -84,12 +89,14 @@ impl NetworkSettings {
             "mtu_override": self.mtu_override,
             "keepalive_secs": self.keepalive_secs,
             "linux_dns_mode": self.linux_dns_mode,
+            "data_encryption": self.data_encryption,
         })
     }
 
     /// Apply a partial update (3.0.x `PUT /net/settings`): absent fields are
     /// unchanged, `null` clears an optional field, `keepalive_secs` is
-    /// clamped to 5..=30, an unknown `linux_dns_mode` means `prefer_split`.
+    /// clamped to 5..=30, an unknown `linux_dns_mode` means `prefer_split`,
+    /// `data_encryption` must be `prefer` or `off`.
     pub fn apply_patch(&mut self, patch: &Value) -> Result<(), String> {
         let obj = patch.as_object().ok_or("settings must be a JSON object")?;
         let bool_field = |k: &str| -> Result<Option<bool>, String> {
@@ -125,6 +132,13 @@ impl NetworkSettings {
             self.keepalive_secs = match v {
                 Value::Null => None,
                 _ => Some(v.as_u64().ok_or("keepalive_secs must be null or a positive integer")?.clamp(5, 30) as u32),
+            };
+        }
+        if let Some(v) = obj.get("data_encryption") {
+            self.data_encryption = match v.as_str() {
+                Some("prefer") => EncryptionPolicy::Prefer,
+                Some("off") => EncryptionPolicy::Off,
+                _ => return Err("data_encryption must be \"prefer\" or \"off\"".into()),
             };
         }
         if let Some(v) = obj.get("linux_dns_mode") {
@@ -187,5 +201,19 @@ mod tests {
         assert!(s.apply_patch(&json!({"lock_path": "yes"})).is_err());
         assert!(s.apply_patch(&json!([1])).is_err());
         assert_eq!(s.to_view()["linux_dns_mode"], "prefer_split");
+    }
+
+    #[test]
+    fn data_encryption_setting() {
+        let mut s = NetworkSettings::default();
+        assert_eq!(s.data_encryption, EncryptionPolicy::Prefer);
+        assert_eq!(s.to_view()["data_encryption"], "prefer");
+        s.apply_patch(&json!({"data_encryption": "off"})).unwrap();
+        assert_eq!(s.data_encryption, EncryptionPolicy::Off);
+        for bad in [json!({"data_encryption": "require"}), json!({"data_encryption": null}), json!({"data_encryption": 1})] {
+            assert!(s.clone().apply_patch(&bad).is_err(), "{}", bad);
+        }
+        let back: NetworkSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.data_encryption, EncryptionPolicy::Off);
     }
 }

@@ -239,8 +239,8 @@ async fn set_net_settings(state: &Arc<CoreState>, patch: serde_json::Value) -> R
         next.save(&state.data_dir).map_err(|e| err("persist_failed", format!("failed to save settings: {}", e)))?;
         *s = next;
         info!(
-            "IPC: network settings updated: disable_p2p={} lock_path={} preferred_relay={:?} mtu_override={:?} keepalive_secs={:?} linux_dns_mode={:?}",
-            s.disable_p2p, s.lock_path, s.preferred_relay, s.mtu_override, s.keepalive_secs, s.linux_dns_mode
+            "IPC: network settings updated: disable_p2p={} lock_path={} preferred_relay={:?} mtu_override={:?} keepalive_secs={:?} linux_dns_mode={:?} data_encryption={:?}",
+            s.disable_p2p, s.lock_path, s.preferred_relay, s.mtu_override, s.keepalive_secs, s.linux_dns_mode, s.data_encryption
         );
         s.to_view()
     };

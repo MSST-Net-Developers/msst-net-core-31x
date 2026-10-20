@@ -39,6 +39,14 @@ fn proto_str(p: Protocol) -> &'static str {
     }
 }
 
+/// Whether a packet decrypted from `device_id`'s WireGuard session carries
+/// that peer's own virtual address as its source (WireGuard "AllowedIPs").
+pub async fn from_peer_address(state: &CoreState, device_id: &str, pkt: &[u8]) -> bool {
+    let Some(parsed) = crate::runtime::parse_ip_packet(pkt) else { return false };
+    let net = state.net.read().await;
+    net.peer_list.get(device_id).is_some_and(|e| e.ipv4 == parsed.src_ip || e.ipv6 == parsed.src_ip)
+}
+
 /// Run one inbound IP packet through the firewall and deliver it if allowed.
 pub async fn deliver_inbound(state: &Arc<CoreState>, tun_tx: &mpsc::Sender<Vec<u8>>, pkt: Vec<u8>) {
     let Some(parsed) = crate::runtime::parse_ip_packet(&pkt) else { return };

@@ -6,6 +6,8 @@
 //! [type:    1 byte ] 0x01=register 0x02=keepalive 0x04=data
 //!                    0x05=relay-ping 0x06=p2p-ping 0x07=p2p-pong
 //!                    0x08=discovery-register 0x09=discovery-data
+//!                    0x0A..0x0C=secure discovery (`sdisc`)
+//!                    0x0D=WireGuard message (data-plane encryption)
 //! [flags:   1 byte ] 0
 //! [src_id:  8 bytes] sender device ID (big-endian u64, lower 32 bits)
 //! [dst_id:  8 bytes] destination device ID (zeros for broadcast types)
@@ -29,6 +31,8 @@ pub const TYPE_P2P_PING: u8 = 0x06;
 pub const TYPE_P2P_PONG: u8 = 0x07;
 pub const TYPE_DISCOVERY_REGISTER: u8 = 0x08;
 pub const TYPE_DISCOVERY_DATA: u8 = 0x09;
+/// One WireGuard message (see `docs/DATA_PLANE_ENCRYPTION.md`).
+pub const TYPE_WG: u8 = 0x0D;
 
 pub const HEADER_LEN: usize = 4 + 1 + 1 + 1 + 8 + 8; // 23
 pub const PING_PAYLOAD_LEN: usize = 12; // seq(4) + timestamp_ms(8)
@@ -111,6 +115,7 @@ impl MsstPacket {
             TYPE_P2P_PONG => "p2p-pong",
             TYPE_DISCOVERY_REGISTER => "discovery-register",
             TYPE_DISCOVERY_DATA => "discovery-data",
+            TYPE_WG => "wireguard",
             _ => "unknown",
         }
     }
@@ -244,6 +249,19 @@ pub fn build_data(src_id: &str, dst_id: &str, ip_payload: &[u8]) -> Vec<u8> {
         src_id: encode_id(src_id),
         dst_id: encode_id(dst_id),
         payload: ip_payload.to_vec(),
+    }
+    .encode()
+}
+
+/// Build a `TYPE_WG` frame carrying one WireGuard message.
+pub fn build_wg(src_id: &str, dst_id: &str, wg_message: &[u8]) -> Vec<u8> {
+    MsstPacket {
+        version: VERSION,
+        packet_type: TYPE_WG,
+        flags: 0,
+        src_id: encode_id(src_id),
+        dst_id: encode_id(dst_id),
+        payload: wg_message.to_vec(),
     }
     .encode()
 }

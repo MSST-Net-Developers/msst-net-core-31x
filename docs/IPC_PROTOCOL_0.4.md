@@ -120,6 +120,15 @@ Add `"async": true` to a command request:
   `next_probe_at` (Unix seconds — no probing before then: 30 s after the
   first failed round, doubling up to 10 min; new peer endpoints, a
   `punch_request` or a network change probe at once).
+- **Data-plane encryption** (`docs/DATA_PLANE_ENCRYPTION.md`):
+  - network setting `data_encryption`: `"prefer"` (default) or `"off"`;
+    anything else → `invalid_settings`;
+  - `GetPathView`: every peer has `encryption` (`unknown`, `handshaking`,
+    `encrypted` or `plaintext`), plus `last_handshake_at` (Unix seconds,
+    when a WireGuard session exists) and `next_retry_at` (in `plaintext`:
+    no new handshake before then);
+  - new event `EncryptionChanged {device_id, old_state, new_state}` with
+    the same state names.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`
   and `NodeStateChanged` (previously `""` was passed through); a peer
   without a device ID is ignored instead of failing the whole

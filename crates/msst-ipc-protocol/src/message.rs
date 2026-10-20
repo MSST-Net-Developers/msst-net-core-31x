@@ -280,6 +280,15 @@ pub enum IpcEvent {
         endpoint: Option<String>,
     },
 
+    /// A peer's data-plane encryption state changed.  States are
+    /// `unknown`, `handshaking`, `encrypted` or `plaintext` (see
+    /// `docs/DATA_PLANE_ENCRYPTION.md`).
+    EncryptionChanged {
+        device_id: String,
+        old_state: String,
+        new_state: String,
+    },
+
     // ── ACL events ──────────────────────────────────────────────────────────
     /// A firewall rule was created, updated, or deleted.
     AclChanged {

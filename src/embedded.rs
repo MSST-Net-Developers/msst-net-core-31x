@@ -124,6 +124,7 @@ impl EmbeddedCore {
                 dns.clear_cache();
             }
             state.scheduler.lock().await.clear_hold_timers();
+            state.encryption.lock().await.reset_backoff();
             crate::endpoints::spawn_detect_and_report(state.clone());
         });
     }

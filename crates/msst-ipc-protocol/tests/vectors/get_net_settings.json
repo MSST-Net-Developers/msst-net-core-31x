@@ -9,6 +9,7 @@
   "response": {
     "body": {
       "data": {
+        "data_encryption": "prefer",
         "disable_p2p": false,
         "keepalive_secs": null,
         "linux_dns_mode": "prefer_split",
