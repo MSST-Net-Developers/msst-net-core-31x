@@ -317,6 +317,24 @@ pub async fn auth_poll(state: &Arc<CoreState>, session_id: &str) -> Result<Value
     Ok(v)
 }
 
+/// The access credentials expired and the IdP refused to refresh them: drop
+/// them and fall back to the user ID derived from the device key, with no
+/// handle (registered as the ID).  Device fields and the user display name
+/// are kept.  Logging in again restores the OIDC identity.
+pub async fn drop_expired_credentials(state: &CoreState) -> Result<(), IpcError> {
+    let reverted = update_identity(state, |id| {
+        id.auth.take()?;
+        id.user.id = identity::derive_id(&id.public_key, "user");
+        id.user.handle.clear();
+        Some(id.user.id.clone())
+    })
+    .await?;
+    if let Some(user_id) = reverted {
+        info!("account: access credentials expired — using the local user ID {}", user_id);
+    }
+    Ok(())
+}
+
 /// Refresh the access token now (`POST /auth/token/refresh`).
 pub async fn auth_refresh(state: &Arc<CoreState>) -> Result<Value, IpcError> {
     let client = client(state)?;
@@ -476,7 +494,7 @@ mod tests {
         let out = update_display_name(&state, None, Some(" ".into())).await.unwrap();
         assert!(out["device_display_name"].is_null());
         assert_eq!(identity_on_disk(&state).device.display_name, "");
-        assert_eq!(registers().last().unwrap()["meta"]["device_display_name"], format!("用户{}的设备", user_id));
+        assert_eq!(registers().last().unwrap()["meta"]["device_display_name"], format!("用户{}的设备", user_id.strip_prefix("user-").unwrap()));
 
         // Handle set, then cleared → registered as the device ID.
         update_handle(&state, None, Some("pc".into())).await.unwrap();

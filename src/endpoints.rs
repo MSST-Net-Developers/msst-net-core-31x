@@ -168,7 +168,7 @@ async fn detect_and_report(state: &Arc<CoreState>) -> Result<(), String> {
     let port = state.udp_socket.local_addr().map(|a| a.port()).unwrap_or(21031);
     let (device_id, relay, room_relay) = {
         let net = state.net.read().await;
-        let room_relay = net.room_relay.as_ref().and_then(|r| r.usable_addr()).map(str::to_string);
+        let room_relay = net.room_relay.as_ref().filter(|r| r.usable_addr().is_some()).map(|r| r.address.clone());
         (net.local_device_id.clone(), net.relay_addr.clone(), room_relay)
     };
     let (lan, v6) = if disable_p2p { (Vec::new(), Vec::new()) } else { (stun::detect_lan_ipv4(), stun::detect_public_ipv6()) };

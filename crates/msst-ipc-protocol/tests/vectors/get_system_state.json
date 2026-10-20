@@ -24,7 +24,7 @@
           },
           {
             "device_id": "device-00000001",
-            "display_name": null,
+            "display_name": "用户00000001的设备",
             "hostname": null,
             "ipv4": "172.22.0.1",
             "ipv6": "fd22:2222:2222:2222::1"

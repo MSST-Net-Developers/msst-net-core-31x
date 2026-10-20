@@ -734,7 +734,7 @@ async fn on_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: crate::
             let relay_rtt = {
                 let net = state.net.read().await;
                 // Back through our own relay: its binding for us works.
-                if net.relay_addr.as_deref().and_then(|r| r.parse().ok()) == Some(src) {
+                if net.relay_addr.as_deref().and_then(crate::relay::cached_addr).map(relay::unmap_addr) == Some(src) {
                     state.relay_path_ok_at.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
                 net.relay_rtt.for_peer(net.relay_for_peer(device_id), net.relay_addr.as_deref())
@@ -992,7 +992,10 @@ pub(crate) async fn apply_room_relay(state: &Arc<CoreState>, room_id: &str, rela
 fn room_relay_registration_target(net: &crate::state::NetState) -> Option<(String, [u8; 32])> {
     let r = net.room_relay.as_ref()?;
     let addr = r.addr.clone()?;
-    (net.relay_addr.as_deref() != Some(addr.as_str())).then_some((addr, r.pub_key))
+    let own = net.relay_addr.as_deref();
+    let ours = own == Some(r.address.as_str())
+        || own.and_then(crate::relay::cached_addr).map(|a| relay::unmap_addr(a).to_string()).as_deref() == Some(addr.as_str());
+    (!ours).then_some((addr, r.pub_key))
 }
 
 /// (Re)register with the room relay: the first packet now, the rest from

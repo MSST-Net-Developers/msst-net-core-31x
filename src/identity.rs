@@ -119,9 +119,11 @@ impl Identity {
     }
 }
 
-/// The device display name registered when none is set.
+/// The device display name registered (and shown) when none is set, from
+/// the user ID shortened to its 8 hex chars: `user-1a2b3c4d` → "用户1a2b3c4d的设备".
 pub fn default_device_display_name(user_id: &str) -> String {
-    format!("用户{}的设备", user_id)
+    let short: String = user_id.strip_prefix("user-").unwrap_or(user_id).chars().take(8).collect();
+    format!("用户{}的设备", short)
 }
 
 pub(crate) fn derive_id(pubkey: &[u8; 32], prefix: &str) -> String {
@@ -310,6 +312,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn default_device_name_uses_the_short_user_id() {
+        assert_eq!(default_device_display_name("user-1a2b3c4d"), "用户1a2b3c4d的设备");
+        assert_eq!(default_device_display_name("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"), "用户0f1e2d3c的设备");
     }
 
     #[test]

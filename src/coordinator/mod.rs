@@ -297,6 +297,11 @@ impl CoordinatorClient {
                 warn!("coordinator: MSST access authentication required (token refresh did not resolve 401) — continuing as a guest (room mode only)");
                 self.oidc_rejected.store(true, Ordering::SeqCst);
                 core.net.write().await.local_authenticated = false;
+                // The credentials are dead: register with the key-derived
+                // user ID, not the OIDC one.
+                if let Err(e) = crate::account::drop_expired_credentials(core).await {
+                    warn!("coordinator: cannot drop the expired credentials: {}", e.message);
+                }
                 self.report_auth_required(core);
             }
         }
@@ -426,10 +431,10 @@ impl CoordinatorClient {
 
     async fn connect_once(&self, core: &Arc<CoreState>) -> ConnectOutcome {
         let ws_url = self.ws_url();
-        let Some(identity) = core.identity.read().await.clone() else {
+        if core.identity.read().await.is_none() {
             warn!("coordinator: identity not loaded yet");
             return ConnectOutcome::Failed;
-        };
+        }
 
         info!("coordinator: connecting to {}", ws_url);
         self.set_state(core, ConnectionState::Connecting).await;
@@ -437,6 +442,10 @@ impl CoordinatorClient {
         let (ws_stream, credential) = match self.open_authenticated(core, &ws_url).await {
             Ok(v) => v,
             Err(outcome) => return outcome,
+        };
+        // Read after authenticating: expired credentials change the user ID.
+        let Some(identity) = core.identity.read().await.clone() else {
+            return ConnectOutcome::Failed;
         };
         info!("coordinator: WebSocket connected ({})", credential.as_ref().map_or("no credential", Credential::kind));
         *self.credential.write().unwrap_or_else(|e| e.into_inner()) = credential;
@@ -1267,7 +1276,7 @@ mod tests {
         let mut id = test_identity(false);
         id.device.display_name.clear();
         let d = &build_register_message(&id)["data"];
-        assert_eq!(d["meta"]["device_display_name"], "用户user-11223344的设备");
+        assert_eq!(d["meta"]["device_display_name"], "用户11223344的设备");
         assert_eq!(d["device"]["handle"], "device-a1b2c3d4");
         // An invalid handle (e.g. hand-edited identity.json) is not sent.
         id.device.handle = "My PC".into();
@@ -1518,12 +1527,28 @@ mod tests {
         let coord = auth_coordinator(allowed.clone(), 401, &["g1"]).await;
         let (core, _ipc) = core_state("coord-guest").await;
         set_oidc(&core, "stale").await;
+        if let Some(id) = core.identity.write().await.as_mut() {
+            (id.user.id, id.user.handle) = ("user-0a0b0c0d".into(), "alice".into());
+        }
         let (client, runner) = start_client(&core, &coord.url).await;
 
         wait_for(|| client.credential_kind() == "guest").await;
         assert!(client.oidc_rejected());
         assert!(core.access_auth_required.load(Ordering::SeqCst));
         assert!(!core.net.read().await.local_authenticated, "room-mode rules apply");
+        // The dead credentials are dropped: registered with the user ID
+        // derived from the key, and no handle.
+        let derived = {
+            let id = core.identity.read().await;
+            let id = id.as_ref().unwrap();
+            assert!(id.auth.is_none());
+            assert_eq!(id.user.handle, "");
+            crate::identity::derive_id(&id.public_key, "user")
+        };
+        assert_eq!(core.net.read().await.local_user_id, derived);
+        let register = coord.ws_log.lock().unwrap().iter().find(|m| m["type"] == "register").cloned().unwrap();
+        assert_eq!(register["data"]["user"]["id"], derived.as_str());
+        assert_eq!(register["data"]["user"]["handle"], derived.as_str());
         let attempts: Vec<(Option<String>, bool)> = coord.ws_auth_log.lock().unwrap().clone();
         // Refused once; the refresh was refused too, so no second try with it.
         assert_eq!(attempts, [(Some("stale".into()), false), (Some("g1".into()), true)]);

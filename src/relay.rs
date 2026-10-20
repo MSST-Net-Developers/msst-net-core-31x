@@ -11,6 +11,7 @@ use msst_core_state::net::path::RTT_EWMA_ALPHA;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -48,18 +49,20 @@ impl RelayEntry {
         }
     }
 
-    /// The selection result for this entry reached at `addr`.
-    fn selected(&self, addr: SocketAddr) -> SelectedRelay {
+    /// The selection result for this entry, known as `name` and reached
+    /// at `target`.
+    fn selected(&self, name: &str, target: SocketAddr) -> SelectedRelay {
         let pub_key = self.key();
         let sreg = pub_key.is_some() && self.features.iter().any(|f| f == crate::sreg::FEATURE);
-        SelectedRelay { addr: addr.to_string(), pub_key, sreg }
+        SelectedRelay::new(name, target, pub_key, sreg)
     }
 }
 
 /// The relay chosen by [`select_best_relay`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectedRelay {
-    /// Numeric `IP:port`.
+    /// `host:port` as listed by `GET /relays` or configured: a name stays a
+    /// name (resolved through [`resolve_addr`]'s cache).
     pub addr: String,
     /// The relay's key from `GET /relays` (pinned for this selection): used
     /// by secure discovery and authenticated registration.
@@ -67,6 +70,15 @@ pub struct SelectedRelay {
     /// Register with `0x0E` (sreg v1): the relay lists `sreg1` in its
     /// `features` and has a valid `pub_key`.
     pub sreg: bool,
+}
+
+impl SelectedRelay {
+    /// Pins `name` to the probed `target` in the resolver cache, so traffic
+    /// uses the address (and family) the selection measured.
+    fn new(name: &str, target: SocketAddr, pub_key: Option<[u8; 32]>, sreg: bool) -> Self {
+        pin_resolved(name, target);
+        SelectedRelay { addr: name.to_string(), pub_key, sreg }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,9 +155,9 @@ async fn entry_for_preferred<'a>(relays: &'a [RelayEntry], pref: &str, target: S
     None
 }
 
-/// Fetch the relay list from the coordinator and return the **numeric
-/// IP:port** of the relay with the lowest average ping RTT, with the
-/// secure-discovery key it advertises.
+/// Fetch the relay list from the coordinator and return the relay with the
+/// lowest average ping RTT (its address as listed, a name stays a name),
+/// with the secure-discovery key it advertises.
 ///
 /// A `preferred` relay is probed first and used only if it responds; an
 /// unresponsive preferred relay falls through to auto-selection (silently
@@ -166,9 +178,9 @@ pub async fn select_best_relay(
         match probe_relay(pref, src_id).await {
             Some((target, rtt)) => {
                 info!("relay: preferred relay {} reachable at {} ({:.1} ms)", pref, target, rtt);
-                let unlisted = SelectedRelay { addr: target.to_string(), pub_key: None, sreg: false };
+                let unlisted = SelectedRelay::new(pref, target, None, false);
                 return Ok(match &listed {
-                    Ok(relays) => entry_for_preferred(relays, pref, target).await.map_or(unlisted, |e| e.selected(target)),
+                    Ok(relays) => entry_for_preferred(relays, pref, target).await.map_or(unlisted, |e| e.selected(pref, target)),
                     Err(e) => {
                         warn!("relay: relay list unavailable ({}) — preferred relay used without a key", e);
                         unlisted
@@ -202,7 +214,7 @@ pub async fn select_best_relay(
         if let Ok((relay, Some((target, rtt)))) = h.await {
             info!("relay: {} ({}) avg RTT {:.1} ms", relay.addr, target, rtt);
             if best.as_ref().is_none_or(|(_, b)| rtt < *b) {
-                best = Some((relay.selected(target), rtt));
+                best = Some((relay.selected(&relay.addr, target), rtt));
             }
         }
     }
@@ -317,26 +329,99 @@ async fn ping_target(target: SocketAddr, src_id: [u8; 8]) -> Option<f64> {
     (!rtts.is_empty()).then(|| rtts.iter().sum::<f64>() / rtts.len() as f64)
 }
 
-/// Resolve a relay address string.  Numeric `IP:port` is the fast path; DNS
-/// is the fallback, preferring the address family the host can route.
+/// How long a resolved relay name is used before it is looked up again.
+const DNS_TTL: Duration = Duration::from_secs(60);
+/// How long a failed lookup is remembered (this runs per packet).
+const DNS_NEGATIVE_TTL: Duration = Duration::from_secs(10);
+
+struct Resolved {
+    addr: Option<SocketAddr>,
+    at: Instant,
+    refreshing: bool,
+}
+
+/// Relay names (`host:port`) resolved by [`resolve_addr`].
+static RESOLVED: LazyLock<Mutex<HashMap<String, Resolved>>> = LazyLock::new(Default::default);
+
+fn resolved_cache() -> std::sync::MutexGuard<'static, HashMap<String, Resolved>> {
+    RESOLVED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Record that relay `name` was reached at `addr` (relay selection).
+pub fn pin_resolved(name: &str, addr: SocketAddr) {
+    if name.parse::<SocketAddr>().is_err() {
+        resolved_cache().insert(name.to_string(), Resolved { addr: Some(addr), at: Instant::now(), refreshing: false });
+    }
+}
+
+/// [`resolve_addr`] without a lookup: numeric, or the last resolved
+/// address of a name (`None` if it was never resolved).
+pub fn cached_addr(addr: &str) -> Option<SocketAddr> {
+    match addr.parse::<SocketAddr>() {
+        Ok(sa) => Some(sa),
+        Err(_) => resolved_cache().get(addr).and_then(|r| r.addr),
+    }
+}
+
+/// Resolve a relay address string.  Numeric `IP:port` is the fast path; a
+/// name is looked up at most every [`DNS_TTL`] (an expired one is still used
+/// while it is looked up again in the background), keeping the address
+/// family it had, else preferring the family the host can route.
 pub async fn resolve_addr(addr: &str) -> Option<SocketAddr> {
     // Fast path: numeric IPv4 needs no probing at all (this runs per packet).
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return (sa.is_ipv4() || crate::ip::ipv6_available()).then_some(sa);
     }
-    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(addr).await {
-        Ok(it) => it.collect(),
-        Err(e) => {
-            debug!("relay: DNS lookup failed for {}: {}", addr, e);
-            return None;
+    let prev = {
+        let mut cache = resolved_cache();
+        match cache.get_mut(addr) {
+            Some(r) if r.at.elapsed() < if r.addr.is_some() { DNS_TTL } else { DNS_NEGATIVE_TTL } => return r.addr,
+            Some(r) if r.addr.is_some() => {
+                if !r.refreshing {
+                    r.refreshing = true;
+                    let name = addr.to_string();
+                    tokio::spawn(async move { refresh_resolved(&name).await });
+                }
+                return r.addr;
+            }
+            _ => None,
         }
     };
-    let v6_ok = crate::ip::ipv6_available();
-    addrs
-        .iter()
-        .find(|a| a.is_ipv6() == v6_ok)
-        .or_else(|| addrs.first())
-        .copied()
+    refresh_resolved_from(addr, prev).await
+}
+
+async fn refresh_resolved(name: &str) -> Option<SocketAddr> {
+    let prev = resolved_cache().get(name).and_then(|r| r.addr);
+    refresh_resolved_from(name, prev).await
+}
+
+/// Look `name` up and cache the result.  A failed lookup keeps a previous
+/// address (a DNS hiccup must not cut the relay path).
+async fn refresh_resolved_from(name: &str, prev: Option<SocketAddr>) -> Option<SocketAddr> {
+    let found = match tokio::net::lookup_host(name).await {
+        Ok(it) => pick_resolved(&it.collect::<Vec<_>>(), prev, crate::ip::ipv6_available()),
+        Err(e) => {
+            debug!("relay: DNS lookup failed for {}: {}", name, e);
+            None
+        }
+    };
+    let addr = found.or(prev);
+    resolved_cache().insert(name.to_string(), Resolved { addr, at: Instant::now(), refreshing: false });
+    addr
+}
+
+/// The address to use from a lookup: the previous one if still listed, else
+/// one of its family, else the family the host can route.
+fn pick_resolved(addrs: &[SocketAddr], prev: Option<SocketAddr>, v6_ok: bool) -> Option<SocketAddr> {
+    if let Some(p) = prev {
+        if addrs.contains(&p) {
+            return Some(p);
+        }
+        if let Some(a) = addrs.iter().find(|a| a.is_ipv6() == p.is_ipv6()) {
+            return Some(*a);
+        }
+    }
+    addrs.iter().find(|a| a.is_ipv6() == v6_ok).or_else(|| addrs.first()).copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +490,36 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn resolved_address_keeps_its_family() {
+        let (v4, v4b, v6) = (sa("192.0.2.1:7000"), sa("192.0.2.2:7000"), sa("[2001:db8::1]:7000"));
+        // Still listed: kept.
+        assert_eq!(pick_resolved(&[v6, v4], Some(v4), true), Some(v4));
+        // Moved: same family.
+        assert_eq!(pick_resolved(&[v6, v4b], Some(v4), true), Some(v4b));
+        // First lookup: the family the host can route.
+        assert_eq!(pick_resolved(&[v4, v6], None, true), Some(v6));
+        assert_eq!(pick_resolved(&[v6, v4], None, false), Some(v4));
+        assert_eq!(pick_resolved(&[], Some(v4), true), None);
+    }
+
+    #[tokio::test]
+    async fn relay_names_are_kept_and_resolved_through_the_cache() {
+        // A selected name is pinned to the probed address: no lookup.
+        let name = "relay.invalid:7000";
+        assert_eq!(cached_addr(name), None);
+        let s = SelectedRelay::new(name, sa("192.0.2.9:7000"), None, false);
+        assert_eq!(s.addr, name);
+        assert_eq!(cached_addr(name), Some(sa("192.0.2.9:7000")));
+        assert_eq!(resolve_addr(name).await, Some(sa("192.0.2.9:7000")));
+        // Numeric addresses bypass the cache.
+        assert_eq!(cached_addr("192.0.2.1:1"), Some(sa("192.0.2.1:1")));
+        // A name is looked up once, then served from the cache.
+        let local = resolve_addr("localhost:7001").await.expect("localhost resolves");
+        assert!(local.ip().is_loopback());
+        assert_eq!(cached_addr("localhost:7001"), Some(local));
     }
 
     #[test]
@@ -502,8 +617,8 @@ mod tests {
         assert_eq!(e(Some(&STANDARD.encode([5u8; 32]))).key(), Some([5u8; 32]));
         // sreg needs both the feature and a valid key.
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        assert!(!e(Some("AAAA")).selected(addr).sreg);
-        assert!(e(Some(&STANDARD.encode([5u8; 32]))).selected(addr).sreg);
+        assert!(!e(Some("AAAA")).selected("r:1", addr).sreg);
+        assert!(e(Some(&STANDARD.encode([5u8; 32]))).selected("r:1", addr).sreg);
     }
 
     #[test]
@@ -516,7 +631,7 @@ mod tests {
         ] }))
         .unwrap();
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let sreg: Vec<bool> = list.relays.iter().map(|e| e.selected(addr).sreg).collect();
+        let sreg: Vec<bool> = list.relays.iter().map(|e| e.selected("r:1", addr).sreg).collect();
         assert_eq!(sreg, [false, false, true]);
     }
 }

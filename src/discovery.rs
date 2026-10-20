@@ -503,7 +503,8 @@ async fn room_ctx(state: &CoreState) -> RoomCtx {
     let mut peer_relays: Vec<SocketAddr> = net
         .room_peers
         .iter()
-        .filter_map(|id| net.relay_for_peer(id)?.parse::<SocketAddr>().ok())
+        // Names resolve through the relay cache (filled by the RTT loop).
+        .filter_map(|id| crate::relay::cached_addr(net.relay_for_peer(id)?))
         .map(unmap_addr)
         .collect();
     peer_relays.sort_unstable();

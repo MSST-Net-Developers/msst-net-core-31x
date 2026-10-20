@@ -100,7 +100,9 @@ Add `"async": true` to a command request:
   set, and Core registers the default instead: the device handle becomes
   the device ID (so the ezPlay hostname becomes
   `<device_id>.<user handle or ID>.ezplay.msst.net`), the device display
-  name becomes `用户<user_id>的设备`.  Display names are trimmed and at
+  name becomes `用户<short user ID>的设备`, the user ID without its
+  `user-` prefix, at most 8 characters (`user-1a2b3c4d` →
+  `用户1a2b3c4d的设备`).  Display names are trimmed and at
   most 64 characters without control characters (else
   `invalid_display_name`).
 - **Immediate coordinator sync:** both commands re-register the device
@@ -151,6 +153,12 @@ Add `"async": true` to a command request:
   `AccessAuthRequired` is emitted as before, but the device stays online in
   room mode instead of retrying the dead token forever.  A new login
   (`AuthPoll`) or a successful refresh reconnects with OIDC at once.
+  - dead credentials are dropped: the user ID falls back to the one
+    derived from the device key (`user-<8 hex>`, as before the first
+    login) and the user handle is cleared (registered as the ID);
+    `IdentityChanged` reports this with `is_authenticated: false`.  Device
+    fields and the user display name are kept.  A refresh that can't be
+    attempted (Coordinator unreachable) keeps the credentials.
   - new `Health.coordinator_credential`: `"oidc"`, `"guest"` or `"none"`
     (disconnected, or a Coordinator without guest tokens);
   - `Health.is_authenticated` is now `false` while the Coordinator refuses
@@ -187,11 +195,21 @@ Add `"async": true` to a command request:
     `relay_offline`, `relay_unsupported`, `relay_password_wrong`,
     `room_password_required` (the relay requires a room password).  Other
     Coordinator refusals stay `room_create_failed`;
+  - our own entry in the room view's `peers` has the default device
+    display name (`用户<short user ID>的设备`, what peers see) when none is
+    set, instead of `null`;
   - the room view (`GetSystemState`) and `RoomStateChanged` carry
     `room_relay`: `{address, self_hosted, state}` with `state` `probing`,
     `ok` (room traffic uses it) or `down` (fallback to preferred
     relays), or `null`.  `RoomStateChanged` is also sent when the state
     changes.  `GetRelays.room_relay` adds `addr` (resolved) and `tx_sreg`.
+- **Relay addresses keep their host names:** `Health.relay`, the room
+  view's `relay` and `GetRelays.current` are the relay's address as
+  listed by the Coordinator or configured as the preferred relay (e.g.
+  `relay1.msst.net:7000`), no longer the IP it resolved to.  Peers get the
+  name in our `relay:` endpoint and resolve it themselves (in their own
+  address family); `room-relay:` likewise carries the room relay's
+  address.  Core caches a lookup for 60 s.
 - **Removed from `Health`:** `local_device_id` and `local_user_id`
   (3.1.0-alpha aliases); use `device_id` and `user_id`.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`

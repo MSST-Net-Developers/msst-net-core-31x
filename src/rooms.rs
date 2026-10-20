@@ -337,7 +337,12 @@ pub async fn room_view(state: &CoreState) -> Value {
                 "ipv4": ipv4,
                 "ipv6": ipv6,
                 "hostname": Some(&id.device.hostname).filter(|s| !s.is_empty()),
-                "display_name": Some(&id.device.display_name).filter(|s| !s.is_empty()),
+                // Peers see the default name the Coordinator was given.
+                "display_name": if id.device.display_name.is_empty() {
+                    crate::identity::default_device_display_name(&id.user.id)
+                } else {
+                    id.device.display_name.clone()
+                },
             }));
         }
     }
@@ -402,6 +407,10 @@ mod tests {
         assert_eq!(out["relay"], relay.to_string());
         let peers: Vec<&str> = out["peers"].as_array().unwrap().iter().map(|p| p["device_id"].as_str().unwrap()).collect();
         assert!(peers.contains(&"device-0000000b") && peers.contains(&"device-00000001"));
+        // No device name set: we see the default name peers see.
+        let me = out["peers"].as_array().unwrap().iter().find(|p| p["device_id"] == "device-00000001").unwrap();
+        let user_id = state.identity.read().await.as_ref().unwrap().user.id.clone();
+        assert_eq!(me["display_name"], crate::identity::default_device_display_name(&user_id));
         let create = coord.http_log.lock().unwrap().iter().find(|r| r.path == "/room/create").cloned().unwrap();
         assert!(create.body.get("password_hash").is_none() && !create.body.to_string().contains("\"pw\""));
         let salt = STANDARD.decode(create.body["password"]["salt"].as_str().unwrap()).unwrap();
