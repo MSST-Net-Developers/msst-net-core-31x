@@ -30,7 +30,7 @@ use crate::net::path::{PeerPath, PeerPathMode};
 use crate::nat::punch;
 use crate::nat::stun;
 use crate::p2p::{probe, router};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use tracing::{debug, info, warn};
 
@@ -155,8 +155,7 @@ impl P2PScheduler {
         now_unix: i64,
         now_ms: u64,
         peer_endpoints: &HashMap<String, Vec<SocketAddr>>,
-        peer_relays: &HashMap<String, SocketAddr>,
-        _relay_rtt: &HashMap<String, f64>,
+        relay_routed: &HashSet<String>,
     ) -> Vec<SchedulerAction> {
         let mut actions = Vec::new();
 
@@ -173,17 +172,20 @@ impl P2PScheduler {
             let candidates = peer_endpoints.get(&peer_id).map(Vec::as_slice).unwrap_or_default();
             let Some(pp) = self.paths.get_mut(&peer_id) else { continue };
             let before = pp.mode.clone();
-            let pings = probe::probe_tick(
+            let out = probe::probe_tick(
                 now_unix,
                 now_ms,
                 &self.local_device_id,
                 &peer_id,
                 pp,
                 candidates,
-                peer_relays.get(&peer_id).copied(),
+                relay_routed.contains(&peer_id),
                 &policy,
             );
-            actions.extend(pings.into_iter().map(|(target, data)| SchedulerAction::UdpSend { data, target }));
+            actions.extend(out.pings.into_iter().map(|(target, data)| SchedulerAction::UdpSend { data, target }));
+            if let Some(seq) = out.relay_probe {
+                actions.push(SchedulerAction::RelayPathProbe { peer_id: peer_id.clone(), seq, sent_ms: now_ms });
+            }
             actions.extend(mode_change(&peer_id, &before, pp));
         }
 
@@ -442,7 +444,7 @@ mod tests {
             s.set_disable_p2p(disable);
             s.set_lock_path(lock);
             s.ensure_peer("device-11223344");
-            let _ = s.tick(1000, 1_000_000, &peer_eps(), &HashMap::new(), &HashMap::new());
+            let _ = s.tick(1000, 1_000_000, &peer_eps(), &HashSet::new());
             assert!(matches!(s.path_mode("device-11223344"), Some(PeerPathMode::Relay)));
         }
     }
@@ -451,10 +453,10 @@ mod tests {
     fn tick_disable_p2p_reverts_probing() {
         let mut s = make_scheduler();
         s.ensure_peer("device-11223344");
-        let _ = s.tick(1000, 1_000_000, &peer_eps(), &HashMap::new(), &HashMap::new());
+        let _ = s.tick(1000, 1_000_000, &peer_eps(), &HashSet::new());
         assert!(matches!(s.path_mode("device-11223344"), Some(PeerPathMode::Probing)));
         s.set_disable_p2p(true);
-        let actions = s.tick(1001, 1_001_000, &peer_eps(), &HashMap::new(), &HashMap::new());
+        let actions = s.tick(1001, 1_001_000, &peer_eps(), &HashSet::new());
         assert!(matches!(s.path_mode("device-11223344"), Some(PeerPathMode::Relay)));
         assert!(actions.iter().any(|a| matches!(a, SchedulerAction::PathModeChanged { new_mode, .. } if new_mode == "relay")));
     }
@@ -470,7 +472,7 @@ mod tests {
         // Many ticks with no pongs: unlocked this would downgrade.
         let mut sent = 0;
         for i in 0..60i64 {
-            let actions = s.tick(1000 + i, 1_000_000 + (i as u64) * 1000, &peer_eps(), &HashMap::new(), &HashMap::new());
+            let actions = s.tick(1000 + i, 1_000_000 + (i as u64) * 1000, &peer_eps(), &HashSet::new());
             sent += actions.iter().filter(|a| matches!(a, SchedulerAction::UdpSend { .. })).count();
         }
         assert!(matches!(s.path_mode("device-11223344"), Some(PeerPathMode::Direct { .. })));
@@ -481,7 +483,7 @@ mod tests {
         s.set_lock_path(false);
         let mut downgraded = false;
         for i in 60..120i64 {
-            let actions = s.tick(1000 + i, 1_000_000 + (i as u64) * 1000, &peer_eps(), &HashMap::new(), &HashMap::new());
+            let actions = s.tick(1000 + i, 1_000_000 + (i as u64) * 1000, &peer_eps(), &HashSet::new());
             downgraded |= actions.iter().any(|a| matches!(a, SchedulerAction::PathModeChanged { old_mode, .. } if old_mode == "direct"));
         }
         assert!(downgraded);
@@ -492,7 +494,7 @@ mod tests {
     fn tick_with_no_peers_returns_stun_only() {
         let mut s = make_scheduler();
         s.last_stun_unix = 0; // force STUN
-        let actions = s.tick(300, 300_000, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let actions = s.tick(300, 300_000, &HashMap::new(), &HashSet::new());
         assert!(actions.iter().any(|a| matches!(a, SchedulerAction::DetectEndpoints)));
     }
 
@@ -504,7 +506,7 @@ mod tests {
         let mut endpoints = HashMap::new();
         endpoints.insert("device-11223344".to_string(), vec![v4(1, 2, 3, 4, 21031)]);
 
-        let actions = s.tick(1000, 1_000_000, &endpoints, &HashMap::new(), &HashMap::new());
+        let actions = s.tick(1000, 1_000_000, &endpoints, &HashSet::new());
 
         // Should transition to Probing and send probe pings.
         assert!(matches!(
@@ -575,7 +577,7 @@ mod tests {
         // Run ticks and send pongs for each tick's new pings.
         let mut total_ok = 0u32;
         for tick_t in 1001..1010 {
-            let actions = s.tick(tick_t, (tick_t * 1000) as u64, &endpoints, &HashMap::new(), &HashMap::new());
+            let actions = s.tick(tick_t, (tick_t * 1000) as u64, &endpoints, &HashSet::new());
             // Extract seqs from sent pings.
             let sent_seqs: Vec<u32> = actions.iter().filter_map(|a| {
                 if let SchedulerAction::UdpSend { data, .. } = a {
@@ -612,7 +614,7 @@ mod tests {
         let mut down = Vec::new();
         for t in 0..10 {
             let now = after_hold + 10 + t;
-            down.extend(mode_changes(&s.tick(now, now as u64 * 1000, &HashMap::new(), &HashMap::new(), &HashMap::new())));
+            down.extend(mode_changes(&s.tick(now, now as u64 * 1000, &HashMap::new(), &HashSet::new())));
         }
         assert_eq!(down, [("direct".to_string(), "relay".to_string(), None)]);
     }
@@ -632,10 +634,10 @@ mod tests {
         s.paths.get_mut(peer).unwrap().note_probe_failure(&[v4(203, 0, 113, 7, 1)], 1000);
         let mut endpoints = HashMap::new();
         endpoints.insert(peer.to_string(), vec![v4(203, 0, 113, 7, 1)]);
-        s.tick(1001, 1_001_000, &endpoints, &HashMap::new(), &HashMap::new());
+        s.tick(1001, 1_001_000, &endpoints, &HashSet::new());
         assert_eq!(s.path_mode(peer), Some(&PeerPathMode::Relay));
         s.clear_hold_timers();
-        let changes = mode_changes(&s.tick(1002, 1_002_000, &endpoints, &HashMap::new(), &HashMap::new()));
+        let changes = mode_changes(&s.tick(1002, 1_002_000, &endpoints, &HashSet::new()));
         assert_eq!(changes, [("relay".to_string(), "probing".to_string(), None)]);
         assert_eq!(s.mode_counts(), (0, 1, 0));
     }

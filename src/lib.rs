@@ -32,6 +32,7 @@ mod relay;
 mod rooms;
 mod sdisc;
 mod sreg;
+mod tunnel_probe;
 mod runtime;
 mod state;
 #[cfg(test)]

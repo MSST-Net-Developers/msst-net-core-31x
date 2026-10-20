@@ -74,6 +74,28 @@ path change never rebuilds it.  Every `TYPE_WG` frame to a peer, including
 replies to its handshakes, goes to the peer's direct endpoint when the path
 is direct, otherwise to the peer's relay, falling back to our own relay.
 
+## Relay-path probe (in-tunnel)
+
+While a peer's path is `probing`, Core measures the round trip data really
+takes over the relays — A → B's relay → B → A's relay → A — as the
+baseline a direct path must beat.  Plain `0x06` / `0x07` can't do this:
+a relay forwards `0x06` only from the address bound to the sender (sreg)
+and only to devices registered with it, so across two relays one hop
+always drops it.  The probe therefore travels inside the WireGuard session
+like data:
+
+- Inner packet: IPv4, protocol 253 (RFC 3692 experimentation), from the
+  sender's virtual IPv4 to the receiver's; payload (18 bytes):
+  `"MSRP" ‖ kind (1 ping, 2 pong) ‖ 0 ‖ seq (u32 BE) ‖ sent_ms (u64 BE)`.
+- Sent every 2 s while probing, only over an established session (a probe
+  never starts a handshake), always over the relay route (the peer's
+  relay, else ours), never the direct path.
+- The receiving Core answers a ping itself over its relay route back to
+  the sender and never delivers probes to the TUN; the pong is matched by
+  `seq`, and `sent_ms` (the sender's own clock, echoed) gives the RTT.
+- Probes pass the same source-binding check as data.
+- 0x06 / 0x07 are now used on the direct path only.
+
 ## Security rules
 
 1. Peer data is only accepted from `TYPE_WG` frames that decrypt with that

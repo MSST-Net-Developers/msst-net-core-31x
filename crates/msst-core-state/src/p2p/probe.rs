@@ -42,11 +42,22 @@ impl Default for PathPolicy {
 // Probe tick — called once per second per peer
 // ---------------------------------------------------------------------------
 
-/// Process one probe cycle for a peer and return the pings to send.
+/// What one probe cycle wants sent.
+#[derive(Debug, Default)]
+pub struct ProbeOut {
+    /// P2P pings (`0x06`) to candidate endpoints.
+    pub pings: Pings,
+    /// A relay-path probe is due with this sequence number.  The runtime
+    /// sends it inside the WireGuard session over the relay route (see
+    /// `tunnel_probe` in the Core); its pong goes to [`process_pong`].
+    pub relay_probe: Option<u32>,
+}
+
+/// Process one probe cycle for a peer.
 ///
 /// `candidates` — the peer's announced endpoints (sorted IPv6-first);
-/// `relay_rtt_ms` — EWMA RTT to the relay (upgrade baseline estimate);
-/// `relay_addr` — the relay used to measure the end-to-end relay path.
+/// `relay_path` — a relay route to the peer exists, so the end-to-end
+/// relay path can be measured (the upgrade baseline).
 #[allow(clippy::too_many_arguments)]
 pub fn probe_tick(
     now_unix: i64,
@@ -55,18 +66,32 @@ pub fn probe_tick(
     peer_id: &str,
     pp: &mut PeerPath,
     candidates: &[SocketAddr],
-    relay_addr: Option<SocketAddr>,
+    relay_path: bool,
     policy: &PathPolicy,
+) -> ProbeOut {
+    let mut relay_probe = None;
+    let pings = tick_pings(now_unix, now_ms, local_id, peer_id, pp, candidates, relay_path, policy, &mut relay_probe);
+    ProbeOut { pings, relay_probe }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tick_pings(
+    now_unix: i64,
+    now_ms: u64,
+    local_id: &str,
+    peer_id: &str,
+    pp: &mut PeerPath,
+    candidates: &[SocketAddr],
+    relay_path: bool,
+    policy: &PathPolicy,
+    relay_probe: &mut Option<u32>,
 ) -> Pings {
     let mut pkts = Vec::new();
-    let ping = |pp: &mut PeerPath, pkts: &mut Pings, target: SocketAddr, tracked: bool| {
+    let ping = |pp: &mut PeerPath, pkts: &mut Pings, target: SocketAddr| {
         let seq = pp.next_seq;
         pp.next_seq = pp.next_seq.wrapping_add(1);
-        if tracked {
-            pp.pending_pings.insert(seq, (target, now_ms));
-        }
+        pp.pending_pings.insert(seq, (target, now_ms));
         pkts.push((target, msst_packet::build_p2p_ping(local_id, peer_id, seq, now_ms)));
-        seq
     };
 
     match pp.mode.clone() {
@@ -80,7 +105,7 @@ pub fn probe_tick(
             pp.start_probing(candidates.to_vec(), now_unix);
             // Send the first round of probe pings immediately.
             for &candidate in candidates {
-                ping(pp, &mut pkts, candidate, true);
+                ping(pp, &mut pkts, candidate);
             }
         }
 
@@ -117,19 +142,18 @@ pub fn probe_tick(
             for candidate in pp.probe_candidates.clone() {
                 let miss = pp.probe_miss.get(&candidate).copied().unwrap_or(0);
                 if miss < MAX_PROBE_MISS && !in_flight.contains(&candidate) {
-                    ping(pp, &mut pkts, candidate, true);
+                    ping(pp, &mut pkts, candidate);
                 }
             }
-            // Measure the end-to-end relay path (us → relay → peer → relay →
-            // us) as the upgrade baseline: a P2P ping addressed to the peer,
-            // sent to its relay (3.0.x).
-            if let Some(relay) = relay_addr {
-                if now_ms.saturating_sub(pp.last_relay_path_probe_ms) >= path::RELAY_PATH_PROBE_INTERVAL_MS {
-                    pp.last_relay_path_probe_ms = now_ms;
-                    pp.relay_path_pending.clear(); // drop a stale in-flight probe
-                    let seq = ping(pp, &mut pkts, relay, false);
-                    pp.relay_path_pending.insert(seq);
-                }
+            // Measure the end-to-end relay path (us → peer's relay → peer →
+            // our relay → us) as the upgrade baseline.
+            if relay_path && now_ms.saturating_sub(pp.last_relay_path_probe_ms) >= path::RELAY_PATH_PROBE_INTERVAL_MS {
+                pp.last_relay_path_probe_ms = now_ms;
+                pp.relay_path_pending.clear(); // drop a stale in-flight probe
+                let seq = pp.next_seq;
+                pp.next_seq = pp.next_seq.wrapping_add(1);
+                pp.relay_path_pending.insert(seq);
+                *relay_probe = Some(seq);
             }
         }
 
@@ -169,7 +193,7 @@ pub fn probe_tick(
             let keepalive_ms = (policy.keepalive_secs.max(1) * 1000) as u64;
             if now_ms.saturating_sub(pp.last_keepalive_sent_ms) >= keepalive_ms {
                 pp.last_keepalive_sent_ms = now_ms;
-                ping(pp, &mut pkts, endpoint, true);
+                ping(pp, &mut pkts, endpoint);
             }
 
             // Background probing (3.0.x): keep measuring the peer's other
@@ -187,7 +211,7 @@ pub fn probe_tick(
                     for candidate in pp.probe_candidates.clone() {
                         let miss = pp.probe_miss.get(&candidate).copied().unwrap_or(0);
                         if miss < MAX_PROBE_MISS && !in_flight.contains(&candidate) {
-                            ping(pp, &mut pkts, candidate, true);
+                            ping(pp, &mut pkts, candidate);
                         }
                     }
                 }
@@ -241,7 +265,7 @@ pub fn process_pong(
     now_unix: i64,
     lock_path: bool,
 ) {
-    // Relay-path probe answered (via the relay): update its RTT (3.0.x).
+    // Relay-path probe answered (in-tunnel, over the relays): update its RTT.
     if pp.relay_path_pending.remove(&seq) {
         pp.relay_path_rtt_ms = Some(match pp.relay_path_rtt_ms {
             None => rtt_ms,
@@ -333,7 +357,7 @@ mod tests {
     const P: PathPolicy = PathPolicy { keepalive_secs: 1, disable_p2p: false, lock_path: false };
 
     fn tick(pp: &mut PeerPath, now: i64, candidates: &[SocketAddr]) -> Pings {
-        probe_tick(now, now as u64 * 1000, "local", "peer", pp, candidates, None, &P)
+        probe_tick(now, now as u64 * 1000, "local", "peer", pp, candidates, false, &P).pings
     }
 
     /// Answer the ping `seq` (sent to `to`) from `from`.
@@ -468,7 +492,7 @@ mod tests {
         pp.set_direct(v4(12345), 1000);
         pp.consecutive_no_pong = MAX_CONSECUTIVE_NO_PONG;
         let locked = PathPolicy { lock_path: true, ..P };
-        probe_tick(1100, 1_100_000, "local", "peer", &mut pp, &[v4(12345)], None, &locked);
+        probe_tick(1100, 1_100_000, "local", "peer", &mut pp, &[v4(12345)], false, &locked);
         assert!(pp.mode.is_direct());
         pp.rtt_baseline_ms = Some(10.0);
         for _ in 0..RTT_SPIKE_CONSECUTIVE {
@@ -576,13 +600,22 @@ mod tests {
     }
 
     #[test]
-    fn probing_sends_relay_path_probe_to_relay() {
+    fn probing_requests_a_relay_path_probe() {
         let mut pp = PeerPath::new();
         pp.start_probing(vec![v4(12345)], 1000);
-        let relay: SocketAddr = "198.51.100.1:7000".parse().unwrap();
-        let pings = probe_tick(1001, 1_001_000, "local", "peer", &mut pp, &[v4(12345)], Some(relay), &P);
-        assert!(pings.iter().any(|(t, _)| *t == relay));
-        assert_eq!(pp.relay_path_pending.len(), 1);
+        let out = probe_tick(1001, 1_001_000, "local", "peer", &mut pp, &[v4(12345)], true, &P);
+        let seq = out.relay_probe.expect("relay-path probe due");
+        // Only the candidate gets a 0x06; the relay probe goes in-tunnel.
+        assert!(out.pings.iter().all(|(t, _)| *t == v4(12345)));
+        assert!(pp.relay_path_pending.contains(&seq));
+        // Not again until the interval has passed; never without a relay route.
+        assert!(probe_tick(1002, 1_002_000, "local", "peer", &mut pp, &[v4(12345)], true, &P).relay_probe.is_none());
+        let mut other = PeerPath::new();
+        other.start_probing(vec![v4(12345)], 1000);
+        assert!(probe_tick(1001, 1_001_000, "local", "peer", &mut other, &[v4(12345)], false, &P).relay_probe.is_none());
+        // Its pong only updates the relay-path RTT.
+        process_pong(&mut pp, "198.51.100.1:7000".parse().unwrap(), seq, 80.0, None, 1002, false);
+        assert_eq!(pp.relay_path_rtt_ms, Some(80.0));
     }
 
     #[test]
@@ -590,8 +623,8 @@ mod tests {
         let mut pp = PeerPath::new();
         pp.start_probing(vec![v4(12345)], 1000);
         let off = PathPolicy { disable_p2p: true, ..P };
-        probe_tick(1001, 1_001_000, "local", "peer", &mut pp, &[v4(12345)], None, &off);
+        probe_tick(1001, 1_001_000, "local", "peer", &mut pp, &[v4(12345)], false, &off);
         assert_eq!((pp.mode.clone(), pp.probe_failures), (PeerPathMode::Relay, 0));
-        assert!(probe_tick(1002, 1_002_000, "local", "peer", &mut pp, &[v4(12345)], None, &off).is_empty());
+        assert!(probe_tick(1002, 1_002_000, "local", "peer", &mut pp, &[v4(12345)], false, &off).pings.is_empty());
     }
 }

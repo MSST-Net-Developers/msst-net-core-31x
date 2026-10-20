@@ -52,8 +52,7 @@ Both send to the relay address listed in `GET /relays` (`addr`).
 | `0x01` | register | client:21031 → relay | Other relays only. Record `src_id` → source address. Sent after every relay selection (and on every coordinator reconnect). Empty payload. |
 | `0x02` | keepalive | client:21031 → relay | Other relays only. Refresh the `src_id` → address mapping. Every 25 s by default (user setting 5–30 s). Empty payload. |
 | `0x05` | relay ping | client:21031 → relay | **Echo the datagram unchanged** back to its source, from the same socket. Every 5 s; the client measures RTT and matches replies by source address. |
-| `0x06` | p2p ping | client → relay → peer | Forward unchanged to the address registered for `dst_id`. 12-byte payload. Used to measure the relay path RTT. |
-| `0x07` | p2p pong | peer → relay → client | Same as `0x06`. |
+| `0x06` / `0x07` | p2p ping / pong | client ↔ peer, **direct only** | Nothing: 3.1.x clients no longer send these through relays. The relay-path RTT is measured with a probe inside the WireGuard session (`0x0D`), see `DATA_PLANE_ENCRYPTION.md`. |
 | **`0x0D`** | **WireGuard** | client → relay → peer | **Forward unchanged to the address registered for `dst_id`.** Payload is one WireGuard message, opaque to the relay. |
 | `0x0A` | sdisc register | client:21032 → relay | As in `SECURE_DISCOVERY.md` (records the 21032 mapping). |
 | `0x0B` | sdisc data | client:21032 → relay | As in `SECURE_DISCOVERY.md` (verify, then fan out to room members as `0x0C`). |
@@ -110,8 +109,10 @@ Implemented as specified in the relay's `REGISTRATION_AUTH.md`:
 - Counter `max(last + 1, now_ms << 16)`, strictly increasing.
 - Schedule after every relay selection or change and every coordinator
   reconnect: immediately, ~1 s, ~3 s, then every keepalive interval.
-- Success shows up as relay-path `0x06` / `0x07` round trips through the
-  client's own relay (`GetRelays.registration.last_relay_path_ok_at`).
+- Success shows up as relay-path probe pongs (in-tunnel, `0x0D`) coming
+  back through the client's own relay
+  (`GetRelays.registration.last_relay_path_ok_at`): the relay forwarded
+  them to the address bound by `0x0E`.
 
 ## Recommended (not required by 3.1.x clients)
 

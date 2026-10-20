@@ -23,6 +23,13 @@ pub enum SchedulerAction {
         new_mode: String,
         endpoint: Option<SocketAddr>,
     },
+    /// Send relay-path probe `seq` to the peer inside its WireGuard session,
+    /// over the relay route; feed the pong to `handle_pong`.
+    RelayPathProbe {
+        peer_id: String,
+        seq: u32,
+        sent_ms: u64,
+    },
     /// Trigger STUN endpoint detection.
     DetectEndpoints,
     /// Report endpoints to the coordinator.

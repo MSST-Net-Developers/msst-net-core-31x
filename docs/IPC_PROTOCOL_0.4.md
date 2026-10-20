@@ -135,8 +135,9 @@ Add `"async": true` to a command request:
 - **`GetRelays.registration`** (relay registration, see
   `docs/RELAY_REQUIREMENTS_3.1.md`): `mode` (`"sreg1"` — authenticated
   `0x0E` — or `"legacy"`), `tx_sreg` (`0x0E` packets sent) and
-  `last_relay_path_ok_at` (Unix seconds a relay-path probe last came back
-  through our relay, proving its binding works; `null` if never).  Relay
+  `last_relay_path_ok_at` (Unix seconds a relay-path probe — in-tunnel,
+  sent while a peer is `probing` — last came back through our relay,
+  proving its binding works; `null` if never).  Relay
   list entries may carry `features` (passed through from the coordinator).
 - **Removed from `Health`:** `local_device_id` and `local_user_id`
   (3.1.0-alpha aliases); use `device_id` and `user_id`.

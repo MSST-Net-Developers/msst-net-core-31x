@@ -211,16 +211,19 @@ async fn inbound_loop(
                             send_wg(&state, &src_id, target, &res.reply).await;
                         }
                         if let Some(ip) = res.packet {
-                            if crate::inbound::from_peer_address(&state, &src_id, &ip).await {
-                                crate::inbound::deliver_inbound(&state, &tun_tx, ip).await;
-                            } else {
+                            if !crate::inbound::from_peer_address(&state, &src_id, &ip).await {
                                 debug!("inbound: dropped WireGuard packet from {} with a foreign source address", src_id);
+                            } else if let Some(probe) = crate::tunnel_probe::Probe::decode(&ip) {
+                                // Relay-path probe: Core's own, never the TUN's.
+                                on_tunnel_probe(&state, &src_id, probe, src).await;
+                            } else {
+                                crate::inbound::deliver_inbound(&state, &tun_tx, ip).await;
                             }
                         }
                     }
                     msst_packet::TYPE_P2P_PING => {
                         // Echo the payload back as a pong so the sender can
-                        // measure RTT (direct, or relay-forwarded).
+                        // measure the direct path's RTT.
                         if pkt.payload.len() < msst_packet::PING_PAYLOAD_LEN { continue; }
                         let local_id = state.net.read().await.local_device_id.clone();
                         if local_id.is_empty() { continue; }
@@ -238,10 +241,6 @@ async fn inbound_loop(
                         let src_addr = msst_core_state::net::relay::unmap_addr(src);
                         let relay_rtt = {
                             let net = state.net.read().await;
-                            // Back through our own relay: its binding for us works.
-                            if net.relay_addr.as_deref().and_then(|r| r.parse().ok()) == Some(src_addr) {
-                                state.relay_path_ok_at.store(now, std::sync::atomic::Ordering::Relaxed);
-                            }
                             let peer_relay = net.peer_list.get(&peer_id)
                                 .and_then(|e| e.preferred_relay.as_deref());
                             net.relay_rtt.for_peer(peer_relay, net.relay_addr.as_deref())
@@ -296,23 +295,18 @@ async fn scheduler_tick_loop(state: Arc<CoreState>) {
         // Collect peer endpoints and relay info from NetState.
         // The scheduler tracks endpoints internally via punch_request events.
         // Here we only collect relay info for routing decisions.
-        let (endpoints, relays, device_id, relay_rtt) = {
+        let (endpoints, relay_routed, device_id) = {
             let net = state.net.read().await;
             let ep = net.peer_endpoints.clone();
-            let mut rl = std::collections::HashMap::new();
-            let own_relay = net.relay_addr.as_deref();
-            for dev_id in net.peer_list.device_ids() {
-                // The relay path to a peer goes through the peer's relay,
-                // falling back to our own (same choice as outbound routing).
-                let relay = net.peer_list.get(dev_id)
-                    .and_then(|e| e.preferred_relay.as_deref())
-                    .filter(|r| net.relay_rtt.get(r).is_some())
-                    .or(own_relay);
-                if let Some(addr) = relay.and_then(|r| r.parse::<std::net::SocketAddr>().ok()) {
-                    rl.insert(dev_id.to_string(), addr);
-                }
-            }
-            (ep, rl, net.local_device_id.clone(), net.relay_rtt.all().clone())
+            // Peers with a relay route (theirs, else ours): the relay path
+            // can be measured (in-tunnel probe, `crate::tunnel_probe`).
+            let routed: std::collections::HashSet<String> = net
+                .peer_list
+                .device_ids()
+                .filter(|id| net.relay_addr.is_some() || net.peer_list.get(id).is_some_and(|e| e.preferred_relay.is_some()))
+                .map(str::to_string)
+                .collect();
+            (ep, routed, net.local_device_id.clone())
         };
 
         if device_id.is_empty() { continue; }
@@ -320,7 +314,7 @@ async fn scheduler_tick_loop(state: Arc<CoreState>) {
         // Run the scheduler tick.
         let actions = {
             let mut sched = state.scheduler.lock().await;
-            sched.tick(now, now_ms, &endpoints, &relays, &relay_rtt)
+            sched.tick(now, now_ms, &endpoints, &relay_routed)
         };
 
         // Execute all returned actions.
@@ -678,16 +672,78 @@ async fn route_packet(pkt: &[u8], state: &Arc<CoreState>, track: bool) -> Option
 /// Where frames to a peer go now: its direct endpoint, else its relay,
 /// else ours.
 async fn peer_target(state: &Arc<CoreState>, device_id: &str) -> Option<std::net::SocketAddr> {
-    if let Some(ep) = state.scheduler.lock().await.direct_endpoint(device_id) {
-        return Some(ep);
+    match state.scheduler.lock().await.direct_endpoint(device_id) {
+        Some(ep) => Some(ep),
+        None => relay_target(state, device_id).await,
     }
+}
+
+/// The relay route to a peer: its relay, else ours.
+async fn relay_target(state: &Arc<CoreState>, device_id: &str) -> Option<std::net::SocketAddr> {
     let (peer_relay, own_relay) = {
         let net = state.net.read().await;
         (net.peer_list.get(device_id).and_then(|e| e.preferred_relay.clone()), net.relay_addr.clone())
     };
-    let p = match &peer_relay { Some(r) => crate::relay::resolve_addr(r).await, None => None };
-    let o = match &own_relay { Some(r) => crate::relay::resolve_addr(r).await, None => None };
-    state.scheduler.lock().await.route_target(device_id, p, o)
+    if let Some(addr) = match &peer_relay { Some(r) => crate::relay::resolve_addr(r).await, None => None } {
+        return Some(addr);
+    }
+    match &own_relay { Some(r) => crate::relay::resolve_addr(r).await, None => None }
+}
+
+/// Send a relay-path probe (ping or pong) to a peer inside its WireGuard
+/// session, over the relay route — never the direct path.  Only with an
+/// established session: a probe must not start a handshake (or wait for
+/// one, which would inflate the measured RTT).
+async fn send_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: &crate::tunnel_probe::Probe) {
+    use msst_core_state::encryption::EncState;
+    if state.encryption.lock().await.state(device_id) != Some(EncState::Encrypted) {
+        return;
+    }
+    let Some(target) = relay_target(state, device_id).await else { return };
+    let out = state.encryption.lock().await.outbound(device_id, &probe.encode(), current_unix());
+    if let Outbound::Send(msg) = out {
+        send_wg(state, device_id, target, std::slice::from_ref(&msg)).await;
+    }
+}
+
+/// Answer or account for a relay-path probe that arrived in `device_id`'s
+/// session from `src` (the relay it came through).
+async fn on_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: crate::tunnel_probe::Probe, src: std::net::SocketAddr) {
+    use crate::tunnel_probe::Kind;
+    match probe.kind {
+        Kind::Ping => send_tunnel_probe(state, device_id, &probe.pong()).await,
+        Kind::Pong => {
+            let src = msst_core_state::net::relay::unmap_addr(src);
+            let now = current_unix();
+            let rtt_ms = current_time_ms().saturating_sub(probe.sent_ms) as f64;
+            let relay_rtt = {
+                let net = state.net.read().await;
+                // Back through our own relay: its binding for us works.
+                if net.relay_addr.as_deref().and_then(|r| r.parse().ok()) == Some(src) {
+                    state.relay_path_ok_at.store(now, std::sync::atomic::Ordering::Relaxed);
+                }
+                let peer_relay = net.peer_list.get(device_id).and_then(|e| e.preferred_relay.as_deref());
+                net.relay_rtt.for_peer(peer_relay, net.relay_addr.as_deref())
+            };
+            let actions = state.scheduler.lock().await.handle_pong(device_id, src, probe.seq, rtt_ms, relay_rtt, now);
+            for action in actions {
+                execute_scheduler_action(&action, state, &state.udp_socket).await;
+            }
+        }
+    }
+}
+
+/// Our virtual IPv4 address.
+async fn vpn_ipv4(state: &CoreState) -> Option<std::net::Ipv4Addr> {
+    state.identity.read().await.as_ref()?.virtual_ips().0.parse().ok()
+}
+
+/// A peer's virtual IPv4 address.
+async fn peer_ipv4(state: &CoreState, device_id: &str) -> Option<std::net::Ipv4Addr> {
+    match state.net.read().await.peer_list.get(device_id)?.ipv4 {
+        std::net::IpAddr::V4(a) => Some(a),
+        _ => None,
+    }
 }
 
 /// Send WireGuard messages to a peer as `TYPE_WG` frames.  Returns false if
@@ -949,6 +1005,11 @@ async fn execute_scheduler_action(
                 new_mode: new_mode.clone(),
                 endpoint: endpoint.map(|e| e.to_string()),
             });
+        }
+        SchedulerAction::RelayPathProbe { peer_id, seq, sent_ms } => {
+            let (Some(src), Some(dst)) = (vpn_ipv4(state).await, peer_ipv4(state, peer_id).await) else { return };
+            let probe = crate::tunnel_probe::Probe { kind: crate::tunnel_probe::Kind::Ping, src, dst, seq: *seq, sent_ms: *sent_ms };
+            send_tunnel_probe(state, peer_id, &probe).await;
         }
         SchedulerAction::DetectEndpoints => {
             // Periodic (5 min) re-detection.  Skipped until a relay exists:
@@ -1337,6 +1398,61 @@ mod tests {
     }
 
     // ── Relay selection against a fake coordinator + fake relay ──────────
+
+    #[tokio::test]
+    async fn relay_path_rtt_is_measured_in_tunnel_across_two_relays() {
+        use msst_core_state::encryption::EncState;
+        let a = wg_core("rp-a", 0x55).await;
+        let mut b = wg_core("rp-b", 0x66).await;
+        // Each relay only forwards to the device registered with it.
+        let (relay_a, seen_a) = forwarding_relay(vec![(msst_packet::encode_id(&a.id.device.id), a.state.udp_socket.local_addr().unwrap())]).await;
+        let (relay_b, seen_b) = forwarding_relay(vec![(msst_packet::encode_id(&b.id.device.id), b.state.udp_socket.local_addr().unwrap())]).await;
+        know(&a, &b, relay_a).await;
+        know(&b, &a, relay_b).await;
+        a.state.net.write().await.peer_list.update_relay(&b.id.device.id, &relay_b.to_string());
+        b.state.net.write().await.peer_list.update_relay(&a.id.device.id, &relay_a.to_string());
+
+        // Establish the session: A → R_B → B, B → R_A → A.
+        let ping = icmp_echo(&a.id.virtual_ips().0, &b.id.virtual_ips().0);
+        assert_eq!(route_outbound_packet(&ping, &a.state).await, Some(relay_b));
+        assert_eq!(recv_tun(&mut b).await, Some(ping));
+        assert_eq!(enc_state(&a, &b).await, Some(EncState::Encrypted));
+
+        // A probes B (a dummy candidate keeps it in Probing): the relay-path
+        // probe goes in-tunnel and the RTT comes back.
+        let candidate: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let actions = {
+            let mut sched = a.state.scheduler.lock().await;
+            sched.handle_punch_request(&b.id.device.id, &[candidate], current_unix(), current_time_ms());
+            let routed = std::collections::HashSet::from([b.id.device.id.clone()]);
+            let eps = std::collections::HashMap::from([(b.id.device.id.clone(), vec![candidate])]);
+            sched.tick(current_unix(), current_time_ms(), &eps, &routed)
+        };
+        assert!(actions.iter().any(|x| matches!(x, SchedulerAction::RelayPathProbe { .. })));
+        seen_a.lock().unwrap().clear();
+        seen_b.lock().unwrap().clear();
+        for x in &actions {
+            execute_scheduler_action(x, &a.state, &a.state.udp_socket).await;
+        }
+        let rtt = || async {
+            let sched = a.state.scheduler.lock().await;
+            sched.paths().find(|(id, _)| *id == &b.id.device.id).and_then(|(_, pp)| pp.relay_path_rtt_ms)
+        };
+        let mut measured = None;
+        for _ in 0..50 {
+            measured = rtt().await;
+            if measured.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(measured.is_some(), "relay-path RTT measured");
+        // Out via B's relay, back via ours, all as 0x0D; nothing for the TUN.
+        assert_eq!(*seen_b.lock().unwrap(), [msst_packet::TYPE_WG]);
+        assert_eq!(*seen_a.lock().unwrap(), [msst_packet::TYPE_WG]);
+        assert!(a.state.relay_path_ok_at.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(recv_tun(&mut b).await, None);
+    }
 
     /// Datagrams a fake relay receives within `window`.
     async fn collect(relay: &tokio::net::UdpSocket, window: std::time::Duration) -> Vec<Vec<u8>> {
