@@ -77,7 +77,6 @@ pub struct RegisteredPayload {
 /// The `room_state` message payload.
 ///
 /// Matches `roomStateData` in `hub.go`.
-/// Note: the `relay` field is NOT present in 3.1.x coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomStateData {
     pub room_id: String,
@@ -85,6 +84,25 @@ pub struct RoomStateData {
     pub room_name: String,
     #[serde(default)]
     pub peers: Vec<RoomStatePeer>,
+    /// The room relay chosen at room creation; `null` = none
+    /// (`docs/ROOM_RELAY_3.1.md`).
+    #[serde(default)]
+    pub relay: Option<RoomStateRelay>,
+}
+
+/// `room_state.relay` (`roomStateRelay` in `hub.go`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomStateRelay {
+    /// `host:port` the relay registered.
+    #[serde(default)]
+    pub address: String,
+    /// Base64 X25519 key.
+    #[serde(default)]
+    pub pub_key: String,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub self_hosted: bool,
 }
 
 /// A peer in the `room_state` message.

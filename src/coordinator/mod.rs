@@ -141,6 +141,8 @@ pub enum CoordinatorEvent {
         room_id: String,
         room_name: String,
         peers: Vec<RoomStatePeer>,
+        /// The room relay, if the room has one.
+        relay: Option<messages::RoomStateRelay>,
     },
     /// A member joined our room (with the same peer data as `room_state`).
     MemberJoined {
@@ -973,6 +975,7 @@ impl CoordinatorClient {
                     room_id: data.room_id,
                     room_name: data.room_name,
                     peers,
+                    relay: data.relay,
                 }))
             }
             "member_joined" => {

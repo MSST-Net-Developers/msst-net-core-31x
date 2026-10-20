@@ -177,6 +177,21 @@ Add `"async": true` to a command request:
     room that has one fails with the new code `room_password_required`
     before anything is sent; a password given for a room without one is
     ignored.  An unknown or malformed room ID fails with `room_rejected`.
+  - **room relay**: `CreateRoom` takes optional `relay` — a connection
+    string `msst-relay://host:port#<key>[?pw=1]` or an official relay's
+    address — and `relay_password` (sent only as an Argon2id verifier).
+    New codes: `invalid_relay` (not a valid link, or an address that is
+    not an official relay), `relay_password_required` (the link says the
+    relay has a password and none was given — checked before anything is
+    sent; the Coordinator also returns it), and from the Coordinator
+    `relay_offline`, `relay_unsupported`, `relay_password_wrong`,
+    `room_password_required` (the relay requires a room password).  Other
+    Coordinator refusals stay `room_create_failed`;
+  - the room view (`GetSystemState`) and `RoomStateChanged` carry
+    `room_relay`: `{address, self_hosted, state}` with `state` `probing`,
+    `ok` (room traffic uses it) or `down` (fallback to preferred
+    relays), or `null`.  `RoomStateChanged` is also sent when the state
+    changes.  `GetRelays.room_relay` adds `addr` (resolved) and `tx_sreg`.
 - **Removed from `Health`:** `local_device_id` and `local_user_id`
   (3.1.0-alpha aliases); use `device_id` and `user_id`.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`

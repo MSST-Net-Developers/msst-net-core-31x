@@ -1,6 +1,6 @@
 # 房间中转与自托管中转（方案草案）
 
-状态：**方案已确认，待实施**。2026-10-20。涉及客户端（msst-net-core-31x）、Coordinator（msstnetCoordinator31x）、中转（msstnetRelay31x）。
+状态：**客户端已实现**（第 5 节）；Coordinator 与中转见 `ROOM_RELAY_SERVER_3.1.md`。2026-10-20。涉及客户端（msst-net-core-31x）、Coordinator（msstnetCoordinator31x）、中转（msstnetRelay31x）。
 
 房主建房时可以指定一台中转（官方或自托管）作为**房间中转**：房间内需要经中转的流量都走它。默认“不指定”，各成员仍用自己的偏好中转（游戏发现已能跨中转，见 `SERVER_FOLLOWUPS_3.1.md` K2）。
 
@@ -180,11 +180,12 @@ Core 现在只维护一个中转注册。进入指定了房间中转的房间后
 - 自托管房间中转的公钥来自 `room_state`，不再依赖 `GET /relays`。
 - 重复到达照旧只注入一次。
 
-### 5.5 IPC（新增字段，待定的协议版本号）
+### 5.5 IPC（协议 0.4 中的新增字段，见 `IPC_PROTOCOL_0.4.md`）
 
 - `CreateRoom`：新增可选的 `relay`（连接串，或者官方中转的地址）与 `relay_password`。中转密码只在 Core 内存中用于计算 `verifier`，不保存、不写日志。房间密码的 IPC 接口不变（仍是明文 `password`，经本机 IPC 传给 Core），由 Core 计算校验值。
 - 房间视图（`GetSystemState` / `RoomStateChanged`）：新增 `room_relay`，形如 `{address, self_hosted, state: "probing"|"ok"|"down"}`；未指定时为 `null`。
-- 新错误码：与第 4 节 Coordinator 返回的错误码一一对应，供 Controller 显示。
+- 新错误码：与第 4 节 Coordinator 返回的错误码一一对应，供 Controller 显示；连接串标明 `pw=1` 而没给中转密码时，Core 直接返回 `relay_password_required`，不发请求。
+- `GetRelays.room_relay`：额外给出解析后的地址 `addr` 与 `0x0E` 计数 `tx_sreg`，供排障。
 - Controller 在房间界面显示“此房间使用自托管中转 <地址>”（D6），以及回退状态。
 
 ## 6. 中转改动

@@ -158,6 +158,9 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         if let Some(relay) = crate::relay::extract_relay(p.endpoints) {
             net.peer_list.update_relay(p.device_id, &relay);
         }
+        if !p.endpoints.is_empty() {
+            net.set_peer_on_room_relay(p.device_id, crate::room_relay::reports_room_relay(p.endpoints));
+        }
         let candidates = crate::endpoints::direct_candidates(p.endpoints);
         if !candidates.is_empty() {
             net.peer_endpoints.insert(p.device_id.to_string(), candidates);

@@ -44,6 +44,17 @@ pub const ROOM_REJECTED: &str = "room_rejected";
 pub const ROOM_PASSWORD_REQUIRED: &str = "room_password_required";
 /// This device is already in a room: leave it first (one room at a time).
 pub const ALREADY_IN_ROOM: &str = "already_in_room";
+/// `CreateRoom.relay` is neither a valid connection string nor an official
+/// relay's address.
+pub const INVALID_RELAY: &str = "invalid_relay";
+/// The room relay is not online (not registered with the coordinator).
+pub const RELAY_OFFLINE: &str = "relay_offline";
+/// The room relay lacks authenticated registration or secure discovery.
+pub const RELAY_UNSUPPORTED: &str = "relay_unsupported";
+/// The room relay has a password and none was given.
+pub const RELAY_PASSWORD_REQUIRED: &str = "relay_password_required";
+/// The room relay's password is wrong.
+pub const RELAY_PASSWORD_WRONG: &str = "relay_password_wrong";
 /// Core could not save the change to disk (nothing was changed).
 pub const PERSIST_FAILED: &str = "persist_failed";
 
@@ -63,6 +74,7 @@ pub const ALL: &[&str] = &[
     INVALID_DISPLAY_NAME,
     NOT_FOUND, MNEMONIC_NOT_FOUND, NOT_INITIALIZED, NOT_AUTHENTICATED, AUTH_FAILED,
     COORDINATOR_UNAVAILABLE, COORDINATOR_ERROR, REGISTER_FAILED, RELAY_UNAVAILABLE,
-    ROOM_CREATE_FAILED, ROOM_REJECTED, ROOM_PASSWORD_REQUIRED, ALREADY_IN_ROOM, PERSIST_FAILED, PERMISSION_DENIED, BUSY, INCOMPATIBLE_VERSION,
+    ROOM_CREATE_FAILED, ROOM_REJECTED, ROOM_PASSWORD_REQUIRED, ALREADY_IN_ROOM, INVALID_RELAY,
+    RELAY_OFFLINE, RELAY_UNSUPPORTED, RELAY_PASSWORD_REQUIRED, RELAY_PASSWORD_WRONG, PERSIST_FAILED, PERMISSION_DENIED, BUSY, INCOMPATIBLE_VERSION,
     RESPONSE_TOO_LARGE,
 ];

@@ -4,13 +4,17 @@
 //! - public IPv4:port via STUN on the main UDP socket (the NAT mapping
 //!   peers will see),
 //! - LAN IPv4 addresses (direct P2P inside one LAN without NAT hairpinning),
-//! - public IPv6 addresses,
-//! plus `relay:<addr>` so peers can route to our relay.  With `disable_p2p`
-//! only the relay is reported.  Reported via `POST /device/endpoint`.
+//! - public IPv6 addresses.
+//!
+//! Also `relay:<addr>` so peers can route to our relay, and, while our room
+//! relay works, `room-relay:<addr>` (`crate::room_relay`).  With
+//! `disable_p2p` only the relays are reported.  Reported via
+//! `POST /device/endpoint`.
 //!
 //! Triggers: after a relay is selected, every 5 minutes (scheduler
-//! `DetectEndpoints`), and on `RefreshEndpoint`.  Only one detection runs at
-//! a time.
+//! `DetectEndpoints`), on `RefreshEndpoint`, and when the room relay comes
+//! or goes.  Only one detection runs at a time; a request meanwhile makes it
+//! run once more.
 
 use crate::state::CoreState;
 use msst_core_state::nat::stun;
@@ -121,6 +125,7 @@ pub fn build_endpoints(
     public_v6: &[std::net::Ipv6Addr],
     port: u16,
     relay: Option<&str>,
+    room_relay: Option<&str>,
 ) -> Vec<String> {
     let mut eps = Vec::new();
     if !disable_p2p {
@@ -129,20 +134,31 @@ pub fn build_endpoints(
         eps.extend(public_v6.iter().map(|ip| format!("[{}]:{}", ip, port)));
     }
     eps.extend(relay.map(|r| format!("relay:{}", r)));
+    eps.extend(room_relay.map(|r| format!("{}{}", crate::room_relay::ENDPOINT_PREFIX, r)));
     eps
 }
 
-/// Detect and report our endpoints, unless a detection is already running.
+/// Detect and report our endpoints.  A request while a detection runs makes
+/// it run once more afterwards (what it reports may be stale already, e.g.
+/// the room relay's health changed meanwhile).
 pub fn spawn_detect_and_report(state: Arc<CoreState>) {
+    state.endpoint_detect_again.store(true, Ordering::SeqCst);
     if state.endpoint_detect_running.swap(true, Ordering::SeqCst) {
-        debug!("endpoints: detection already running");
+        debug!("endpoints: detection already running; it will run again");
         return;
     }
     tokio::spawn(async move {
-        if let Err(e) = detect_and_report(&state).await {
-            warn!("endpoints: {}", e);
+        loop {
+            state.endpoint_detect_again.store(false, Ordering::SeqCst);
+            if let Err(e) = detect_and_report(&state).await {
+                warn!("endpoints: {}", e);
+            }
+            state.endpoint_detect_running.store(false, Ordering::SeqCst);
+            // A request that came in meanwhile, unless another task took it.
+            if !state.endpoint_detect_again.load(Ordering::SeqCst) || state.endpoint_detect_running.swap(true, Ordering::SeqCst) {
+                break;
+            }
         }
-        state.endpoint_detect_running.store(false, Ordering::SeqCst);
     });
 }
 
@@ -150,12 +166,13 @@ async fn detect_and_report(state: &Arc<CoreState>) -> Result<(), String> {
     let disable_p2p = state.net_settings.read().await.disable_p2p;
     let stun_addr = if disable_p2p { None } else { detect_public_ipv4(state).await };
     let port = state.udp_socket.local_addr().map(|a| a.port()).unwrap_or(21031);
-    let (device_id, relay) = {
+    let (device_id, relay, room_relay) = {
         let net = state.net.read().await;
-        (net.local_device_id.clone(), net.relay_addr.clone())
+        let room_relay = net.room_relay.as_ref().and_then(|r| r.usable_addr()).map(str::to_string);
+        (net.local_device_id.clone(), net.relay_addr.clone(), room_relay)
     };
     let (lan, v6) = if disable_p2p { (Vec::new(), Vec::new()) } else { (stun::detect_lan_ipv4(), stun::detect_public_ipv6()) };
-    let endpoints = build_endpoints(disable_p2p, stun_addr, &lan, &v6, port, relay.as_deref());
+    let endpoints = build_endpoints(disable_p2p, stun_addr, &lan, &v6, port, relay.as_deref(), room_relay.as_deref());
     if endpoints.is_empty() {
         return Err("no endpoints to report (no public address and no relay)".into());
     }
@@ -189,12 +206,12 @@ mod tests {
         let lan = ["192.168.1.5".parse().unwrap()];
         let v6 = ["2001:db8::5".parse().unwrap()];
         assert_eq!(
-            build_endpoints(false, Some(stun_addr), &lan, &v6, 21031, Some("5.6.7.8:7000")),
+            build_endpoints(false, Some(stun_addr), &lan, &v6, 21031, Some("5.6.7.8:7000"), None),
             vec!["1.2.3.4:40000", "192.168.1.5:21031", "[2001:db8::5]:21031", "relay:5.6.7.8:7000"]
         );
-        // disable_p2p → relay only.
-        assert_eq!(build_endpoints(true, Some(stun_addr), &lan, &v6, 21031, Some("r:1")), vec!["relay:r:1"]);
-        assert!(build_endpoints(true, None, &[], &[], 21031, None).is_empty());
+        // disable_p2p → relays only; a working room relay is announced.
+        assert_eq!(build_endpoints(true, Some(stun_addr), &lan, &v6, 21031, Some("r:1"), Some("9.9.9.9:7000")), vec!["relay:r:1", "room-relay:9.9.9.9:7000"]);
+        assert!(build_endpoints(true, None, &[], &[], 21031, None, None).is_empty());
     }
 
     #[test]

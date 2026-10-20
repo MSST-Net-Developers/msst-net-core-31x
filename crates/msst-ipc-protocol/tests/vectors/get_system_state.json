@@ -33,6 +33,7 @@
         "relay": "198.51.100.1:7000",
         "room_id": "space-1",
         "room_name": "Test room",
+        "room_relay": null,
         "rule_count": 1,
         "user_id": "user-00000001"
       },

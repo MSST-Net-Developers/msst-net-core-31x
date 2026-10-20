@@ -717,7 +717,7 @@ mod tests {
         hanging_coordinator(&state).await;
         let (mut client, _t) = connect(state, &events, PROTOCOL_VERSION).await;
         // CreateRoom first re-selects the relay: GET /relays hangs.
-        request(&mut client, "slow", IpcRequest::CreateRoom { room_name: "r".into(), password: None }).await;
+        request(&mut client, "slow", IpcRequest::CreateRoom { room_name: "r".into(), password: None, relay: None, relay_password: None }).await;
         request(&mut client, "health", IpcRequest::Health).await;
         assert!(matches!(next(&mut client).await, IpcMessage::Response { id, .. } if id == "health"));
     }

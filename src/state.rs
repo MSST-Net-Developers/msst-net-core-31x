@@ -45,6 +45,10 @@ pub struct NetState {
     /// every re-join, because the coordinator checks the password on each
     /// `join`.
     pub room_password_verifiers: HashMap<String, String>,
+    /// The room relay of the room we are in (`crate::room_relay`).
+    pub room_relay: Option<crate::room_relay::RoomRelay>,
+    /// Peers whose endpoints say their room relay works (`room-relay:`).
+    pub peers_on_room_relay: HashSet<String>,
     /// Local device ID (set during init).
     pub local_device_id: String,
     /// Local user ID (set during init).
@@ -70,6 +74,27 @@ pub struct NetState {
 }
 
 impl NetState {
+    /// The relay frames to a peer go through when the path isn't direct:
+    /// the room relay while it works and the peer, a member of our room,
+    /// reports being on it too; otherwise the peer's preferred relay.
+    /// `None`: unknown (callers fall back to our relay).
+    pub fn relay_for_peer(&self, device_id: &str) -> Option<&str> {
+        let room_relay = self.room_relay.as_ref().and_then(|r| r.usable_addr());
+        if let Some(addr) = room_relay.filter(|_| self.room_peers.contains(device_id) && self.peers_on_room_relay.contains(device_id)) {
+            return Some(addr);
+        }
+        self.peer_list.get(device_id)?.preferred_relay.as_deref()
+    }
+
+    /// Record whether a peer's latest endpoint list includes `room-relay:`.
+    pub fn set_peer_on_room_relay(&mut self, device_id: &str, on: bool) {
+        if on {
+            self.peers_on_room_relay.insert(device_id.to_string());
+        } else {
+            self.peers_on_room_relay.remove(device_id);
+        }
+    }
+
     pub fn new() -> Self {
         NetState {
             peer_list: PeerList::new(),
@@ -79,6 +104,8 @@ impl NetState {
             room_peers: HashSet::new(),
             joined_rooms: HashMap::new(),
             room_password_verifiers: HashMap::new(),
+            room_relay: None,
+            peers_on_room_relay: HashSet::new(),
             local_device_id: String::new(),
             local_user_id: String::new(),
             ping_enabled: false,
@@ -156,6 +183,8 @@ pub struct CoreState {
     pub endpoint_history: std::sync::Mutex<crate::endpoints::EndpointHistory>,
     /// Whether an endpoint detection is in progress.
     pub endpoint_detect_running: std::sync::atomic::AtomicBool,
+    /// Another detection was requested while one was running.
+    pub endpoint_detect_again: std::sync::atomic::AtomicBool,
     /// Pending room join waiting for the next room_state / error.
     pub room_waiter: crate::rooms::RoomWaiter,
     /// Serializes create / join / leave (one room at a time, one waiter).
@@ -170,6 +199,8 @@ pub struct CoreState {
     pub sdisc_stats: crate::discovery::SdiscStats,
     /// Registration with the current relay (sreg v1 key, counter, schedule).
     pub relay_reg: std::sync::Mutex<crate::sreg::Registration>,
+    /// Registration with the room relay (sreg v1; see `crate::room_relay`).
+    pub room_relay_reg: std::sync::Mutex<crate::sreg::Registration>,
     /// Unix time a P2P pong last came back through our own relay — proof
     /// that the relay's binding for us works (it only forwards `0x06` from
     /// the bound address).  0 = never.
@@ -230,12 +261,14 @@ impl CoreState {
             discovery_tx: std::sync::OnceLock::new(),
             sdisc_stats: Default::default(),
             relay_reg: Default::default(),
+            room_relay_reg: Default::default(),
             relay_path_ok_at: std::sync::atomic::AtomicI64::new(0),
             room_waiter: std::sync::Mutex::new(None),
             room_op: tokio::sync::Mutex::new(()),
             stun_waiters: std::sync::Mutex::new(HashMap::new()),
             endpoint_history: std::sync::Mutex::new(Default::default()),
             endpoint_detect_running: std::sync::atomic::AtomicBool::new(false),
+            endpoint_detect_again: std::sync::atomic::AtomicBool::new(false),
             fetch_tx: std::sync::OnceLock::new(),
             fetch_gate: std::sync::Mutex::new(crate::nodes::FetchGate::default()),
         }

@@ -133,10 +133,69 @@ async fn joined(state: &Arc<CoreState>, client: &CoordinatorClient, room_id: &st
     room_view(state).await
 }
 
-pub async fn create_room(state: &Arc<CoreState>, room_name: String, password: Option<String>) -> Result<Value, IpcError> {
+/// `CreateRoom.relay` (a connection string, or an official relay's
+/// address) → the `relay` object of `POST /room/create`.  The relay is
+/// named by its key; a password becomes an Argon2id verifier.
+async fn room_relay_request(client: &CoordinatorClient, relay: &str, password: Option<String>) -> Result<Value, IpcError> {
+    let (pub_key, has_password) = if crate::room_relay::is_link(relay) {
+        let link = crate::room_relay::parse_link(relay).map_err(|e| err(errors::INVALID_RELAY, e))?;
+        (link.pub_key, link.password)
+    } else {
+        let relay = relay.trim();
+        let addrs: Vec<std::net::SocketAddr> = match relay.parse::<std::net::SocketAddr>() {
+            Ok(a) => vec![a],
+            Err(_) => tokio::net::lookup_host(relay).await.map(|it| it.collect()).unwrap_or_default(),
+        };
+        let addrs: Vec<_> = addrs.into_iter().map(msst_core_state::net::relay::unmap_addr).collect();
+        let known = crate::relay::fetch_known_relays(client.http(), client.coord_url())
+            .await
+            .map_err(|e| err(errors::COORDINATOR_UNAVAILABLE, e.to_string()))?;
+        let official = known
+            .iter()
+            .find(|k| k.addrs.iter().any(|a| addrs.contains(a)))
+            .ok_or_else(|| err(errors::INVALID_RELAY, format!("{:?} is not an official relay; use the relay's msst-relay:// link", relay)))?;
+        (official.pub_key, false)
+    };
+    let mut body = json!({ "pub_key": STANDARD.encode(pub_key) });
+    match password {
+        Some(pw) => {
+            let v = passwords::verifier_blocking(passwords::RELAY_DOMAIN, pw, pub_key.to_vec()).await;
+            body["password_verifier"] = json!(STANDARD.encode(v));
+        }
+        None if has_password => return Err(err(errors::RELAY_PASSWORD_REQUIRED, "the relay has a password")),
+        None => {}
+    }
+    Ok(body)
+}
+
+/// The IPC error for a refused `POST /room/create`.
+fn room_create_error(status: u16, resp: &Value) -> IpcError {
+    const PASSED_ON: &[&str] = &[
+        errors::INVALID_RELAY,
+        errors::RELAY_OFFLINE,
+        errors::RELAY_UNSUPPORTED,
+        errors::RELAY_PASSWORD_REQUIRED,
+        errors::RELAY_PASSWORD_WRONG,
+        errors::ROOM_PASSWORD_REQUIRED,
+    ];
+    let code = resp["code"].as_str().and_then(|c| PASSED_ON.iter().find(|k| **k == c)).copied().unwrap_or(errors::ROOM_CREATE_FAILED);
+    err(code, format!("coordinator returned {}: {}", status, resp))
+}
+
+pub async fn create_room(
+    state: &Arc<CoreState>,
+    room_name: String,
+    password: Option<String>,
+    relay: Option<String>,
+    relay_password: Option<String>,
+) -> Result<Value, IpcError> {
     let _op = state.room_op.lock().await;
     ensure_not_in_room(state).await?;
     let client = client(state)?;
+    let room_relay = match relay.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => Some(room_relay_request(&client, r, relay_password).await?),
+        None => None,
+    };
     // 3.0.x re-selects the relay before creating a room.
     crate::runtime::select_relay_now(state, &client).await.map_err(|e| err(errors::RELAY_UNAVAILABLE, e))?;
     crate::ipc::ops::progress("relay_selected");
@@ -149,12 +208,15 @@ pub async fn create_room(state: &Arc<CoreState>, room_name: String, password: Op
         body["password"] = json!({ "salt": STANDARD.encode(salt), "verifier": v });
         verifier = Some(v);
     }
+    if let Some(r) = room_relay {
+        body["relay"] = r;
+    }
     let (status, resp) = client
         .api_request(reqwest::Method::POST, "/room/create", Some(&body), client.bearer().as_deref())
         .await
         .map_err(|e| err(errors::COORDINATOR_UNAVAILABLE, e))?;
     if !(200..300).contains(&status) {
-        return Err(err(errors::ROOM_CREATE_FAILED, format!("coordinator returned {}: {}", status, resp)));
+        return Err(room_create_error(status, &resp));
     }
     let room_id = resp["room_id"]
         .as_str()
@@ -201,13 +263,18 @@ pub async fn leave_room(state: &Arc<CoreState>, room_id: String) -> Result<Value
     if let Err(e) = client.send_discovery_leave(&room_id).await {
         warn!("rooms: discovery_leave for {} failed: {}", room_id, e);
     }
-    {
+    let had_room_relay = {
         let mut net = state.net.write().await;
         net.joined_rooms.remove(&room_id);
         net.room_password_verifiers.remove(&room_id);
         if net.joined_rooms.is_empty() {
             net.room_peers.clear();
         }
+        net.room_relay.take_if(|r| r.room_id == room_id).is_some()
+    };
+    if had_room_relay {
+        // Stop announcing `room-relay:`.
+        crate::endpoints::spawn_detect_and_report(state.clone());
     }
     if state.net.read().await.joined_rooms.is_empty() {
         crate::peer_cache::on_rooms_left(state).await;
@@ -227,6 +294,7 @@ pub async fn emit_room_state(state: &CoreState) {
         room_name: v["room_name"].as_str().map(str::to_string),
         peers: v["peers"].as_array().cloned().unwrap_or_default(),
         relay: v["relay"].as_str().map(str::to_string),
+        room_relay: Some(v["room_relay"].clone()).filter(|r| !r.is_null()),
     });
 }
 
@@ -258,6 +326,7 @@ pub async fn room_view(state: &CoreState) -> Value {
         }))
         .collect();
     let relay = net.relay_addr.clone();
+    let room_relay = net.room_relay.as_ref().filter(|_| in_room).map(|r| r.view());
     let local_id = net.local_device_id.clone();
     drop(net);
     if let Some(id) = state.identity.read().await.as_ref() {
@@ -272,7 +341,7 @@ pub async fn room_view(state: &CoreState) -> Value {
             }));
         }
     }
-    json!({ "room_id": room_id, "room_name": room_name, "relay": relay, "peers": peers })
+    json!({ "room_id": room_id, "room_name": room_name, "relay": relay, "room_relay": room_relay, "peers": peers })
 }
 
 #[cfg(test)]
@@ -327,7 +396,7 @@ mod tests {
 
         // Create: relay selected, room created over HTTP with a salted
         // verifier (never the password), joined over WS with the verifier.
-        let out = create_room(&state, "Test".into(), Some("pw".into())).await.unwrap();
+        let out = create_room(&state, "Test".into(), Some("pw".into()), None, None).await.unwrap();
         assert_eq!(out["room_id"], "space-1");
         assert_eq!(out["room_name"], "Test");
         assert_eq!(out["relay"], relay.to_string());
@@ -351,7 +420,7 @@ mod tests {
         // One room at a time: refused before anything is sent.
         let e = join_room(&state, "space-4".into(), None).await.unwrap_err();
         assert_eq!(e.code, errors::ALREADY_IN_ROOM);
-        assert_eq!(create_room(&state, "Other".into(), None).await.unwrap_err().code, errors::ALREADY_IN_ROOM);
+        assert_eq!(create_room(&state, "Other".into(), None, None, None).await.unwrap_err().code, errors::ALREADY_IN_ROOM);
         assert_eq!(joins().len(), 1);
         assert_eq!(coord.http_log.lock().unwrap().iter().filter(|r| r.path == "/room/create").count(), 1);
 
@@ -386,6 +455,67 @@ mod tests {
         assert_eq!(out["room_name"], "Open");
         assert!(joins().last().unwrap()["data"].get("password_verifier").is_none());
         assert!(state.net.read().await.room_password_verifiers.is_empty());
+        rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_room_with_a_room_relay() {
+        let relay = echo_relay().await;
+        let pk = *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2u8; 32])).as_bytes();
+        let relays = json!({ "relays": [{ "addr": relay.to_string(), "pub_key": STANDARD.encode(pk), "features": ["sdisc1", "sreg1"] }] });
+        let good = STANDARD.encode(passwords::verifier(passwords::RELAY_DOMAIN, "relay secret", &pk));
+        let coord = FakeCoordinator::start(
+            move |req| match req.path.as_str() {
+                "/relays" => (200, relays.clone()),
+                "/room/create" => match req.body["relay"]["password_verifier"].as_str() {
+                    Some(v) if v != good => (403, json!({ "error": "wrong relay password", "code": "relay_password_wrong" })),
+                    _ if req.body["room_name"] == "offline" => (409, json!({ "error": "relay offline", "code": "relay_offline" })),
+                    _ if req.body["room_name"] == "odd" => (400, json!({ "error": "?", "code": "something_new" })),
+                    _ => (200, json!({ "room_id": "space-1" })),
+                },
+                _ => (404, json!({})),
+            },
+            |msg| match msg["type"].as_str() {
+                Some("join") => vec![json!({ "type": "room_state", "data": { "room_id": "space-1", "room_name": "R", "peers": [] } })],
+                _ => vec![],
+            },
+        ).await;
+        let creates = || coord.http_log.lock().unwrap().iter().filter(|r| r.path == "/room/create").map(|r| r.body.clone()).collect::<Vec<_>>();
+        let (state, _ipc) = core_state("rooms-relay").await;
+        let mut rt = crate::runtime::CoreRuntime::new(state.clone());
+        rt.start_coordinator(crate::coordinator::CoordinatorConfig { coord_url: coord.url.clone() }, None);
+        assert!(eventually(|| coord.ws_types().contains(&"register".to_string())).await);
+        let link = "msst-relay://relay.example.com:7000#zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk?pw=1";
+        let create = |name: &str, relay: Option<&str>, pw: Option<&str>| {
+            create_room(&state, name.into(), Some("room pw".into()), relay.map(str::to_string), pw.map(str::to_string))
+        };
+
+        // Refused locally, before anything is sent.
+        assert_eq!(create("R", Some(link), None).await.unwrap_err().code, errors::RELAY_PASSWORD_REQUIRED);
+        assert_eq!(create("R", Some("msst-relay://nope"), None).await.unwrap_err().code, errors::INVALID_RELAY);
+        assert_eq!(create("R", Some("192.0.2.1:7000"), None).await.unwrap_err().code, errors::INVALID_RELAY, "not an official relay");
+        assert!(creates().is_empty());
+
+        // The coordinator's refusals keep their codes; unknown ones don't.
+        assert_eq!(create("R", Some(link), Some("wrong")).await.unwrap_err().code, errors::RELAY_PASSWORD_WRONG);
+        assert_eq!(create("offline", Some(link), Some("relay secret")).await.unwrap_err().code, errors::RELAY_OFFLINE);
+        assert_eq!(create("odd", Some(link), Some("relay secret")).await.unwrap_err().code, errors::ROOM_CREATE_FAILED);
+
+        // A connection string with its password: the key and a verifier.
+        create("R", Some(link), Some("relay secret")).await.unwrap();
+        let body = creates().last().cloned().unwrap();
+        assert_eq!(body["relay"], json!({ "pub_key": STANDARD.encode(pk), "password_verifier": STANDARD.encode(passwords::verifier(passwords::RELAY_DOMAIN, "relay secret", &pk)) }));
+        assert!(!body.to_string().contains("relay secret"));
+        leave_room(&state, "space-1".into()).await.unwrap();
+
+        // An official relay by address: its key from GET /relays, no password.
+        create("R", Some(&relay.to_string()), None).await.unwrap();
+        assert_eq!(creates().last().unwrap()["relay"], json!({ "pub_key": STANDARD.encode(pk) }));
+        leave_room(&state, "space-1".into()).await.unwrap();
+
+        // No relay: no `relay` field.
+        create("R", None, None).await.unwrap();
+        assert!(creates().last().unwrap().get("relay").is_none());
         rt.shutdown().await;
     }
 }

@@ -423,15 +423,21 @@ async fn tx_loop(mut rx: mpsc::Receiver<Vec<u8>>, sock: Arc<UdpSocket>, state: A
     }
 }
 
-/// The relays discovery goes to: ours, plus each room member's relay
-/// (from its `relay:` endpoint), identified by key through the relay list.
-/// Members on a relay we have no key for (not listed, or listed without a
-/// key) can't be reached; the second value says whether one was seen, so
-/// the list can be refreshed.  Each relay appears once, at an address we
-/// can reach.
-fn plan_targets(own: Option<Target>, peer_relays: &[SocketAddr], known: &[KnownRelay], v6_ok: bool) -> (Vec<Target>, bool) {
+/// The relays discovery goes to: ours (our preferred relay, and the room
+/// relay while it works), plus the relay each room member's traffic goes
+/// through (`NetState::relay_for_peer`), identified by key through the
+/// relay list (and the room relay's key from `room_state`).  Members on a
+/// relay we have no key for (not listed, or listed without a key) can't be
+/// reached; the second value says whether one was seen, so the list can be
+/// refreshed.  Each relay appears once, at an address we can reach.
+fn plan_targets(own: Vec<Target>, peer_relays: &[SocketAddr], known: &[KnownRelay], v6_ok: bool) -> (Vec<Target>, bool) {
     let reachable = |a: &SocketAddr| a.is_ipv4() || v6_ok;
-    let mut targets: Vec<Target> = own.into_iter().collect();
+    let mut targets: Vec<Target> = Vec::with_capacity(own.len() + peer_relays.len());
+    for t in own {
+        if !targets.iter().any(|x| x.relay_pk == t.relay_pk) {
+            targets.push(t);
+        }
+    }
     let mut unknown = false;
     for &peer_relay in peer_relays {
         let Some(relay) = known.iter().find(|k| k.addrs.contains(&peer_relay)) else {
@@ -484,7 +490,11 @@ impl RelayDirectory {
 struct RoomCtx {
     room: Option<String>,
     device_id: String,
-    own: Option<(String, [u8; 32])>,
+    /// Our relays with keys: the preferred one, and the room relay while it
+    /// works (resolved).
+    own: Vec<(String, [u8; 32])>,
+    /// The room relay while it works.
+    room_relay: Option<KnownRelay>,
     peer_relays: Vec<SocketAddr>,
 }
 
@@ -493,15 +503,22 @@ async fn room_ctx(state: &CoreState) -> RoomCtx {
     let mut peer_relays: Vec<SocketAddr> = net
         .room_peers
         .iter()
-        .filter_map(|id| net.peer_list.get(id)?.preferred_relay.as_deref()?.parse::<SocketAddr>().ok())
+        .filter_map(|id| net.relay_for_peer(id)?.parse::<SocketAddr>().ok())
         .map(unmap_addr)
         .collect();
     peer_relays.sort_unstable();
     peer_relays.dedup();
+    let room_relay = net.room_relay.as_ref().and_then(|r| {
+        let addr = r.usable_addr()?.parse::<SocketAddr>().ok()?;
+        Some(KnownRelay { addrs: vec![unmap_addr(addr)], pub_key: r.pub_key })
+    });
+    let mut own: Vec<(String, [u8; 32])> = net.relay_addr.clone().zip(net.relay_pub_key).into_iter().collect();
+    own.extend(room_relay.as_ref().map(|r| (r.addrs[0].to_string(), r.pub_key)));
     RoomCtx {
         room: net.joined_rooms.keys().next().cloned(),
         device_id: net.local_device_id.clone(),
-        own: net.relay_addr.clone().zip(net.relay_pub_key),
+        own,
+        room_relay,
         peer_relays,
     }
 }
@@ -520,23 +537,26 @@ async fn registration_loop(sock: Arc<UdpSocket>, state: Arc<CoreState>, secure: 
         // the 1 s retry to the next tick.
         let tick = ticker.tick().await;
         let now_ms = tick.duration_since(*start.get_or_insert(tick)).as_millis() as u64;
-        let RoomCtx { room, device_id, own, peer_relays } = room_ctx(&state).await;
+        let RoomCtx { room, device_id, own, room_relay, peer_relays } = room_ctx(&state).await;
         let Some(room) = room.filter(|_| !device_id.is_empty()) else {
             schedules.clear();
             secure.lock().unwrap().route = None;
             state.sdisc_stats.set_relays(Vec::new());
             continue;
         };
-        let own = match own {
-            Some((addr, relay_pk)) => crate::relay::resolve_addr(&addr).await.map(|a| Target { relay_pk, addr: unmap_addr(a) }),
-            None => None,
-        };
+        let mut own_targets = Vec::with_capacity(own.len());
+        for (addr, relay_pk) in own {
+            if let Some(a) = crate::relay::resolve_addr(&addr).await {
+                own_targets.push(Target { relay_pk, addr: unmap_addr(a) });
+            }
+        }
+        let known = |dir: &RelayDirectory| -> Vec<KnownRelay> { dir.relays.iter().cloned().chain(room_relay.clone()).collect() };
         let v6_ok = crate::ip::ipv6_available();
-        let (mut targets, unknown) = plan_targets(own.clone(), &peer_relays, &directory.relays, v6_ok);
+        let (mut targets, unknown) = plan_targets(own_targets.clone(), &peer_relays, &known(&directory), v6_ok);
         let now = Instant::now();
         if directory.due(unknown, now) {
             directory.refresh(&state, now).await;
-            targets = plan_targets(own, &peer_relays, &directory.relays, v6_ok).0;
+            targets = plan_targets(own_targets, &peer_relays, &known(&directory), v6_ok).0;
         }
         let mut usable = Vec::with_capacity(targets.len());
         for t in targets {
@@ -817,7 +837,7 @@ mod tests {
             KnownRelay { addrs: vec![relay_addr(2)], pub_key: relay_pk(2) },
             KnownRelay { addrs: vec![relay_addr(3), v6], pub_key: relay_pk(3) },
         ];
-        let own = Some(Target { relay_pk: relay_pk(2), addr: relay_addr(2) });
+        let own = vec![Target { relay_pk: relay_pk(2), addr: relay_addr(2) }];
         let t = |seed: u8, addr| Target { relay_pk: relay_pk(seed), addr };
 
         // Alone in the room, or every member on our relay: ours only.
@@ -830,7 +850,16 @@ mod tests {
         // A relay the list doesn't know (or lists without a key): reported.
         assert_eq!(plan_targets(own.clone(), &[relay_addr(4)], &known, true), (vec![t(2, relay_addr(2))], true));
         // Our relay has no key: still reach members on keyed relays.
-        assert_eq!(plan_targets(None, &[relay_addr(3)], &known, true).0, [t(3, relay_addr(3))]);
+        assert_eq!(plan_targets(Vec::new(), &[relay_addr(3)], &known, true).0, [t(3, relay_addr(3))]);
+        // Our relay and the room relay (5), which every member reports to
+        // use, except one that fell back to relay 3.
+        let room = KnownRelay { addrs: vec![relay_addr(5)], pub_key: relay_pk(5) };
+        let known_room: Vec<KnownRelay> = known.iter().cloned().chain([room]).collect();
+        let own_room = vec![t(2, relay_addr(2)), t(5, relay_addr(5)), t(2, relay_addr(2))];
+        assert_eq!(
+            plan_targets(own_room, &[relay_addr(5), relay_addr(3)], &known_room, true),
+            (vec![t(2, relay_addr(2)), t(5, relay_addr(5)), t(3, relay_addr(3))], false)
+        );
     }
 
     #[test]
@@ -932,5 +961,43 @@ mod tests {
         for t in tasks {
             t.abort();
         }
+    }
+
+    /// With a working room relay, discovery registers with it as well as
+    /// our relay, and reaches members through the relay their traffic
+    /// uses: the room relay if they report it, else their own.
+    #[tokio::test]
+    async fn room_relay_is_one_of_our_relays() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let (state, _ipc) = crate::test_support::core_state("disc-room-relay").await;
+        let room = crate::coordinator::messages::RoomStateRelay {
+            address: relay_addr(5).to_string(),
+            pub_key: STANDARD.encode(relay_pk(5)),
+            features: vec!["sdisc1".into(), "sreg1".into()],
+            self_hosted: true,
+        };
+        let on_room = [format!("relay:{}", relay_addr(3)), format!("room-relay:{}", relay_addr(5))];
+        let fell_back = [format!("relay:{}", relay_addr(4))];
+        for (dev, v4, v6, eps) in [("device-0000000b", "172.22.1.1", "fd22:2222:2222:2222::b", &on_room[..]), ("device-0000000c", "172.22.1.2", "fd22:2222:2222:2222::c", &fell_back[..])] {
+            assert!(crate::nodes::apply_peer(&state, crate::nodes::PeerData { device_id: dev, ipv4: v4, ipv6: v6, endpoints: eps, ..Default::default() }).await);
+        }
+        {
+            let mut net = state.net.write().await;
+            net.joined_rooms.insert("space-1".into(), "Room".into());
+            net.room_peers.extend(["device-0000000b".to_string(), "device-0000000c".to_string()]);
+            net.relay_addr = Some(relay_addr(2).to_string());
+            net.relay_pub_key = Some(relay_pk(2));
+            net.room_relay = Some(crate::room_relay::RoomRelay::from_room_state("space-1", &room).unwrap());
+        }
+        let ctx = room_ctx(&state).await;
+        // Not working yet: our relay only; members by their preferred relays.
+        assert_eq!(ctx.own, [(relay_addr(2).to_string(), relay_pk(2))]);
+        assert_eq!(ctx.peer_relays, [relay_addr(3), relay_addr(4)]);
+
+        state.net.write().await.room_relay.as_mut().unwrap().health.reply(Instant::now());
+        let ctx = room_ctx(&state).await;
+        assert_eq!(ctx.own, [(relay_addr(2).to_string(), relay_pk(2)), (relay_addr(5).to_string(), relay_pk(5))]);
+        assert_eq!(ctx.peer_relays, [relay_addr(4), relay_addr(5)], "b through the room relay, c (fell back) through its own");
+        assert_eq!(ctx.room_relay, Some(KnownRelay { addrs: vec![relay_addr(5)], pub_key: relay_pk(5) }));
     }
 }

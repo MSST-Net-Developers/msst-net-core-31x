@@ -241,9 +241,7 @@ async fn inbound_loop(
                         let src_addr = msst_core_state::net::relay::unmap_addr(src);
                         let relay_rtt = {
                             let net = state.net.read().await;
-                            let peer_relay = net.peer_list.get(&peer_id)
-                                .and_then(|e| e.preferred_relay.as_deref());
-                            net.relay_rtt.for_peer(peer_relay, net.relay_addr.as_deref())
+                            net.relay_rtt.for_peer(net.relay_for_peer(&peer_id), net.relay_addr.as_deref())
                         };
                         let mut sched = state.scheduler.lock().await;
                         let actions = sched.handle_pong(&peer_id, src_addr, seq, rtt_ms, relay_rtt, now);
@@ -255,9 +253,18 @@ async fn inbound_loop(
                     msst_packet::TYPE_RELAY_PING => {
                         // The relay echoed one of our RTT pings; match by source.
                         let src = msst_core_state::net::relay::unmap_addr(src);
-                        let mut net = state.net.write().await;
-                        if let Some((addr, ewma)) = net.relay_rtt.on_reply(src, std::time::Instant::now()) {
+                        let now_i = std::time::Instant::now();
+                        let change = {
+                            let mut net = state.net.write().await;
+                            let Some((addr, ewma)) = net.relay_rtt.on_reply(src, now_i) else { continue };
                             debug!("relay RTT {} EWMA {:.1}ms", addr, ewma);
+                            net.room_relay
+                                .as_mut()
+                                .filter(|r| r.addr.as_deref() == Some(addr.as_str()))
+                                .and_then(|r| r.health.reply(now_i))
+                        };
+                        if let Some(change) = change {
+                            room_relay_health_changed(&state, change).await;
                         }
                     }
                     _ => {
@@ -303,7 +310,7 @@ async fn scheduler_tick_loop(state: Arc<CoreState>) {
             let routed: std::collections::HashSet<String> = net
                 .peer_list
                 .device_ids()
-                .filter(|id| net.relay_addr.is_some() || net.peer_list.get(id).is_some_and(|e| e.preferred_relay.is_some()))
+                .filter(|id| net.relay_addr.is_some() || net.relay_for_peer(id).is_some())
                 .map(str::to_string)
                 .collect();
             (ep, routed, net.local_device_id.clone())
@@ -428,7 +435,7 @@ async fn coordinator_event_loop(
             }
 
             // ── Room state update ─────────────────────────────────────────
-            CoordinatorEvent::RoomState { room_id, room_name, peers } => {
+            CoordinatorEvent::RoomState { room_id, room_name, peers, relay } => {
                 info!("coordinator: room_state room={} ({}), {} peer(s)", room_id, room_name, peers.len());
 
                 let now = current_unix();
@@ -449,6 +456,7 @@ async fn coordinator_event_loop(
                 for peer in &peers {
                     crate::nodes::apply_peer(state, room_peer_data(peer)).await;
                 }
+                apply_room_relay(state, &room_id, relay.as_ref()).await;
 
                 // Complete a pending join.
                 crate::rooms::notify_room_waiter(state, Ok(serde_json::json!({
@@ -503,6 +511,9 @@ async fn coordinator_event_loop(
                     let mut net = state.net.write().await;
                     if let Some(relay) = crate::relay::extract_relay(&endpoints) {
                         net.peer_list.update_relay(&device_id, &relay);
+                    }
+                    if !endpoints.is_empty() {
+                        net.set_peer_on_room_relay(&device_id, crate::room_relay::reports_room_relay(&endpoints));
                     }
                     let candidates = crate::endpoints::direct_candidates(&endpoints);
                     if !candidates.is_empty() {
@@ -681,11 +692,12 @@ async fn peer_target(state: &Arc<CoreState>, device_id: &str) -> Option<std::net
     }
 }
 
-/// The relay route to a peer: its relay, else ours.
+/// The relay route to a peer: the room relay or its preferred relay
+/// (`NetState::relay_for_peer`), else ours.
 async fn relay_target(state: &Arc<CoreState>, device_id: &str) -> Option<std::net::SocketAddr> {
     let (peer_relay, own_relay) = {
         let net = state.net.read().await;
-        (net.peer_list.get(device_id).and_then(|e| e.preferred_relay.clone()), net.relay_addr.clone())
+        (net.relay_for_peer(device_id).map(str::to_string), net.relay_addr.clone())
     };
     if let Some(addr) = match &peer_relay { Some(r) => crate::relay::resolve_addr(r).await, None => None } {
         return Some(addr);
@@ -725,8 +737,7 @@ async fn on_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: crate::
                 if net.relay_addr.as_deref().and_then(|r| r.parse().ok()) == Some(src) {
                     state.relay_path_ok_at.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
-                let peer_relay = net.peer_list.get(device_id).and_then(|e| e.preferred_relay.as_deref());
-                net.relay_rtt.for_peer(peer_relay, net.relay_addr.as_deref())
+                net.relay_rtt.for_peer(net.relay_for_peer(device_id), net.relay_addr.as_deref())
             };
             let actions = state.scheduler.lock().await.handle_pong(device_id, src, probe.seq, rtt_ms, relay_rtt, now);
             for action in actions {
@@ -914,16 +925,125 @@ async fn relay_keepalive_loop(state: Arc<CoreState>) {
             let net = state.net.read().await;
             (net.relay_addr.clone(), net.local_device_id.clone())
         };
-        let Some(relay_addr) = relay_addr else { continue };
-        if !state.relay_reg.lock().unwrap_or_else(|e| e.into_inner()).due(current_time_ms(), interval_ms) {
-            continue;
+        if let Some(relay_addr) = relay_addr {
+            if state.relay_reg.lock().unwrap_or_else(|e| e.into_inner()).due(current_time_ms(), interval_ms) {
+                if let (Some(target), Some(pkt)) = (crate::relay::resolve_addr(&relay_addr).await, relay_registration_packet(&state, &device_id, false).await) {
+                    if let Err(e) = state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
+                        warn!("relay: keepalive to {} failed: {}", relay_addr, e);
+                    }
+                }
+            }
         }
-        let Some(target) = crate::relay::resolve_addr(&relay_addr).await else { continue };
-        let Some(pkt) = relay_registration_packet(&state, &device_id, false).await else { continue };
-        if let Err(e) = state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
-            warn!("relay: keepalive to {} failed: {}", relay_addr, e);
+        // The room relay, on the same schedule (kept up while it is down,
+        // so the binding is there when it comes back).
+        let Some((addr, relay_pk)) = room_relay_registration_target(&*state.net.read().await) else { continue };
+        if state.room_relay_reg.lock().unwrap_or_else(|e| e.into_inner()).due(current_time_ms(), interval_ms) {
+            send_room_relay_registration(&state, &addr, &relay_pk, &device_id).await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Room relay (`crate::room_relay`, docs/ROOM_RELAY_3.1.md)
+// ---------------------------------------------------------------------------
+
+/// Take the room relay from a `room_state`.  It never changes, so a repeated
+/// `room_state` (e.g. after a reconnect) keeps its health and registration.
+/// An unusable one (bad key, no `sreg1`/`sdisc1`) is ignored: everyone
+/// then uses their preferred relays.
+pub(crate) async fn apply_room_relay(state: &Arc<CoreState>, room_id: &str, relay: Option<&crate::coordinator::messages::RoomStateRelay>) {
+    use crate::room_relay::RoomRelay;
+    let new = match relay.map(|r| RoomRelay::from_room_state(room_id, r)) {
+        None => None,
+        Some(Ok(r)) => Some(r),
+        Some(Err(e)) => {
+            warn!("room relay of {} is unusable ({}): using preferred relays", room_id, e);
+            None
+        }
+    };
+    {
+        let net = state.net.read().await;
+        let unchanged = match (&net.room_relay, &new) {
+            (Some(a), Some(b)) => a.same_as(b),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+    }
+    let new = match new {
+        Some(mut r) => {
+            if r.addr.is_none() {
+                r.addr = crate::relay::resolve_addr(&r.address).await.map(|a| relay::unmap_addr(a).to_string());
+            }
+            info!("room relay: {} ({}) for {}", r.address, if r.self_hosted { "self-hosted" } else { "official" }, room_id);
+            Some(r)
+        }
+        None => None,
+    };
+    state.net.write().await.room_relay = new;
+    register_with_room_relay(state).await;
+    room_relay_updated(state).await;
+}
+
+/// Where to register for the room relay: its address and key, unless it is
+/// our own relay (registered already) or its address is unresolved.
+fn room_relay_registration_target(net: &crate::state::NetState) -> Option<(String, [u8; 32])> {
+    let r = net.room_relay.as_ref()?;
+    let addr = r.addr.clone()?;
+    (net.relay_addr.as_deref() != Some(addr.as_str())).then_some((addr, r.pub_key))
+}
+
+/// (Re)register with the room relay: the first packet now, the rest from
+/// [`relay_keepalive_loop`] (again 1 s and 3 s later, then every keepalive
+/// interval).  A room relay always takes `0x0E`.
+async fn register_with_room_relay(state: &Arc<CoreState>) {
+    let (target, device_id) = {
+        let net = state.net.read().await;
+        (room_relay_registration_target(&net), net.local_device_id.clone())
+    };
+    let Some((addr, relay_pk)) = target else { return };
+    state.room_relay_reg.lock().unwrap_or_else(|e| e.into_inner()).restart(current_time_ms(), true);
+    send_room_relay_registration(state, &addr, &relay_pk, &device_id).await;
+}
+
+async fn send_room_relay_registration(state: &Arc<CoreState>, addr: &str, relay_pk: &[u8; 32], device_id: &str) {
+    if device_id.is_empty() {
+        return;
+    }
+    let Some(sk) = state.identity.read().await.as_ref().map(|i| i.secret_key) else { return };
+    let pkt = state.room_relay_reg.lock().unwrap_or_else(|e| e.into_inner()).packet(&sk, crate::sdisc::wire_id(device_id), relay_pk, current_time_ms());
+    let Some(pkt) = pkt else {
+        warn!("room relay: its key is invalid (low-order) — cannot register");
+        return;
+    };
+    let Some(target) = crate::relay::resolve_addr(addr).await else { return };
+    if let Err(e) = state.udp_socket.send_to(&pkt, relay::map_send_addr(target)).await {
+        debug!("room relay: register with {} failed: {}", addr, e);
+    }
+}
+
+/// The room relay appeared, went, or changed health: re-announce our
+/// endpoints (`room-relay:`), and tell Controllers.
+async fn room_relay_updated(state: &Arc<CoreState>) {
+    state.next_generation();
+    crate::rooms::emit_room_state(state).await;
+    crate::endpoints::spawn_detect_and_report(state.clone());
+}
+
+/// Apply a room relay health transition.
+async fn room_relay_health_changed(state: &Arc<CoreState>, (old, new): (crate::room_relay::HealthState, crate::room_relay::HealthState)) {
+    use crate::room_relay::HealthState;
+    match new {
+        HealthState::Down => warn!("room relay: {} → down — room traffic falls back to preferred relays", old.as_str()),
+        _ => info!("room relay: {} → {}", old.as_str(), new.as_str()),
+    }
+    if new == HealthState::Ok && old == HealthState::Down {
+        // Rebind quickly: the relay may have lost our registration.
+        register_with_room_relay(state).await;
+    }
+    room_relay_updated(state).await;
 }
 
 /// Every 5 s, ping our relay and every relay our peers are registered with,
@@ -933,7 +1053,7 @@ async fn relay_rtt_loop(state: Arc<CoreState>) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let (relays, device_id) = {
+        let (relays, device_id, health_change, unresolved_room_relay) = {
             let mut net = state.net.write().await;
             net.relay_rtt.purge_stale(std::time::Instant::now());
             let mut relays: Vec<String> = net.relay_addr.iter().cloned().collect();
@@ -944,8 +1064,30 @@ async fn relay_rtt_loop(state: Arc<CoreState>) {
                     }
                 }
             }
-            (relays, net.local_device_id.clone())
+            // The room relay's pings also drive its health.
+            let (mut change, mut unresolved) = (None, None);
+            if let Some(r) = net.room_relay.as_mut() {
+                change = r.health.tick();
+                match &r.addr {
+                    Some(a) if !relays.contains(a) => relays.push(a.clone()),
+                    Some(_) => {}
+                    None => unresolved = Some(r.address.clone()),
+                }
+            }
+            (relays, net.local_device_id.clone(), change, unresolved)
         };
+        if let Some(change) = health_change {
+            room_relay_health_changed(&state, change).await;
+        }
+        if let Some(address) = unresolved_room_relay {
+            // Its name didn't resolve yet: retry (pinged from the next round).
+            if let Some(a) = crate::relay::resolve_addr(&address).await {
+                if let Some(r) = state.net.write().await.room_relay.as_mut().filter(|r| r.address == address) {
+                    r.addr = Some(relay::unmap_addr(a).to_string());
+                }
+                register_with_room_relay(&state).await;
+            }
+        }
         if device_id.is_empty() {
             continue;
         }
@@ -1545,5 +1687,109 @@ mod tests {
         ).await.unwrap();
         assert_eq!(chosen.addr, relay_addr.to_string());
         assert_eq!(chosen.pub_key, None);
+    }
+
+    /// The room relay: registered at once (sreg v1) and again by the
+    /// keepalive loop; its health follows real `0x05` echoes; room traffic
+    /// goes through it only while it works and the peer reports being on
+    /// it too.
+    #[tokio::test]
+    async fn room_relay_registration_health_and_routing() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use crate::room_relay::HealthState;
+        let state = test_state().await;
+        let (tun_tx, _tun) = mpsc::channel(4);
+        tokio::spawn(inbound_loop(state.udp_socket.clone(), state.clone(), tun_tx));
+
+        // Our own relay stays silent; the room relay echoes RTT pings
+        // while `echo` is set and reports everything it receives.
+        let own = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let own_addr = own.local_addr().unwrap();
+        let room = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let room_addr = room.local_addr().unwrap();
+        let echo = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (seen_tx, mut seen) = mpsc::unbounded_channel::<Vec<u8>>();
+        {
+            let (room, echo) = (room.clone(), echo.clone());
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                while let Ok((n, src)) = room.recv_from(&mut buf).await {
+                    if buf[5] == msst_packet::TYPE_RELAY_PING && echo.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = room.send_to(&buf[..n], src).await;
+                    }
+                    let _ = seen_tx.send(buf[..n].to_vec());
+                }
+            });
+        }
+        add_peer(&state, Some(&own_addr.to_string())).await;
+        {
+            let mut net = state.net.write().await;
+            net.relay_addr = Some(own_addr.to_string());
+            net.room_peers.insert("device-a1b2c3d4".into());
+            net.joined_rooms.insert("space-1".into(), "Room".into());
+        }
+        let relay_pk = *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2u8; 32])).as_bytes();
+        let room_state_relay = crate::coordinator::messages::RoomStateRelay {
+            address: room_addr.to_string(),
+            pub_key: STANDARD.encode(relay_pk),
+            features: vec!["sdisc1".into(), "sreg1".into()],
+            self_hosted: true,
+        };
+        let id = crate::sdisc::wire_id("device-11111111");
+        let key = crate::sreg::derive_key(&[1u8; 32], id, &relay_pk).unwrap();
+
+        // Registered at once, then ~1 s later by the keepalive loop.
+        apply_room_relay(&state, "space-1", Some(&room_state_relay)).await;
+        let keepalive = tokio::spawn(relay_keepalive_loop(state.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let mut regs = Vec::new();
+        while let Ok(p) = seen.try_recv() {
+            regs.push(p);
+        }
+        keepalive.abort();
+        assert_eq!(regs.len(), 2, "{:?}", regs);
+        for p in &regs {
+            let counter = u64::from_be_bytes(p[23..31].try_into().unwrap());
+            assert_eq!(*p, crate::sreg::build_packet(&key, id, counter), "a 0x0E for the room relay's key");
+        }
+        // A repeated room_state (e.g. after a reconnect) changes nothing.
+        apply_room_relay(&state, "space-1", Some(&room_state_relay)).await;
+        assert!(seen.try_recv().is_err());
+        assert_eq!(state.net.read().await.room_relay.as_ref().unwrap().health.state(), HealthState::Probing);
+
+        // Health: the first echoed ping makes it ok.
+        let rtt = tokio::spawn(relay_rtt_loop(state.clone()));
+        let mut ok = false;
+        for _ in 0..100 {
+            if state.net.read().await.room_relay.as_ref().unwrap().health.state() == HealthState::Ok {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        rtt.abort();
+        assert!(ok, "room relay never became ok");
+        assert_eq!(crate::rooms::room_view(&state).await["room_relay"], serde_json::json!({ "address": room_addr.to_string(), "self_hosted": true, "state": "ok" }));
+
+        // Routing: the room relay only once the peer reports it too.
+        assert_eq!(relay_target(&state, "device-a1b2c3d4").await, Some(own_addr));
+        state.net.write().await.set_peer_on_room_relay("device-a1b2c3d4", true);
+        assert_eq!(relay_target(&state, "device-a1b2c3d4").await, Some(room_addr));
+        // Not for a peer outside the room.
+        state.net.write().await.room_peers.clear();
+        assert_eq!(relay_target(&state, "device-a1b2c3d4").await, Some(own_addr));
+        state.net.write().await.room_peers.insert("device-a1b2c3d4".into());
+
+        // Three missed rounds: down, back to the preferred relays.
+        echo.store(false, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut net = state.net.write().await;
+            let h = &mut net.room_relay.as_mut().unwrap().health;
+            for _ in 0..4 {
+                h.tick();
+            }
+            assert_eq!(h.state(), HealthState::Down);
+        }
+        assert_eq!(relay_target(&state, "device-a1b2c3d4").await, Some(own_addr));
     }
 }

@@ -30,6 +30,7 @@ mod ipc;
 mod observability;
 mod passwords;
 mod relay;
+mod room_relay;
 mod rooms;
 mod sdisc;
 mod sreg;

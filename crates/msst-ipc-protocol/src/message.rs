@@ -117,8 +117,18 @@ pub enum IpcRequest {
     GetServices,
 
     // ── Commands ────────────────────────────────────────────────────────────
-    /// Create a room on the coordinator.
-    CreateRoom { room_name: String, password: Option<String> },
+    /// Create a room on the coordinator.  `relay` (protocol 0.4, optional):
+    /// the room relay — a connection string `msst-relay://host:port#<key>`
+    /// or an official relay's address; `relay_password`: that relay's
+    /// password, if it has one (`docs/ROOM_RELAY_3.1.md`).
+    CreateRoom {
+        room_name: String,
+        password: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_password: Option<String>,
+    },
     /// Join an existing room.
     JoinRoom { room_id: String, password: Option<String> },
     /// Leave a room.
@@ -308,6 +318,10 @@ pub enum IpcEvent {
         room_name: Option<String>,
         peers: Vec<serde_json::Value>,
         relay: Option<String>,
+        /// The room relay, `{address, self_hosted, state}`; `null` = none
+        /// (protocol 0.4).
+        #[serde(default)]
+        room_relay: Option<serde_json::Value>,
     },
 
     // ── Identity / settings ─────────────────────────────────────────────────
@@ -404,6 +418,8 @@ mod tests {
             body: IpcRequest::CreateRoom {
                 room_name: "test-room".into(),
                 password: Some("secret".into()),
+                relay: Some("msst-relay://relay.example.com:7000#zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk?pw=1".into()),
+                relay_password: Some("relay secret".into()),
             },
         });
     }

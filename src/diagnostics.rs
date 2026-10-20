@@ -202,6 +202,16 @@ pub async fn relays(state: &CoreState) -> Result<Value, IpcError> {
             "tx_sreg": tx_sreg,
             "last_relay_path_ok_at": (path_ok > 0).then_some(path_ok),
         });
+        // The room relay (additive): `null` outside a room with one.
+        body["room_relay"] = match &net.room_relay {
+            Some(r) => {
+                let mut v = r.view();
+                v["addr"] = json!(r.addr);
+                v["tx_sreg"] = json!(state.room_relay_reg.lock().unwrap_or_else(|e| e.into_inner()).tx_sreg);
+                v
+            }
+            None => Value::Null,
+        };
     }
     Ok(body)
 }

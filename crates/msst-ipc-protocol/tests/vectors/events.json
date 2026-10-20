@@ -20,7 +20,8 @@
         ],
         "relay": "198.51.100.1:7000",
         "room_id": "space-1",
-        "room_name": "Test room"
+        "room_name": "Test room",
+        "room_relay": null
       },
       "type": "room_state_changed"
     },

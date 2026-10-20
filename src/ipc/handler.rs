@@ -73,7 +73,9 @@ pub async fn handle_request(request: IpcRequest, state: &Arc<CoreState>, session
         IpcRequest::GetRelays => respond(crate::diagnostics::relays(state).await),
 
         // ── Commands ───────────────────────────────────────────────────────
-        IpcRequest::CreateRoom { room_name, password } => respond(crate::rooms::create_room(state, room_name, password).await),
+        IpcRequest::CreateRoom { room_name, password, relay, relay_password } => {
+            respond(crate::rooms::create_room(state, room_name, password, relay, relay_password).await)
+        }
         IpcRequest::JoinRoom { room_id, password } => respond(crate::rooms::join_room(state, room_id, password).await),
         IpcRequest::LeaveRoom { room_id } => respond(crate::rooms::leave_room(state, room_id).await),
         IpcRequest::CreateAclRule { rule } => respond(crate::acl::create_rule(state, rule).await),
