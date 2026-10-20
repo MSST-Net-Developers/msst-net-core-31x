@@ -457,11 +457,15 @@ impl CoordinatorClient {
         // so the coordinator knows who we are before any other message.
         let (tx, rx) = mpsc::channel::<String>(64);
         let _ = tx.send(register.to_string()).await;
-        let rooms: Vec<String> = core.net.read().await.joined_rooms.keys().cloned().collect();
-        for room_id in &rooms {
-            // The coordinator ties discovery-proxy registration to the WS
-            // connection, so `discovery_join` must be resent with `join`.
-            let _ = tx.send(join_message(room_id).to_string()).await;
+        let rooms: Vec<(String, Option<String>)> = {
+            let net = core.net.read().await;
+            net.joined_rooms.keys().map(|id| (id.clone(), net.room_password_hashes.get(id).cloned())).collect()
+        };
+        for (room_id, pw) in &rooms {
+            // The coordinator checks the password on every join, and ties
+            // discovery-proxy registration to the WS connection, so
+            // `discovery_join` must be resent with `join`.
+            let _ = tx.send(join_message(room_id, pw.as_deref()).to_string()).await;
             let _ = tx.send(discovery_join_message(room_id).to_string()).await;
             info!("coordinator: re-joining room {} after (re)connect", room_id);
         }
@@ -620,11 +624,7 @@ impl CoordinatorClient {
 
     /// Send a join room message.
     pub async fn send_join(&self, room_id: &str, password_hash: Option<&str>) -> Result<(), NotConnected> {
-        let mut msg = join_message(room_id);
-        if let Some(pw) = password_hash {
-            msg["data"]["password_hash"] = json!(pw);
-        }
-        self.send(&msg.to_string()).await
+        self.send(&join_message(room_id, password_hash).to_string()).await
     }
 
     /// Send a leave room message.
@@ -817,8 +817,12 @@ pub fn build_register_message(id: &Identity) -> Value {
     })
 }
 
-fn join_message(room_id: &str) -> Value {
-    json!({ "type": "join", "data": { "room_id": room_id } })
+fn join_message(room_id: &str, password_hash: Option<&str>) -> Value {
+    let mut msg = json!({ "type": "join", "data": { "room_id": room_id } });
+    if let Some(pw) = password_hash {
+        msg["data"]["password_hash"] = json!(pw);
+    }
+    msg
 }
 
 fn discovery_join_message(room_id: &str) -> Value {
@@ -1282,7 +1286,9 @@ mod tests {
         assert_eq!(heartbeat_message().to_string(), r#"{"data":{},"type":"node_heartbeat"}"#);
         assert_eq!(room_keepalive_message("r1")["data"]["room_id"], "r1");
         assert_eq!(discovery_join_message("r1")["type"], "discovery_join");
-        assert_eq!(join_message("r1")["type"], "join");
+        assert_eq!(join_message("r1", None)["type"], "join");
+        assert!(join_message("r1", None)["data"].get("password_hash").is_none());
+        assert_eq!(join_message("r1", Some("h"))["data"]["password_hash"], "h");
     }
 
     #[test]
@@ -1353,7 +1359,11 @@ mod tests {
         let core = Arc::new(CoreState::new(udp, std::env::temp_dir()));
         let mut ipc_rx = core.subscribe_events();
         core.apply_identity(&test_identity(false)).await;
-        core.net.write().await.joined_rooms.insert("space-1".into(), "Room".into());
+        {
+            let mut net = core.net.write().await;
+            net.joined_rooms.insert("space-1".into(), "Room".into());
+            net.room_password_hashes.insert("space-1".into(), "pwhash".into());
+        }
 
         let (event_tx, _event_rx) = mpsc::channel(16);
         let client = Arc::new(CoordinatorClient::new(
@@ -1387,14 +1397,16 @@ mod tests {
             let tcp = tokio::time::timeout(Duration::from_secs(10), ws_conns.recv())
                 .await.expect("client did not (re)connect").unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            let mut types = Vec::new();
-            while types.len() < 3 {
+            let mut msgs = Vec::new();
+            while msgs.len() < 3 {
                 if let Some(Ok(Message::Text(t))) = ws.next().await {
-                    let v: Value = serde_json::from_str(&t).unwrap();
-                    types.push(v["type"].as_str().unwrap().to_string());
+                    msgs.push(serde_json::from_str::<Value>(&t).unwrap());
                 }
             }
+            let types: Vec<&str> = msgs.iter().map(|v| v["type"].as_str().unwrap()).collect();
             assert_eq!(types, ["register", "join", "discovery_join"], "round {}", round);
+            // A password-protected room is re-joined with its password.
+            assert_eq!(msgs[1]["data"]["password_hash"], "pwhash", "round {}", round);
             if round == 0 {
                 // Messages sent while connected go out on the live connection.
                 client.send_leave("space-1").await.unwrap();

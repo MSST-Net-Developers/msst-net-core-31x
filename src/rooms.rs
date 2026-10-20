@@ -4,8 +4,9 @@
 //! waits up to 2 s for the room's `room_state` (or a coordinator `error`,
 //! e.g. wrong password) so the reply can carry the room name and peers.
 //! A timeout is not an error — the room state arrives as an event later.
-//! Joined rooms are re-joined on every coordinator reconnect and kept
-//! alive by `room_keepalive` (see `coordinator`).
+//! Joined rooms are re-joined on every coordinator reconnect, with the
+//! room's password hash (kept in memory), and kept alive by
+//! `room_keepalive` (see `coordinator`).
 
 use crate::coordinator::CoordinatorClient;
 use crate::state::CoreState;
@@ -64,8 +65,15 @@ async fn join_and_wait(state: &CoreState, client: &CoordinatorClient, room_id: &
 }
 
 /// Bookkeeping after a successful join.
-async fn joined(state: &Arc<CoreState>, client: &CoordinatorClient, room_id: &str, room_name: &str) -> Value {
-    state.net.write().await.joined_rooms.insert(room_id.to_string(), room_name.to_string());
+async fn joined(state: &Arc<CoreState>, client: &CoordinatorClient, room_id: &str, room_name: &str, password: Option<&str>) -> Value {
+    {
+        let mut net = state.net.write().await;
+        net.joined_rooms.insert(room_id.to_string(), room_name.to_string());
+        match password {
+            Some(pw) => net.room_password_hashes.insert(room_id.to_string(), password_hash(pw)),
+            None => net.room_password_hashes.remove(room_id),
+        };
+    }
     if let Err(e) = client.send_discovery_join(room_id).await {
         warn!("rooms: discovery_join for {} failed: {}", room_id, e);
     }
@@ -98,9 +106,10 @@ pub async fn create_room(state: &Arc<CoreState>, room_name: String, password: Op
     info!("rooms: created {} ({})", room_id, room_name);
     crate::ipc::ops::progress("room_created");
 
-    // The creator joins without the password (as 3.0.x).
-    join_and_wait(state, &client, &room_id, None).await?;
-    Ok(joined(state, &client, &room_id, &room_name).await)
+    // The creator joins with the password too: the coordinator checks it
+    // on every join (3.0.x joined without it and was refused).
+    join_and_wait(state, &client, &room_id, password.as_deref()).await?;
+    Ok(joined(state, &client, &room_id, &room_name, password.as_deref()).await)
 }
 
 pub async fn join_room(state: &Arc<CoreState>, room_id: String, password: Option<String>) -> Result<Value, IpcError> {
@@ -111,7 +120,7 @@ pub async fn join_room(state: &Arc<CoreState>, room_id: String, password: Option
     }
     let room_name = join_and_wait(state, &client, &room_id, password.as_deref()).await?;
     info!("rooms: joined {}", room_id);
-    Ok(joined(state, &client, &room_id, &room_name).await)
+    Ok(joined(state, &client, &room_id, &room_name, password.as_deref()).await)
 }
 
 pub async fn leave_room(state: &Arc<CoreState>, room_id: String) -> Result<Value, IpcError> {
@@ -123,6 +132,7 @@ pub async fn leave_room(state: &Arc<CoreState>, room_id: String) -> Result<Value
     {
         let mut net = state.net.write().await;
         net.joined_rooms.remove(&room_id);
+        net.room_password_hashes.remove(&room_id);
         if net.joined_rooms.is_empty() {
             net.room_peers.clear();
         }
@@ -239,13 +249,22 @@ mod tests {
         assert!(peers.contains(&"device-0000000b") && peers.contains(&"device-00000001"));
         let create = coord.http_log.lock().unwrap().iter().find(|r| r.path == "/room/create").cloned().unwrap();
         assert_eq!(create.body["password_hash"], password_hash("pw"));
+        // The creator joins with the password (the coordinator checks it).
+        let join = coord.ws_log.lock().unwrap().iter().find(|m| m["type"] == "join").cloned().unwrap();
+        assert_eq!(join["data"]["password_hash"], password_hash("pw"));
         assert!(eventually(|| coord.ws_types().contains(&"discovery_join".to_string())).await);
-        assert!(state.net.read().await.joined_rooms.contains_key("space-1"));
+        {
+            // Kept for re-joins after a reconnect.
+            let net = state.net.read().await;
+            assert!(net.joined_rooms.contains_key("space-1"));
+            assert_eq!(net.room_password_hashes.get("space-1"), Some(&password_hash("pw")));
+        }
 
         // Join rejected by the coordinator.
         let e = join_room(&state, "space-2".into(), Some("bad".into())).await.unwrap_err();
         assert_eq!(e.code, "room_rejected");
         assert!(!state.net.read().await.joined_rooms.contains_key("space-2"));
+        assert!(!state.net.read().await.room_password_hashes.contains_key("space-2"));
         let join = coord.ws_log.lock().unwrap().iter().rev().find(|m| m["type"] == "join").cloned().unwrap();
         assert_eq!(join["data"]["password_hash"], password_hash("bad"));
 
@@ -253,7 +272,7 @@ mod tests {
         leave_room(&state, "space-1".into()).await.unwrap();
         assert!(eventually(|| coord.ws_types().ends_with(&["leave".to_string(), "discovery_leave".to_string()])).await);
         let net = state.net.read().await;
-        assert!(net.joined_rooms.is_empty() && net.room_peers.is_empty());
+        assert!(net.joined_rooms.is_empty() && net.room_peers.is_empty() && net.room_password_hashes.is_empty());
         drop(net);
         rt.shutdown().await;
     }

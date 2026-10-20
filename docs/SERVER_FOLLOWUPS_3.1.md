@@ -1,6 +1,6 @@
 # MSST-Net 3.1 服务端跟进
 
-2026-10-19 · 客户端基线：msst-net-core-31x `2be46a5` · 中转：msstnetRelay31x `19b68ed` · Coordinator：msstnetCoordinator31x `d185258` + 未提交改动
+2026-10-20 · 客户端基线：msst-net-core-31x `837efdf` + 房间密码重入修复 · 中转：msstnetRelay31x `f5cd369` · Coordinator：msstnetCoordinator31x `ff1afdc`
 
 客户端 3.1 已经只走 WireGuard、只用安全发现、支持带认证的中转注册，并改用隧道内探测测中转路径 RTT。本文列出 Coordinator 与中转还要做什么、按什么顺序上线、如何验收。每一项都已对照两个仓库的当前代码核对过状态。
 
@@ -8,30 +8,32 @@
 
 | 编号 | 组件 | 事项 | 状态 |
 |---|---|---|---|
-| C1 | Coordinator | `POST /relay/device-keys` | 已实现，未提交 |
-| C2 | Coordinator | `features` 存储与透传 | 已实现，未提交 |
+| C1 | Coordinator | `POST /relay/device-keys` | 已完成（`356e399`） |
+| C2 | Coordinator | `features` 存储与透传 | 已完成（`356e399`） |
 | C3 | Coordinator | `device_key_proof` 改为 `required` | 待做 |
 | C4 | Coordinator | 客户端依赖的现有行为 | 无需改动，请保持 |
-| C5 | Coordinator | 访客设备的端点上报 `/device/endpoint` | 待做 |
-| R1 | 中转 | 退役 `0x06`/`0x07` 转发 | 待做 |
-| R2 | 中转 | 退役 `0x03` | 待做 |
+| C5 | Coordinator | 访客设备的端点上报 `/device/endpoint` | 已完成（`54d0d04`） |
+| C6 | Coordinator | 快速重连时旧连接的清理覆盖新连接 | 待做 |
+| K1 | 客户端 | 带密码房间：建房加入与重连重入带上密码 | 已修复 |
+| R1 | 中转 | 退役 `0x06`/`0x07` 转发 | 已完成（`f5cd369`） |
+| R2 | 中转 | 退役 `0x03` | 已完成（`f5cd369`） |
 | R3 | 中转 | `relay.register_auth` 改为 `required` | 待做（最后一步） |
 | R4 | 中转 | 3.1 协议约定、sdisc、sreg | 已完成 |
 
 ## Coordinator
 
-### C1 批量查询设备公钥 `POST /relay/device-keys` — 已实现，未提交
+### C1 批量查询设备公钥 `POST /relay/device-keys` — 已完成（`356e399`）
 
-工作区已有路由（`main.go`）与处理函数（`relay.go`），需要补完测试、提交并部署。中转（sreg）首次见到某设备时靠它取公钥；没有它，所有 `0x0E` 都会因 `key_unknown` 被丢弃。
+部署即可。中转（sreg）首次见到某设备时靠它取公钥；没有它，所有 `0x0E` 都会因 `key_unknown` 被丢弃。
 
 - 用与 `discovery-peers` 相同的 `X-Relay-Secret` 校验，错误或缺失返回 401。
 - `device_ids` 最多 256 个；空数组、超出、不是 `device-` 加 8 位小写十六进制时返回 400；请求体约 16 KB 上限。
 - 未知设备直接省略，不报错。返回注册时固定（pin）的公钥；设备删除后不再返回。
 - 只走 HTTPS。每个中转最多约 10 次/秒，低于默认每 IP 30 次/秒的限流。
 
-### C2 中转 `features` 存储与透传 — 已实现，未提交
+### C2 中转 `features` 存储与透传 — 已完成（`356e399`）
 
-工作区已有 `sanitizeRelayFeatures`，`GET /relays` 已返回 `features`。提交并部署即可。
+`sanitizeRelayFeatures` 已提交，`GET /relays` 返回 `features`。部署即可。
 
 - 只保留形如 `[a-z0-9]{1,16}` 的项，去重，最多 16 个。
 - 客户端判定规则：`features` 含 `"sreg1"` **且** `pub_key` 是合法的 32 字节密钥，才用 `0x0E`；否则用 `0x01`/`0x02`。字段缺失按空数组处理。
@@ -51,7 +53,10 @@
 - `room_state`、`member_joined` 和 `/nodes/*` 为每台设备返回 `public_key`。它就是 WireGuard 公钥，缺失时客户端无法与该设备通信（路径视图显示 `no_key`）。
 - `GET /relays` 每项带 `pub_key`。没有 `pub_key` 的中转对客户端来说既没有游戏发现，也不能用 `0x0E` 注册。
 
-### C5 访客设备的端点上报 — 待做
+### C5 访客设备的端点上报 — 已完成（`54d0d04`）
+
+已按下面的建议实现：通过 WS 注册设备的访客令牌与该设备绑定，可以上报它的端点；OIDC 注册会解除绑定。以下为原始描述，供核对。
+
 
 客户端在没有有效 MSST 登录时改用访客令牌（`POST /auth/guest/token`）接入：WS、`/nodes/*` 都正常。但 `/device/endpoint` 会核对“令牌的用户 ID 就是设备的所有者”：访客令牌的用户 ID 是 `guest-<8hex>`，而设备注册时上报的是它自己的 `user-<hash>`，于是返回 403，访客设备的 P2P 端点无法上报，只能走中转。
 
@@ -59,9 +64,38 @@
 
 另：`POST /device/register` 只认 OIDC 令牌，访客设备通过 HTTP 改名不会立即同步（`synced: false`），会在下次 WS 注册时生效。这是现有行为，可按需放开。
 
+### C6 快速重连时，旧连接的清理覆盖新连接 — 待做
+
+同一设备建立新的 WS 连接时，`Hub.register` 会关闭旧连接；旧连接的 `readPump` 随后退出并调用 `unregister(old)`。`unregister` 只在删除 `h.clients` 条目时检查 `cur == c`，其余步骤不检查，照常执行：
+
+1. 让设备离开 `GetDeviceRooms` 中的所有房间，并广播 `member_left`；
+2. `SetNodeOffline` 并广播 `node_updated`；
+3. `delete(h.discovery, deviceID)`。
+
+这三步通常发生在新连接已经处理完 `register`、`join`、`discovery_join` 之后，于是把新连接刚建立的状态一并清掉。客户端此时认为自己仍在房间里，不会再次 `join`，结果是：
+
+- 设备掉出房间，其他成员收到 `member_left`；它自己也不再收到房间事件；
+- 设备被标记为离线，直到下一次心跳；
+- 设备从 `discovery-peers` 中消失，中转丢弃它的 `0x0A`/`0x0B`（`not in room`），也不再把发现包转给它，游戏发现失效。
+
+网络切换、NAT 超时等让旧连接半开的情况下，客户端会在服务端察觉之前重连，最容易触发。
+
+修法：`unregister` 判断旧连接已被取代（`h.clients[deviceID]` 存在且不是 `c`）时，只关闭这条连接，跳过上面三步。建议补一个测试：同一设备连续建立两条连接，新连接 `join` 和 `discovery_join` 之后关闭旧连接，设备仍是房间成员、仍在线，并且仍在 `GetDiscoveryPeers` 中。
+
+## 客户端
+
+### K1 带密码的房间：建房加入与重连重入带上密码 — 已修复
+
+Coordinator 的 `handleJoin` 在每次 `join` 时都核对 `password_hash`（这是正确行为，无需改动）。原来的客户端（3.0.x 和 3.1.x 都是）有两处不带密码：
+
+- 建房后创建者加入时不带密码，于是创建带密码的房间时总是返回“密码错误”，建房失败；
+- 与 Coordinator 重连后重新加入房间时不带密码，`join` 被拒，随后 `discovery_join` 也因 “not a member” 被拒。房间成员事件和游戏发现都停止，但客户端仍显示在房间里。
+
+现在客户端把已加入房间的密码哈希只保存在内存中，建房加入和每次重连重入都带上它；离开房间时清除，不写入磁盘。Coordinator 与中转无需配合。
+
 ## 中转
 
-### R1 退役 `0x06`/`0x07` 转发 — 待做
+### R1 退役 `0x06`/`0x07` 转发 — 已完成（`f5cd369`）
 
 客户端从 `2be46a5` 起不再经中转发送 `0x06`/`0x07`。中转路径 RTT 改由加密隧道内的探测测量，外层就是普通的 `0x0D`，中转不需要任何新逻辑；`0x06`/`0x07` 只在客户端之间直连使用。
 
@@ -70,7 +104,7 @@
 
 原因：sreg 的来源检查让跨两台中转的 `0x06` 总有一跳被丢弃，客户端因此改用隧道内探测。现在留着这条转发路径只会多一个可被滥用的反射面。
 
-### R2 退役 `0x03` — 待做
+### R2 退役 `0x03` — 已完成（`f5cd369`）
 
 中转目前把 `0x03`（3.0.x 打洞）当作注册处理。3.1 客户端从不发送它（打洞用的是直接发往对端的 `0x06`），它只剩一条未认证注册路径的作用。建议同样归入退役类型。
 
@@ -88,8 +122,8 @@
 
 ## 上线顺序
 
-1. **中转** `19b68ed`（已提交）加上 R1、R2。`register_auth` 保持 `optional`。不影响任何现有客户端。
-2. **Coordinator** 部署 C1，然后部署 C2。C2 生效后，3.1 客户端会在下次选择中转或重连时自动切到 `0x0E`。
+1. **中转** `f5cd369`（含 R1、R2）。`register_auth` 保持 `optional`。不影响任何现有客户端。
+2. **Coordinator** 部署 C1，然后部署 C2（同在 `356e399` 中，部署一次即可，但中转第 1 步必须先完成）。C5、C6 随时可部署。C2 生效后，3.1 客户端会在下次选择中转或重连时自动切到 `0x0E`。
 3. **客户端** 推送 3.1（`2be46a5` 或更新）。在中转支持 `0x0D` 之前，客户端经中转的流量全部不通，只有直连可用，所以第 1 步必须先完成。
 4. **Coordinator** C3：`device_key_proof` 先 `optional`，确认无误后 `required`。
 5. **中转** R3：`register_auth: required`。
@@ -105,6 +139,8 @@
 - [ ] A、B 处于 `probing` 时，`GetRelays.registration.last_relay_path_ok_at` 持续更新（隧道内探测经本机中转回来）；中转上看不到 `0x06`/`0x07`。
 - [ ] MTU 覆盖设为 1500 时，`ping -s 1472` 通过（中转转发 1555 字节的 `0x0D`）。
 - [ ] 游戏发现（如 Minecraft 局域网）在 A、B 间可用；`GetRelays.secure_discovery.active` 为 `true`，`drop.unverified_sender` 为 0。
+- [ ] 创建带密码的房间成功；A 断网约 10 秒后恢复，重连后仍在房间里，B 没有收到 A 的 `member_left`，A、B 间游戏发现仍然可用（K1、C6）。
+- [ ] A 在旧连接尚未超时时切换网络（例如从 Wi-Fi 换到热点）：Coordinator 上 A 仍是房间成员且在线，`discovery-peers` 仍列出 A（C6）。
 - [ ] 从另一台主机用 A 的设备 ID 发 `0x01`：中转 `reg_drop{unauth}` 增加，A 的流量不中断。
 - [ ] 重放抓到的 `0x0E`：`reg_drop{replay}` 增加，绑定不变。
 - [ ] A 切换网络（NAT 地址变化）：下一个 `0x0E` 后中转 `rebind` 增加，流量恢复。
