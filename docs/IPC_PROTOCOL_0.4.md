@@ -132,6 +132,11 @@ Add `"async": true` to a command request:
   that has no `pub_key` there is no game discovery (`active: false`).
   `0x0C` from a sender the relay did not verify is now dropped:
   `rx_unverified_sender` is replaced by `drop.unverified_sender`.
+  Discovery goes to every relay a room member uses (ours and each
+  member's, identified by key through `GET /relays`), so it works across
+  relays: `relays` lists those (`IP:port`, empty outside a room), and
+  `drop.duplicate` counts packets that arrived again through another
+  relay (injected once).  `active` still describes our own relay.
 - **`GetRelays.registration`** (relay registration, see
   `docs/RELAY_REQUIREMENTS_3.1.md`): `mode` (`"sreg1"` — authenticated
   `0x0E` — or `"legacy"`), `tx_sreg` (`0x0E` packets sent) and

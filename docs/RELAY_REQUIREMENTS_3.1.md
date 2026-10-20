@@ -91,6 +91,15 @@ those (`GetRelays` → `secure_discovery.drop.unverified_sender`), so such traff
 wasted.  Relays without a `pub_key` in `GET /relays` get no discovery
 traffic at all from 3.1.x clients.
 
+A relay delivers discovery only to room members registered with it.
+Members may use different relays, so a client in a room registers
+(`0x0A`) with, and sends each discovery packet (`0x0B`) to, every relay a
+room member uses: its own and each member's (`relay:` endpoint), matched
+against `GET /relays` by address.  No relay-to-relay forwarding is
+needed.  A relay therefore receives `0x0A`/`0x0B` from devices that are
+not registered with it for data, and must accept them (it does: sdisc
+authenticates by the room's peer list, not by data registration).
+
 ## Coordinator `GET /relays`
 
 Each entry must carry `addr` and `pub_key` (base64 X25519, 32 bytes).

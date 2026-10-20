@@ -98,6 +98,37 @@ async fn fetch_relays(http: &reqwest::Client, coord_url: &str) -> Result<Vec<Rel
     Ok(resp.json::<RelaysResponse>().await?.relays)
 }
 
+/// A relay from `GET /relays` that advertises a valid key: the key and
+/// every address its name resolves to (IPv4-mapped addresses unmapped).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnownRelay {
+    pub addrs: Vec<SocketAddr>,
+    pub pub_key: [u8; 32],
+}
+
+/// The relays `GET /relays` lists with a key (game discovery to room
+/// members' relays identifies them by address).  Relays whose name doesn't
+/// resolve are left out.
+pub async fn fetch_known_relays(http: &reqwest::Client, coord_url: &str) -> Result<Vec<KnownRelay>> {
+    let mut out = Vec::new();
+    for e in fetch_relays(http, coord_url).await? {
+        let Some(pub_key) = e.key() else { continue };
+        let addrs: Vec<SocketAddr> = match e.addr.parse::<SocketAddr>() {
+            Ok(sa) => vec![sa],
+            Err(_) => match tokio::net::lookup_host(&e.addr).await {
+                Ok(it) => it.collect(),
+                Err(err) => {
+                    debug!("relay: DNS lookup failed for {}: {}", e.addr, err);
+                    continue;
+                }
+            },
+        };
+        let addrs = addrs.into_iter().map(msst_core_state::net::relay::unmap_addr).collect();
+        out.push(KnownRelay { addrs, pub_key });
+    }
+    Ok(out)
+}
+
 /// The relay list entry for a preferred relay reached at `target`: matched
 /// by address string, else by resolved address.
 async fn entry_for_preferred<'a>(relays: &'a [RelayEntry], pref: &str, target: SocketAddr) -> Option<&'a RelayEntry> {

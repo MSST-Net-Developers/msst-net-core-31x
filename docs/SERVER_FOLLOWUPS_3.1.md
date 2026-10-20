@@ -15,6 +15,7 @@
 | C5 | Coordinator | 访客设备的端点上报 `/device/endpoint` | 已完成（`54d0d04`） |
 | C6 | Coordinator | 快速重连时旧连接的清理覆盖新连接 | 待做 |
 | K1 | 客户端 | 带密码房间：建房加入与重连重入带上密码 | 已修复 |
+| K2 | 客户端 | 成员分处不同中转时的游戏发现 | 已修复 |
 | R1 | 中转 | 退役 `0x06`/`0x07` 转发 | 已完成（`f5cd369`） |
 | R2 | 中转 | 退役 `0x03` | 已完成（`f5cd369`） |
 | R3 | 中转 | `relay.register_auth` 改为 `required` | 待做（最后一步） |
@@ -93,6 +94,16 @@ Coordinator 的 `handleJoin` 在每次 `join` 时都核对 `password_hash`（这
 
 现在客户端把已加入房间的密码哈希只保存在内存中，建房加入和每次重连重入都带上它；离开房间时清除，不写入磁盘。Coordinator 与中转无需配合。
 
+### K2 成员分处不同中转时的游戏发现 — 已修复
+
+中转只把发现包（`0x0C`）转给在本中转注册过发现的房间成员，而每个成员各自选择延迟最低的中转。现有两台中转，成员分处两台时，数据照常（`0x0D` 跨中转转发），游戏发现却互相不可见。
+
+现在客户端在房间内向“房间成员用到的所有中转”注册发现（`0x0A`）并发送发现包（`0x0B`）：自己的中转，加上每个成员 `relay:` 端点所指的中转；后者按地址在 `GET /relays` 中查到公钥（遇到列表中没有的中转时最多每 60 秒重新拉取一次，另每 15 分钟刷新）。同一个包经两台中转各到一次时，接收端只注入一次（`GetRelays.secure_discovery.drop.duplicate` 计数）。`secure_discovery.relays` 列出当前发往的中转。
+
+中转与 Coordinator 无需改动：中转按房间成员列表认证 `0x0A`/`0x0B`，不要求发送方在本中转注册数据通道。发现流量随中转台数成倍增加（目前两台）。不在 `GET /relays` 中、或没有 `pub_key` 的中转上的成员仍然收不到发现包。
+
+“房间中转”（房主指定后，房间内所有中转流量都走它）是后续功能，届时房间成员都在同一台中转上，不再需要向多台发送。
+
 ## 中转
 
 ### R1 退役 `0x06`/`0x07` 转发 — 已完成（`f5cd369`）
@@ -139,6 +150,7 @@ Coordinator 的 `handleJoin` 在每次 `join` 时都核对 `password_hash`（这
 - [ ] A、B 处于 `probing` 时，`GetRelays.registration.last_relay_path_ok_at` 持续更新（隧道内探测经本机中转回来）；中转上看不到 `0x06`/`0x07`。
 - [ ] MTU 覆盖设为 1500 时，`ping -s 1472` 通过（中转转发 1555 字节的 `0x0D`）。
 - [ ] 游戏发现（如 Minecraft 局域网）在 A、B 间可用；`GetRelays.secure_discovery.active` 为 `true`，`drop.unverified_sender` 为 0。
+- [ ] A、B 在**不同**中转上（例如分别把首选中转设为两台）且同在一个房间：双方 `secure_discovery.relays` 都列出两台中转，游戏发现双向可用；两台中转的 `0x0A`/`0x0B` 计数都在增长（K2）。
 - [ ] 创建带密码的房间成功；A 断网约 10 秒后恢复，重连后仍在房间里，B 没有收到 A 的 `member_left`，A、B 间游戏发现仍然可用（K1、C6）。
 - [ ] A 在旧连接尚未超时时切换网络（例如从 Wi-Fi 换到热点）：Coordinator 上 A 仍是房间成员且在线，`discovery-peers` 仍列出 A（C6）。
 - [ ] 从另一台主机用 A 的设备 ID 发 `0x01`：中转 `reg_drop{unauth}` 增加，A 的流量不中断。
@@ -154,7 +166,7 @@ Coordinator 的 `handleJoin` 在每次 `join` 时都核对 `password_hash`（这
 | `0x01` / `0x02` | 未认证注册 / 保活 | 只发给没有声明 `sreg1` 的中转 |
 | `0x05` | 中转 RTT | 每 5 秒，发给本机中转和对端所在中转 |
 | `0x0D` | 一条 WireGuard 消息：数据、握手、隧道内中转路径探测 | 随流量；发往对端所在中转，没有则发往本机中转 |
-| `0x0A` / `0x0B` | 安全发现注册 / 数据 | 在房间内，从 UDP 21032 发出 |
+| `0x0A` / `0x0B` | 安全发现注册 / 数据 | 在房间内，从 UDP 21032 发往本机中转和每个房间成员所在的中转 |
 
 完整规范：客户端仓库 `docs/RELAY_REQUIREMENTS_3.1.md`、`docs/DATA_PLANE_ENCRYPTION.md`；中转仓库 `REGISTRATION_AUTH.md`、`SECURE_DISCOVERY.md`。
 

@@ -3,21 +3,30 @@
 //! Carries IPv4 multicast/broadcast (Minecraft Java LAN 224.0.2.60, mDNS
 //! 224.0.0.251, subnet broadcasts) between members of a room so LAN game
 //! discovery works over the virtual network.  It uses secure discovery
-//! (sdisc v1, see `crate::sdisc`) only, so it needs a relay that advertised
-//! a `pub_key` in `GET /relays` (`NetState::relay_pub_key`); with any other
-//! relay there is no game discovery (`GetRelays`: `sdisc.active = false`).
+//! (sdisc v1, see `crate::sdisc`) only, so it needs relays that advertise a
+//! `pub_key` in `GET /relays`.
+//!
+//! A relay delivers discovery only to room members registered with it, and
+//! members may use different relays.  So discovery goes to every relay a
+//! room member uses: ours (`NetState::relay_pub_key`) and each member's
+//! (its `relay:` endpoint, identified by key through the relay list).  A
+//! member whose relay has no key, or isn't listed, gets no discovery.
 //!
 //! - **Outbound** (only while in a room): discovery packets read from the
 //!   TUN — and, on Unix desktops, broadcasts this machine sends on its
 //!   physical LAN (rewritten into MSST space) — are de-duplicated,
-//!   rate-limited (10/s) and sent to the relay as authenticated `0x0B`.
-//! - **Registration**: `0x0A` from UDP 21032 to the relay (on join, ~1 s
-//!   later, then every 25 s) so it learns that socket's NAT mapping.
-//! - **Inbound**: UDP 21032 accepts only `0x0C` from that relay that passes
-//!   the tag, recipient and counter checks and whose original sender the
-//!   relay authenticated (flag bit 0).  The payload must be a discovery
-//!   packet; it is then injected into the TUN without ACL evaluation, so
-//!   this path can't be used to inject unicast traffic past the firewall.
+//!   rate-limited (10/s) and sent to each of those relays as authenticated
+//!   `0x0B`.
+//! - **Registration**: `0x0A` from UDP 21032 to each of those relays (when
+//!   it becomes one, ~1 s later, then every 25 s) so it learns that
+//!   socket's NAT mapping.
+//! - **Inbound**: UDP 21032 accepts only `0x0C` from one of those relays
+//!   that passes the tag, recipient and counter checks and whose original
+//!   sender the relay authenticated (flag bit 0).  The payload must be a
+//!   discovery packet; it is then injected into the TUN without ACL
+//!   evaluation, so this path can't be used to inject unicast traffic past
+//!   the firewall.  A packet that arrives through several relays is
+//!   injected once.
 //!
 //! Every outcome is counted in [`SdiscStats`] (reported by `GetRelays`).
 //!
@@ -25,12 +34,13 @@
 //! subject to the inbound ACL when connected to.
 
 use crate::ippkt;
+use crate::relay::KnownRelay;
 use crate::sdisc::{self, DropReason, RegisterSchedule, SdiscKeys};
 use crate::state::CoreState;
-use msst_core_state::net::relay::map_send_addr;
+use msst_core_state::net::relay::{map_send_addr, unmap_addr};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +55,16 @@ const REGISTER_TICK: Duration = Duration::from_secs(1);
 /// Minimum interval between warnings about dropped secure packets.
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const DEDUP_TTL: Duration = Duration::from_secs(3);
+/// A packet arriving again within this time (through another relay) is
+/// dropped.  Shorter than games' re-broadcast interval (Minecraft: 1.5 s).
+const RX_DEDUP_TTL: Duration = Duration::from_secs(1);
+/// Relays with derived keys kept at most (the set is cleared beyond).
+const MAX_BOUND_RELAYS: usize = 16;
+/// Relay list (`GET /relays`): refetch for an unknown member relay at most
+/// this often, refresh at least this often, give up a request after this.
+const RELAY_LIST_RETRY: Duration = Duration::from_secs(60);
+const RELAY_LIST_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+const RELAY_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 const RATE_LIMIT: usize = 10;
 /// Broadcast address in MSST space.
@@ -106,6 +126,10 @@ pub struct SdiscStats {
     pub drop_not_discovery: AtomicU64,
     /// Verified, but the relay could not authenticate the original sender.
     pub drop_unverified_sender: AtomicU64,
+    /// Verified, but the same packet already arrived through another relay.
+    pub drop_duplicate: AtomicU64,
+    /// Relays discovery currently goes to (`IP:port`).
+    relays: Mutex<Vec<String>>,
 }
 
 impl SdiscStats {
@@ -121,9 +145,14 @@ impl SdiscStats {
         c.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn set_relays(&self, relays: Vec<String>) {
+        *self.relays.lock().unwrap_or_else(|e| e.into_inner()) = relays;
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
         serde_json::json!({
+            "relays": *self.relays.lock().unwrap_or_else(|e| e.into_inner()),
             "tx_register": g(&self.tx_register),
             "tx_data": g(&self.tx_data),
             "rx_accepted": g(&self.rx_accepted),
@@ -136,35 +165,65 @@ impl SdiscStats {
                 "replay": g(&self.drop_replay),
                 "not_discovery": g(&self.drop_not_discovery),
                 "unverified_sender": g(&self.drop_unverified_sender),
+                "duplicate": g(&self.drop_duplicate),
             },
         })
     }
 }
 
-/// Keys and counters for the current (relay key, device) pair.  Shared by
-/// the three loops; guarded by a `std` mutex, never held across `.await`.
+/// A relay discovery goes to, identified by its key.
+#[derive(Debug, Clone, PartialEq)]
+struct Target {
+    relay_pk: [u8; 32],
+    addr: SocketAddr,
+}
+
+/// Where discovery goes now (set by the registration loop, used by the
+/// outbound loop).
+#[derive(Clone)]
+struct Route {
+    room: String,
+    device_id: String,
+    targets: Vec<Target>,
+}
+
+/// Keys, counters and the current route.  Shared by the three loops;
+/// guarded by a `std` mutex, never held across `.await`.
 #[derive(Default)]
 struct SecureSession {
-    bound: Option<Bound>,
-    /// Shared by 0x0A and 0x0B (they leave the same socket).  Not reset on
-    /// relay change: it only has to increase.
+    /// Per relay key.
+    bound: HashMap<[u8; 32], Bound>,
+    route: Option<Route>,
+    /// Shared by 0x0A and 0x0B to every relay (they leave the same
+    /// socket); only has to increase.
     tx_counter: u64,
+    /// Recently delivered packets (sender, payload), so a packet that
+    /// arrives through several relays is delivered once.
+    rx_seen: HashMap<[u8; 16], Instant>,
     last_drop_warn: Option<Instant>,
 }
 
 struct Bound {
-    relay_pk: [u8; 32],
     device_id: String,
     own_id: u64,
     keys: SdiscKeys,
+    /// The relay's address we last sent to (tried first on receive).
+    addr: Option<SocketAddr>,
     /// Last accepted 0x0C counter from this relay.
     rx_last: u64,
 }
 
 impl SecureSession {
-    /// The bound keys if they match `(relay_pk, device_id)`.
+    /// The bound keys for `relay_pk` if they are for `device_id`.
     fn current(&mut self, relay_pk: &[u8; 32], device_id: &str) -> Option<&mut Bound> {
-        self.bound.as_mut().filter(|b| &b.relay_pk == relay_pk && b.device_id == device_id)
+        self.bound.get_mut(relay_pk).filter(|b| b.device_id == device_id)
+    }
+
+    fn bind(&mut self, relay_pk: [u8; 32], bound: Bound) {
+        if self.bound.len() >= MAX_BOUND_RELAYS && !self.bound.contains_key(&relay_pk) {
+            self.bound.clear();
+        }
+        self.bound.insert(relay_pk, bound);
     }
 
     fn next_counter(&mut self) -> u64 {
@@ -180,23 +239,64 @@ impl SecureSession {
         self.last_drop_warn = Some(now);
         true
     }
-}
 
-/// What the loops need to know about the relay, per packet.
-struct SecureCtx {
-    relay: Option<String>,
-    relay_pk: Option<[u8; 32]>,
-    room: Option<String>,
-    device_id: String,
-}
+    /// Verify a datagram from `src` received on UDP 21032 with the keys of
+    /// every relay we are bound to (the one at `src` first) and return the
+    /// IPv4 discovery packet to inject; updates replay state and counters.
+    /// `Err(Some(reason))`: failed verification; `Err(None)`: verified, but
+    /// not a discovery packet, from a sender the relay could not
+    /// authenticate, or already delivered — or no relay is bound.  Every
+    /// drop is counted here.
+    fn accept(&mut self, device_id: &str, src: SocketAddr, stats: &SdiscStats, pkt: &[u8], now_ms: u64, now: Instant) -> Result<Vec<u8>, Option<DropReason>> {
+        let mut order: Vec<(bool, [u8; 32])> =
+            self.bound.iter().filter(|(_, b)| b.device_id == device_id).map(|(k, b)| (b.addr != Some(src), *k)).collect();
+        if order.is_empty() {
+            return Err(None);
+        }
+        order.sort_unstable();
+        let mut reason = DropReason::BadTag;
+        for (_, k) in order {
+            let b = self.bound.get_mut(&k).expect("listed above");
+            match sdisc::verify_deliver(&b.keys, b.own_id, pkt, now_ms, b.rx_last) {
+                Ok(d) => {
+                    b.rx_last = d.counter;
+                    return self.deliver(d, stats, now);
+                }
+                // Another relay's packet: try the next key.
+                Err(DropReason::BadTag) => {}
+                Err(r) => {
+                    reason = r;
+                    break;
+                }
+            }
+        }
+        stats.count_drop(reason);
+        Err(Some(reason))
+    }
 
-async fn secure_ctx(state: &CoreState) -> SecureCtx {
-    let net = state.net.read().await;
-    SecureCtx {
-        relay: net.relay_addr.clone(),
-        relay_pk: net.relay_pub_key,
-        room: net.joined_rooms.keys().next().cloned(),
-        device_id: net.local_device_id.clone(),
+    fn deliver(&mut self, d: sdisc::Delivery<'_>, stats: &SdiscStats, now: Instant) -> Result<Vec<u8>, Option<DropReason>> {
+        if !d.sender_verified {
+            // The relay forwarded a sender it could not authenticate.
+            stats.drop_unverified_sender.fetch_add(1, Ordering::Relaxed);
+            debug!("discovery: dropped 0x0C from unverified sender {:016x}", d.sender);
+            return Err(None);
+        }
+        if !is_ipv4_discovery_packet(d.ipv4) {
+            stats.drop_not_discovery.fetch_add(1, Ordering::Relaxed);
+            return Err(None);
+        }
+        let mut h = Sha256::new();
+        h.update(d.sender.to_be_bytes());
+        h.update(d.ipv4);
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&h.finalize()[..16]);
+        self.rx_seen.retain(|_, t| now.duration_since(*t) < RX_DEDUP_TTL);
+        if self.rx_seen.insert(key, now).is_some() {
+            stats.drop_duplicate.fetch_add(1, Ordering::Relaxed);
+            return Err(None);
+        }
+        stats.rx_accepted.fetch_add(1, Ordering::Relaxed);
+        Ok(d.ipv4.to_vec())
     }
 }
 
@@ -209,41 +309,16 @@ async fn ensure_keys(state: &CoreState, secure: &Mutex<SecureSession>, relay_pk:
     let Some(sk) = state.identity.read().await.as_ref().map(|i| i.secret_key) else { return false };
     let own_id = sdisc::wire_id(device_id);
     let Some(keys) = sdisc::derive_keys(&sk, own_id, relay_pk) else {
-        warn!("discovery: relay key is invalid (low-order) — secure discovery unavailable");
+        warn!("discovery: relay key is invalid (low-order) — no secure discovery through that relay");
         return false;
     };
-    info!("discovery: secure discovery (sdisc v1) keys derived for the current relay");
-    secure.lock().unwrap().bound = Some(Bound { relay_pk: *relay_pk, device_id: device_id.to_string(), own_id, keys, rx_last: 0 });
+    info!("discovery: secure discovery (sdisc v1) keys derived for a relay");
+    secure.lock().unwrap().bind(*relay_pk, Bound { device_id: device_id.to_string(), own_id, keys, addr: None, rx_last: 0 });
     true
 }
 
 fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-/// Verify a datagram received on UDP 21032 in secure mode.  Returns the
-/// IPv4 discovery packet to inject; updates the replay state and counters.
-/// `Err(Some(reason))`: failed verification; `Err(None)`: verified, but not
-/// a discovery packet or from a sender the relay could not authenticate.
-/// Every drop is counted here.
-fn accept_secure(session: &mut Bound, stats: &SdiscStats, pkt: &[u8], now_ms: u64) -> Result<Vec<u8>, Option<DropReason>> {
-    let d = sdisc::verify_deliver(&session.keys, session.own_id, pkt, now_ms, session.rx_last).map_err(|r| {
-        stats.count_drop(r);
-        Some(r)
-    })?;
-    session.rx_last = d.counter;
-    if !d.sender_verified {
-        // The relay forwarded a sender it could not authenticate.
-        stats.drop_unverified_sender.fetch_add(1, Ordering::Relaxed);
-        debug!("discovery: dropped 0x0C from unverified sender {:016x}", d.sender);
-        return Err(None);
-    }
-    if !is_ipv4_discovery_packet(d.ipv4) {
-        stats.drop_not_discovery.fetch_add(1, Ordering::Relaxed);
-        return Err(None);
-    }
-    stats.rx_accepted.fetch_add(1, Ordering::Relaxed);
-    Ok(d.ipv4.to_vec())
 }
 
 async fn rx_loop(sock: Arc<UdpSocket>, tun_tx: mpsc::Sender<Vec<u8>>, state: Arc<CoreState>, secure: Arc<Mutex<SecureSession>>) {
@@ -257,18 +332,10 @@ async fn rx_loop(sock: Arc<UdpSocket>, tun_tx: mpsc::Sender<Vec<u8>>, state: Arc
                 continue;
             }
         };
-        let ctx = secure_ctx(&state).await;
-        let Some(relay_pk) = ctx.relay_pk else {
-            debug!("discovery: dropped {} B from {} (relay has no secure discovery)", len, src);
-            continue;
-        };
-        if !ensure_keys(&state, &secure, &relay_pk, &ctx.device_id).await {
-            continue;
-        }
+        let device_id = state.net.read().await.local_device_id.clone();
         let pkt = {
             let mut s = secure.lock().unwrap();
-            let Some(bound) = s.current(&relay_pk, &ctx.device_id) else { continue };
-            match accept_secure(bound, &state.sdisc_stats, &buf[..len], unix_ms()) {
+            match s.accept(&device_id, unmap_addr(src), &state.sdisc_stats, &buf[..len], unix_ms(), Instant::now()) {
                 Ok(ip) => ip,
                 Err(None) => continue,
                 Err(Some(r)) => {
@@ -321,75 +388,187 @@ impl TxState {
 async fn tx_loop(mut rx: mpsc::Receiver<Vec<u8>>, sock: Arc<UdpSocket>, state: Arc<CoreState>, secure: Arc<Mutex<SecureSession>>) {
     let mut st = TxState::default();
     while let Some(mut pkt) = rx.recv().await {
-        let SecureCtx { relay, relay_pk, room, device_id } = secure_ctx(&state).await;
-        // Discovery needs a relay with secure discovery.
-        let (Some(relay), Some(room), Some(relay_pk)) = (relay, room, relay_pk) else { continue };
-        if device_id.is_empty() {
-            continue;
-        }
+        // Set by the registration loop while in a room with a secure relay.
+        let Some(route) = secure.lock().unwrap().route.clone() else { continue };
         if needs_msst_rewrite(&pkt) {
             let Some(vip) = vpn_ipv4(&state).await else { continue };
             rewrite_for_msst_broadcast(&mut pkt, vip);
         }
         let now = Instant::now();
-        if st.is_duplicate(&device_id, &pkt, now) || st.is_rate_limited(&device_id, now) {
+        if st.is_duplicate(&route.device_id, &pkt, now) || st.is_rate_limited(&route.device_id, now) {
             continue;
         }
-        if !ensure_keys(&state, &secure, &relay_pk, &device_id).await {
-            continue;
-        }
-        let frame = {
+        // The same packet to every relay a room member uses: each relay
+        // delivers it to the members registered with it.
+        let frames: Vec<(SocketAddr, Vec<u8>)> = {
             let mut s = secure.lock().unwrap();
-            let counter = s.next_counter();
-            let Some(bound) = s.current(&relay_pk, &device_id) else { continue };
-            let Some(frame) = sdisc::build_client_packet(&bound.keys, bound.own_id, counter, &room, Some(&pkt)) else {
-                debug!("discovery: room ID {:?} not valid for secure discovery", room);
-                continue;
-            };
-            state.sdisc_stats.tx_data.fetch_add(1, Ordering::Relaxed);
-            frame
+            let mut out = Vec::with_capacity(route.targets.len());
+            for t in &route.targets {
+                let counter = s.next_counter();
+                let Some(bound) = s.current(&t.relay_pk, &route.device_id) else { continue };
+                let Some(frame) = sdisc::build_client_packet(&bound.keys, bound.own_id, counter, &route.room, Some(&pkt)) else {
+                    debug!("discovery: room ID {:?} not valid for secure discovery", route.room);
+                    break;
+                };
+                state.sdisc_stats.tx_data.fetch_add(1, Ordering::Relaxed);
+                out.push((t.addr, frame));
+            }
+            out
         };
-        let Some(target) = crate::relay::resolve_addr(&relay).await else { continue };
-        if let Err(e) = sock.send_to(&frame, map_send_addr(target)).await {
-            warn!("discovery: send to relay failed: {}", e);
+        for (addr, frame) in frames {
+            if let Err(e) = sock.send_to(&frame, map_send_addr(addr)).await {
+                warn!("discovery: send to relay {} failed: {}", addr, e);
+            }
         }
     }
 }
 
-/// `0x0A` per [`RegisterSchedule`], only while in a room (the relay finds
-/// our key through the room's peer list).
+/// The relays discovery goes to: ours, plus each room member's relay
+/// (from its `relay:` endpoint), identified by key through the relay list.
+/// Members on a relay we have no key for (not listed, or listed without a
+/// key) can't be reached; the second value says whether one was seen, so
+/// the list can be refreshed.  Each relay appears once, at an address we
+/// can reach.
+fn plan_targets(own: Option<Target>, peer_relays: &[SocketAddr], known: &[KnownRelay], v6_ok: bool) -> (Vec<Target>, bool) {
+    let reachable = |a: &SocketAddr| a.is_ipv4() || v6_ok;
+    let mut targets: Vec<Target> = own.into_iter().collect();
+    let mut unknown = false;
+    for &peer_relay in peer_relays {
+        let Some(relay) = known.iter().find(|k| k.addrs.contains(&peer_relay)) else {
+            unknown = true;
+            continue;
+        };
+        if targets.iter().any(|t| t.relay_pk == relay.pub_key) {
+            continue;
+        }
+        let addr = if reachable(&peer_relay) { Some(peer_relay) } else { relay.addrs.iter().copied().find(reachable) };
+        if let Some(addr) = addr {
+            targets.push(Target { relay_pk: relay.pub_key, addr });
+        }
+    }
+    (targets, unknown)
+}
+
+/// The relay list as last fetched, for [`plan_targets`].
+#[derive(Default)]
+struct RelayDirectory {
+    relays: Vec<KnownRelay>,
+    fetched_at: Option<Instant>,
+}
+
+impl RelayDirectory {
+    /// Fetch when a member's relay isn't known (at most every
+    /// `RELAY_LIST_RETRY`), and refresh every `RELAY_LIST_MAX_AGE`.
+    fn due(&self, unknown: bool, now: Instant) -> bool {
+        match self.fetched_at {
+            None => unknown,
+            Some(t) => {
+                let age = now.duration_since(t);
+                (unknown && age >= RELAY_LIST_RETRY) || age >= RELAY_LIST_MAX_AGE
+            }
+        }
+    }
+
+    async fn refresh(&mut self, state: &CoreState, now: Instant) {
+        self.fetched_at = Some(now);
+        let Some(client) = state.coordinator.get() else { return };
+        match tokio::time::timeout(RELAY_LIST_TIMEOUT, crate::relay::fetch_known_relays(client.http(), client.coord_url())).await {
+            Ok(Ok(relays)) => self.relays = relays,
+            Ok(Err(e)) => debug!("discovery: relay list unavailable: {}", e),
+            Err(_) => debug!("discovery: relay list request timed out"),
+        }
+    }
+}
+
+/// What discovery needs to know about the room, per tick.
+struct RoomCtx {
+    room: Option<String>,
+    device_id: String,
+    own: Option<(String, [u8; 32])>,
+    peer_relays: Vec<SocketAddr>,
+}
+
+async fn room_ctx(state: &CoreState) -> RoomCtx {
+    let net = state.net.read().await;
+    let mut peer_relays: Vec<SocketAddr> = net
+        .room_peers
+        .iter()
+        .filter_map(|id| net.peer_list.get(id)?.preferred_relay.as_deref()?.parse::<SocketAddr>().ok())
+        .map(unmap_addr)
+        .collect();
+    peer_relays.sort_unstable();
+    peer_relays.dedup();
+    RoomCtx {
+        room: net.joined_rooms.keys().next().cloned(),
+        device_id: net.local_device_id.clone(),
+        own: net.relay_addr.clone().zip(net.relay_pub_key),
+        peer_relays,
+    }
+}
+
+/// Every second: work out the relays discovery goes to (the route), and
+/// send `0x0A` to each per its own [`RegisterSchedule`] — only while in a
+/// room (the relay finds our key through the room's peer list).
 async fn registration_loop(sock: Arc<UdpSocket>, state: Arc<CoreState>, secure: Arc<Mutex<SecureSession>>) {
     let mut ticker = tokio::time::interval(REGISTER_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut schedule = RegisterSchedule::default();
-    let start = Instant::now();
+    let mut schedules: HashMap<[u8; 32], RegisterSchedule<(SocketAddr, String)>> = HashMap::new();
+    let mut directory = RelayDirectory::default();
+    let mut start = None;
     loop {
-        ticker.tick().await;
-        let SecureCtx { relay, relay_pk, room, device_id: id } = secure_ctx(&state).await;
-        let now_ms = start.elapsed().as_millis() as u64;
-        let target = match (&relay, &room, relay_pk) {
-            (Some(r), Some(room), Some(pk)) if !id.is_empty() => Some((r.clone(), room.clone(), pk)),
-            _ => None,
-        };
-        let Some(relay_pk) = relay_pk else {
-            schedule.poll(None, now_ms);
+        // Scheduled tick time, so a slow relay-list fetch doesn't shift
+        // the 1 s retry to the next tick.
+        let tick = ticker.tick().await;
+        let now_ms = tick.duration_since(*start.get_or_insert(tick)).as_millis() as u64;
+        let RoomCtx { room, device_id, own, peer_relays } = room_ctx(&state).await;
+        let Some(room) = room.filter(|_| !device_id.is_empty()) else {
+            schedules.clear();
+            secure.lock().unwrap().route = None;
+            state.sdisc_stats.set_relays(Vec::new());
             continue;
         };
-        if !schedule.poll(target, now_ms) || !ensure_keys(&state, &secure, &relay_pk, &id).await {
-            continue;
+        let own = match own {
+            Some((addr, relay_pk)) => crate::relay::resolve_addr(&addr).await.map(|a| Target { relay_pk, addr: unmap_addr(a) }),
+            None => None,
+        };
+        let v6_ok = crate::ip::ipv6_available();
+        let (mut targets, unknown) = plan_targets(own.clone(), &peer_relays, &directory.relays, v6_ok);
+        let now = Instant::now();
+        if directory.due(unknown, now) {
+            directory.refresh(&state, now).await;
+            targets = plan_targets(own, &peer_relays, &directory.relays, v6_ok).0;
         }
-        let pkt = {
+        let mut usable = Vec::with_capacity(targets.len());
+        for t in targets {
+            if ensure_keys(&state, &secure, &t.relay_pk, &device_id).await {
+                usable.push(t);
+            }
+        }
+        state.sdisc_stats.set_relays(usable.iter().map(|t| t.addr.to_string()).collect());
+        schedules.retain(|pk, _| usable.iter().any(|t| &t.relay_pk == pk));
+
+        let mut packets = Vec::new();
+        {
             let mut s = secure.lock().unwrap();
-            let counter = s.next_counter();
-            let Some(bound) = s.current(&relay_pk, &id) else { continue };
-            let Some(pkt) = sdisc::build_client_packet(&bound.keys, bound.own_id, counter, room.as_deref().unwrap_or(""), None) else { continue };
-            state.sdisc_stats.tx_register.fetch_add(1, Ordering::Relaxed);
-            pkt
-        };
-        let Some(relay) = relay else { continue };
-        let Some(target) = crate::relay::resolve_addr(&relay).await else { continue };
-        if let Err(e) = sock.send_to(&pkt, map_send_addr(target)).await {
-            debug!("discovery: register send failed: {}", e);
+            for t in &usable {
+                if let Some(b) = s.bound.get_mut(&t.relay_pk) {
+                    b.addr = Some(t.addr);
+                }
+                if !schedules.entry(t.relay_pk).or_default().poll(Some((t.addr, room.clone())), now_ms) {
+                    continue;
+                }
+                let counter = s.next_counter();
+                let Some(bound) = s.current(&t.relay_pk, &device_id) else { continue };
+                let Some(pkt) = sdisc::build_client_packet(&bound.keys, bound.own_id, counter, &room, None) else { continue };
+                state.sdisc_stats.tx_register.fetch_add(1, Ordering::Relaxed);
+                packets.push((t.addr, pkt));
+            }
+            s.route = (!usable.is_empty()).then(|| Route { room: room.clone(), device_id: device_id.clone(), targets: usable });
+        }
+        for (addr, pkt) in packets {
+            if let Err(e) = sock.send_to(&pkt, map_send_addr(addr)).await {
+                debug!("discovery: register send to {} failed: {}", addr, e);
+            }
         }
     }
 }
@@ -525,12 +704,29 @@ mod tests {
 
     use x25519_dalek::{PublicKey, StaticSecret};
 
-    /// Session as both sides of the spec vectors see it: device key 1×32,
-    /// relay key 2×32, device-a1b2c3d4.
-    fn vector_session() -> (Bound, SdiscKeys) {
-        let relay_pk = *PublicKey::from(&StaticSecret::from([2u8; 32])).as_bytes();
-        let keys = sdisc::derive_keys(&[1u8; 32], 0xa1b2c3d4, &relay_pk).unwrap();
-        (Bound { relay_pk, device_id: "device-a1b2c3d4".into(), own_id: 0xa1b2c3d4, keys: keys.clone(), rx_last: 0 }, keys)
+    const DEV: &str = "device-a1b2c3d4";
+
+    fn relay_pk(seed: u8) -> [u8; 32] {
+        *PublicKey::from(&StaticSecret::from([seed; 32])).as_bytes()
+    }
+
+    fn relay_addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, n], 7000))
+    }
+
+    /// Session as both sides of the spec vectors see it — device key 1×32,
+    /// device-a1b2c3d4 — bound to the relays with private keys `seeds`
+    /// (2×32 is the spec relay), relay `seed` at 10.0.0.`seed`.  Returns
+    /// each relay's keys.
+    fn session(seeds: &[u8]) -> (SecureSession, Vec<SdiscKeys>) {
+        let mut s = SecureSession::default();
+        let mut all = Vec::new();
+        for &seed in seeds {
+            let keys = sdisc::derive_keys(&[1u8; 32], 0xa1b2c3d4, &relay_pk(seed)).unwrap();
+            s.bind(relay_pk(seed), Bound { device_id: DEV.into(), own_id: 0xa1b2c3d4, keys: keys.clone(), addr: Some(relay_addr(seed)), rx_last: 0 });
+            all.push(keys);
+        }
+        (s, all)
     }
 
     fn deliver(keys: &SdiscKeys, sender: u64, flags: u8, counter: u64, ip: &[u8]) -> Vec<u8> {
@@ -539,23 +735,32 @@ mod tests {
 
     #[test]
     fn secure_rx_accepts_verified_and_counts() {
-        let (mut session, keys) = vector_session();
+        let (mut s, keys) = session(&[2]);
+        let keys = &keys[0];
         let stats = SdiscStats::default();
         let now_ms = 1_760_000_000_000u64;
+        let t = Instant::now();
+        let src = relay_addr(2);
         let mc = udp_to(Ipv4Addr::new(224, 0, 2, 60));
 
-        let p1 = deliver(&keys, 7, sdisc::FLAG_SENDER_VERIFIED, now_ms << 16, &mc);
-        assert_eq!(accept_secure(&mut session, &stats, &p1, now_ms).unwrap(), mc);
+        let p1 = deliver(keys, 7, sdisc::FLAG_SENDER_VERIFIED, now_ms << 16, &mc);
+        assert_eq!(s.accept(DEV, src, &stats, &p1, now_ms, t).unwrap(), mc);
         // Replayed → dropped; replay state unchanged by it.
-        assert_eq!(accept_secure(&mut session, &stats, &p1, now_ms), Err(Some(DropReason::Replay)));
+        assert_eq!(s.accept(DEV, src, &stats, &p1, now_ms, t), Err(Some(DropReason::Replay)));
         // Original sender not authenticated by the relay: dropped, counted.
-        let p2 = deliver(&keys, 8, 0, (now_ms << 16) + 1, &mc);
-        assert_eq!(accept_secure(&mut session, &stats, &p2, now_ms), Err(None));
+        let p2 = deliver(keys, 8, 0, (now_ms << 16) + 1, &mc);
+        assert_eq!(s.accept(DEV, src, &stats, &p2, now_ms, t), Err(None));
         // Verified frame carrying unicast: refused (no ACL bypass).
-        let p3 = deliver(&keys, 7, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + 2, &udp_to(Ipv4Addr::new(172, 22, 0, 1)));
-        assert_eq!(accept_secure(&mut session, &stats, &p3, now_ms), Err(None));
+        let p3 = deliver(keys, 7, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + 2, &udp_to(Ipv4Addr::new(172, 22, 0, 1)));
+        assert_eq!(s.accept(DEV, src, &stats, &p3, now_ms, t), Err(None));
         // Bare IPv4 is not accepted.
-        assert_eq!(accept_secure(&mut session, &stats, &mc, now_ms), Err(Some(DropReason::NotDeliver)));
+        assert_eq!(s.accept(DEV, src, &stats, &mc, now_ms, t), Err(Some(DropReason::NotDeliver)));
+        // Keys of a relay we aren't bound to: bad tag.
+        let stranger = sdisc::derive_keys(&[1u8; 32], 0xa1b2c3d4, &relay_pk(9)).unwrap();
+        let p4 = deliver(&stranger, 7, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + 3, &mc);
+        assert_eq!(s.accept(DEV, src, &stats, &p4, now_ms, t), Err(Some(DropReason::BadTag)));
+        // Bound for another device ID (identity changed): nothing to verify with.
+        assert_eq!(s.accept("device-00000001", src, &stats, &p1, now_ms, t), Err(None));
 
         let snap = stats.snapshot();
         assert_eq!(snap["rx_accepted"], 1);
@@ -563,17 +768,169 @@ mod tests {
         assert_eq!(snap["drop"]["replay"], 1);
         assert_eq!(snap["drop"]["not_discovery"], 1);
         assert_eq!(snap["drop"]["not_deliver"], 1);
+        assert_eq!(snap["drop"]["bad_tag"], 1);
+    }
+
+    #[test]
+    fn packet_through_two_relays_is_injected_once() {
+        let (mut s, keys) = session(&[2, 3]);
+        let stats = SdiscStats::default();
+        let now_ms = 1_760_000_000_000u64;
+        let t = Instant::now();
+        let mc = udp_to(Ipv4Addr::new(224, 0, 2, 60));
+        let via = |k: usize, c: u64| deliver(&keys[k], 7, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + c, &mc);
+
+        // Each relay's packet verifies, whichever address it came from.
+        assert_eq!(s.accept(DEV, relay_addr(3), &stats, &via(1, 0), now_ms, t).unwrap(), mc);
+        assert_eq!(s.accept(DEV, relay_addr(3), &stats, &via(0, 0), now_ms, t), Err(None), "copy via the other relay");
+        assert_eq!(stats.snapshot()["drop"]["duplicate"], 1);
+        // Separate replay state per relay.
+        assert_eq!(s.accept(DEV, relay_addr(2), &stats, &via(0, 0), now_ms, t), Err(Some(DropReason::Replay)));
+        // The game's next broadcast (after the window) gets through.
+        let later = t + RX_DEDUP_TTL;
+        assert_eq!(s.accept(DEV, relay_addr(2), &stats, &via(0, 1), now_ms, later).unwrap(), mc);
+        // Another sender's identical payload is not a duplicate.
+        let other = deliver(&keys[0], 8, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + 2, &mc);
+        assert_eq!(s.accept(DEV, relay_addr(2), &stats, &other, now_ms, later).unwrap(), mc);
+        assert_eq!(stats.snapshot()["drop"]["bad_tag"], 0, "trying the other relay's key is not a drop");
     }
 
     #[test]
     fn secure_session_rebinds_on_relay_or_device_change() {
-        let (session, _) = vector_session();
-        let relay_pk = session.relay_pk;
-        let mut s = SecureSession { bound: Some(session), ..Default::default() };
-        assert!(s.current(&relay_pk, "device-a1b2c3d4").is_some());
-        assert!(s.current(&[9u8; 32], "device-a1b2c3d4").is_none());
-        assert!(s.current(&relay_pk, "device-00000001").is_none());
+        let (mut s, _) = session(&[2]);
+        assert!(s.current(&relay_pk(2), DEV).is_some());
+        assert!(s.current(&relay_pk(9), DEV).is_none());
+        assert!(s.current(&relay_pk(2), "device-00000001").is_none());
         let a = s.next_counter();
         assert!(s.next_counter() > a);
+        // Bounded.
+        for seed in 10..10 + MAX_BOUND_RELAYS as u8 {
+            s.bind([seed; 32], Bound { device_id: DEV.into(), own_id: 1, keys: sdisc::derive_keys(&[1u8; 32], 1, &relay_pk(2)).unwrap(), addr: None, rx_last: 0 });
+        }
+        assert!(s.bound.len() <= MAX_BOUND_RELAYS);
+    }
+
+    #[test]
+    fn discovery_goes_to_every_relay_room_members_use() {
+        let v6 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 3], 7000));
+        let known = vec![
+            KnownRelay { addrs: vec![relay_addr(2)], pub_key: relay_pk(2) },
+            KnownRelay { addrs: vec![relay_addr(3), v6], pub_key: relay_pk(3) },
+        ];
+        let own = Some(Target { relay_pk: relay_pk(2), addr: relay_addr(2) });
+        let t = |seed: u8, addr| Target { relay_pk: relay_pk(seed), addr };
+
+        // Alone in the room, or every member on our relay: ours only.
+        assert_eq!(plan_targets(own.clone(), &[], &known, true), (vec![t(2, relay_addr(2))], false));
+        assert_eq!(plan_targets(own.clone(), &[relay_addr(2)], &known, true).0, [t(2, relay_addr(2))]);
+        // A member on the other relay, reported by its IPv6 address: added
+        // once, at an address we can reach.
+        assert_eq!(plan_targets(own.clone(), &[v6, relay_addr(3)], &known, true).0, [t(2, relay_addr(2)), t(3, v6)]);
+        assert_eq!(plan_targets(own.clone(), &[v6], &known, false).0, [t(2, relay_addr(2)), t(3, relay_addr(3))]);
+        // A relay the list doesn't know (or lists without a key): reported.
+        assert_eq!(plan_targets(own.clone(), &[relay_addr(4)], &known, true), (vec![t(2, relay_addr(2))], true));
+        // Our relay has no key: still reach members on keyed relays.
+        assert_eq!(plan_targets(None, &[relay_addr(3)], &known, true).0, [t(3, relay_addr(3))]);
+    }
+
+    #[test]
+    fn relay_list_is_fetched_when_needed_and_refreshed() {
+        let mut d = RelayDirectory::default();
+        let t = Instant::now();
+        assert!(!d.due(false, t));
+        assert!(d.due(true, t));
+        d.fetched_at = Some(t);
+        assert!(!d.due(true, t + RELAY_LIST_RETRY - Duration::from_secs(1)));
+        assert!(d.due(true, t + RELAY_LIST_RETRY));
+        assert!(!d.due(false, t + RELAY_LIST_RETRY));
+        assert!(d.due(false, t + RELAY_LIST_MAX_AGE));
+    }
+
+    /// Datagrams a fake relay receives within `window`.
+    async fn collect(relay: &UdpSocket, window: Duration) -> Vec<Vec<u8>> {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 512];
+        let end = tokio::time::Instant::now() + window;
+        while let Ok(Ok((n, _))) = tokio::time::timeout_at(end, relay.recv_from(&mut buf)).await {
+            got.push(buf[..n].to_vec());
+        }
+        got
+    }
+
+    /// The real loops: we are on relay 2, a room member on relay 3 (known
+    /// only through `GET /relays`); registration and data go to both.
+    #[tokio::test]
+    async fn loops_reach_room_members_on_another_relay() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let (r2, r3) = (UdpSocket::bind("127.0.0.1:0").await.unwrap(), UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (a2, a3) = (r2.local_addr().unwrap(), r3.local_addr().unwrap());
+        let relays = serde_json::json!({ "relays": [
+            { "addr": a2.to_string(), "pub_key": STANDARD.encode(relay_pk(2)) },
+            { "addr": a3.to_string(), "pub_key": STANDARD.encode(relay_pk(3)) },
+        ] });
+        let coord = crate::test_support::FakeCoordinator::start(
+            move |req| if req.path == "/relays" { (200, relays.clone()) } else { (404, serde_json::json!({})) },
+            |_| vec![],
+        ).await;
+        let (state, _ipc) = crate::test_support::core_state("disc-relays").await;
+        let (ev_tx, _ev_rx) = mpsc::channel(4);
+        let client = crate::coordinator::CoordinatorClient::new(crate::coordinator::CoordinatorConfig { coord_url: coord.url.clone() }, ev_tx);
+        let _ = state.coordinator.set(Arc::new(client));
+        let endpoints = [format!("relay:{}", a3)];
+        assert!(crate::nodes::apply_peer(&state, crate::nodes::PeerData {
+            device_id: "device-0000000b", ipv4: "172.22.1.1", ipv6: "fd22:2222:2222:2222::b", endpoints: &endpoints, ..Default::default()
+        }).await);
+        {
+            let mut net = state.net.write().await;
+            net.joined_rooms.insert("space-1".into(), "Room".into());
+            net.room_peers.insert("device-0000000b".into());
+            net.relay_addr = Some(a2.to_string());
+            net.relay_pub_key = Some(relay_pk(2));
+        }
+
+        let sock = Arc::new(crate::make_udp_socket(0).unwrap());
+        let secure = Arc::new(Mutex::new(SecureSession::default()));
+        let (tx, rx) = mpsc::channel(4);
+        let tasks = [
+            tokio::spawn(registration_loop(sock.clone(), state.clone(), secure.clone())),
+            tokio::spawn(tx_loop(rx, sock, state.clone(), secure)),
+        ];
+        let own_id = sdisc::wire_id("device-00000001");
+        let keys = |seed| sdisc::derive_keys(&[1u8; 32], own_id, &relay_pk(seed)).unwrap();
+        let counter = |p: &[u8]| u64::from_be_bytes(p[23..31].try_into().unwrap());
+
+        // Registration: immediately and about 1 s later, at each relay,
+        // under that relay's key.
+        let (got2, got3) = tokio::join!(collect(&r2, Duration::from_millis(1600)), collect(&r3, Duration::from_millis(1600)));
+        for (seed, got) in [(2, &got2), (3, &got3)] {
+            assert_eq!(got.len(), 2, "relay {}: {:?}", seed, got);
+            for p in got {
+                assert_eq!(*p, sdisc::build_client_packet(&keys(seed), own_id, counter(p), "space-1", None).unwrap());
+            }
+        }
+        let mut relays_used = state.sdisc_stats.snapshot()["relays"].as_array().unwrap().clone();
+        relays_used.sort_by_key(|v| v.to_string());
+        let mut expected = vec![serde_json::json!(a2.to_string()), serde_json::json!(a3.to_string())];
+        expected.sort_by_key(|v| v.to_string());
+        assert_eq!(relays_used, expected);
+
+        // A game's broadcast goes to both relays.
+        let mc = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(172, 22, 0, 1)), 4445, IpAddr::V4(Ipv4Addr::new(224, 0, 2, 60)), 4445, b"[MOTD]x[/MOTD]");
+        tx.send(mc.clone()).await.unwrap();
+        let (got2, got3) = tokio::join!(collect(&r2, Duration::from_millis(300)), collect(&r3, Duration::from_millis(300)));
+        for (seed, got) in [(2, &got2), (3, &got3)] {
+            assert_eq!(got.len(), 1, "relay {}: {:?}", seed, got);
+            assert_eq!(got[0], sdisc::build_client_packet(&keys(seed), own_id, counter(&got[0]), "space-1", Some(&mc)).unwrap());
+        }
+
+        // Leaving the room stops everything.
+        state.net.write().await.joined_rooms.clear();
+        tokio::time::sleep(REGISTER_TICK + Duration::from_millis(200)).await;
+        assert_eq!(state.sdisc_stats.snapshot()["relays"], serde_json::json!([]));
+        tx.send(mc).await.unwrap();
+        assert!(collect(&r3, Duration::from_millis(300)).await.is_empty());
+        for t in tasks {
+            t.abort();
+        }
     }
 }

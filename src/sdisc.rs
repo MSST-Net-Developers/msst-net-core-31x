@@ -203,10 +203,16 @@ pub fn seal_deliver(keys: &SdiscKeys, sender: u64, recipient: u64, flags: u8, co
 /// When to send 0x0A: on (re)targeting (relay, room or key change), again
 /// about 1 s later, then every 25 s — the relay drops the first register
 /// while it fetches the room's peer list.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RegisterSchedule<T> {
     target: Option<T>,
     next_at_ms: u64,
+}
+
+impl<T> Default for RegisterSchedule<T> {
+    fn default() -> Self {
+        RegisterSchedule { target: None, next_at_ms: 0 }
+    }
 }
 
 pub const REGISTER_RETRY_MS: u64 = 1_000;
