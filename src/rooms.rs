@@ -85,7 +85,7 @@ pub async fn create_room(state: &Arc<CoreState>, room_name: String, password: Op
         body["password_hash"] = json!(password_hash(pw));
     }
     let (status, resp) = client
-        .api_request(reqwest::Method::POST, "/room/create", Some(&body), None)
+        .api_request(reqwest::Method::POST, "/room/create", Some(&body), client.bearer().as_deref())
         .await
         .map_err(|e| err("coordinator_unavailable", e))?;
     if !(200..300).contains(&status) {

@@ -32,6 +32,10 @@ pub struct Health {
     pub ws_connected: bool,
     /// Coordinator connection state, e.g. `"Connected"`, `"AuthRequired"`.
     pub coordinator_state: String,
+    /// Credential the Coordinator connection uses: `"oidc"`, `"guest"` (no
+    /// valid MSST login: room mode only) or `"none"` (disconnected, or a
+    /// Coordinator without guest tokens).
+    pub coordinator_credential: String,
     pub tun_ready: bool,
     pub access_auth_required: bool,
     pub relay: Option<String>,

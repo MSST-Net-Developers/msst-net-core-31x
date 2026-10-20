@@ -139,6 +139,17 @@ Add `"async": true` to a command request:
   sent while a peer is `probing` — last came back through our relay,
   proving its binding works; `null` if never).  Relay
   list entries may carry `features` (passed through from the coordinator).
+- **Guest access** (no valid MSST login): Core connects to the
+  Coordinator with a guest token (`POST /auth/guest/token`) — always when
+  the device never logged in, and when the Coordinator refuses the stored
+  OIDC credentials and the refresh token too.  In the latter case
+  `AccessAuthRequired` is emitted as before, but the device stays online in
+  room mode instead of retrying the dead token forever.  A new login
+  (`AuthPoll`) or a successful refresh reconnects with OIDC at once.
+  - new `Health.coordinator_credential`: `"oidc"`, `"guest"` or `"none"`
+    (disconnected, or a Coordinator without guest tokens);
+  - `Health.is_authenticated` is now `false` while the Coordinator refuses
+    the stored credentials, even if their expiry time hasn't passed.
 - **Removed from `Health`:** `local_device_id` and `local_user_id`
   (3.1.0-alpha aliases); use `device_id` and `user_id`.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`

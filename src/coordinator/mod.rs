@@ -5,7 +5,8 @@
 //! - Device registration on every (re)connect
 //! - Re-joining rooms (`join` + `discovery_join`) after a reconnect
 //! - Node heartbeat, room keepalive and WS ping, bound to the connection
-//! - Bearer-token auth with refresh on HTTP 401
+//! - Bearer-token auth: OIDC (refreshed on HTTP 401), else a guest token
+//!   (see `credentials`)
 //! - Incoming message parsing (room_state, node events, punch requests)
 //!
 //! ## Protocol contract
@@ -17,8 +18,9 @@
 //!
 //! ```text
 //! run(state) loop:
-//!     connect (Authorization: Bearer <token>)
+//!     connect (Authorization: Bearer <OIDC token>)
 //!       ├── 401 → refresh token → retry once → else AccessAuthRequired
+//!       │         and connect as a guest (Bearer <guest token>)
 //!       └── ok  → new per-connection channel
 //!                 ├── send register
 //!                 ├── re-join rooms in NetState::joined_rooms
@@ -27,17 +29,20 @@
 //!     disconnect → drop channel (send() now fails fast) → backoff → retry
 //! ```
 
+pub mod credentials;
 pub mod keyproof;
 pub mod messages;
 
 use crate::identity::{self, Identity};
 use crate::state::CoreState;
 use futures_util::{SinkExt, StreamExt};
+use credentials::{Credential, GuestToken, Refresh};
 use messages::*;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
@@ -82,6 +87,16 @@ pub struct CoordinatorClient {
     event_tx: mpsc::Sender<CoordinatorEvent>,
     /// Current connection state.
     state: RwLock<ConnectionState>,
+    /// The Coordinator refused the stored OIDC credentials and the refresh
+    /// token too: connect as a guest until a refresh or a new login.
+    oidc_rejected: AtomicBool,
+    /// The guest token in use (memory only).
+    guest: std::sync::Mutex<Option<GuestToken>>,
+    /// The credential of the current connection (`None`: disconnected, or
+    /// connected without one).  Also used for the HTTP API.
+    credential: std::sync::RwLock<Option<Credential>>,
+    /// Drops the current connection so the next one uses new credentials.
+    reconnect: Notify,
 }
 
 /// The current state of the Coordinator connection.
@@ -164,6 +179,8 @@ pub enum CoordinatorEvent {
     },
 }
 
+type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 /// Outcome of a single connection attempt.
 enum ConnectOutcome {
     /// Connected, ran until the connection dropped.
@@ -188,7 +205,127 @@ impl CoordinatorClient {
             conn_tx: RwLock::new(None),
             event_tx,
             state: RwLock::new(ConnectionState::Disconnected),
+            oidc_rejected: AtomicBool::new(false),
+            guest: std::sync::Mutex::new(None),
+            credential: std::sync::RwLock::new(None),
+            reconnect: Notify::new(),
         }
+    }
+
+    // ── Credentials ────────────────────────────────────────────────────────
+
+    /// Bearer token for HTTP API calls: the current connection's credential.
+    pub fn bearer(&self) -> Option<String> {
+        self.credential.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|c| c.token().to_string())
+    }
+
+    /// `Health.coordinator_credential`: `oidc`, `guest` or `none`.
+    pub fn credential_kind(&self) -> &'static str {
+        self.credential.read().unwrap_or_else(|e| e.into_inner()).as_ref().map_or("none", Credential::kind)
+    }
+
+    /// Whether the Coordinator refused the stored OIDC credentials.
+    pub fn oidc_rejected(&self) -> bool {
+        self.oidc_rejected.load(Ordering::SeqCst)
+    }
+
+    /// New or refreshed OIDC credentials: use them again, and if the current
+    /// connection doesn't, reconnect so the Coordinator sees them.
+    pub async fn credentials_changed(&self, core: &Arc<CoreState>) {
+        self.oidc_rejected.store(false, Ordering::SeqCst);
+        core.net.write().await.local_authenticated = core.identity.read().await.as_ref().is_some_and(|i| i.auth.is_some());
+        if !matches!(*self.credential.read().unwrap_or_else(|e| e.into_inner()), Some(Credential::Oidc(_))) {
+            info!("coordinator: reconnecting with the new credentials");
+            self.reconnect.notify_waiters();
+        }
+    }
+
+    /// The guest token to connect with: the cached one unless `renew`, else
+    /// a new one from `POST /auth/guest/token`.  `Ok(None)`: the Coordinator
+    /// doesn't issue guest tokens (connect without a credential).
+    async fn guest_token(&self, renew: bool) -> Result<Option<GuestToken>, String> {
+        let now = unix_now();
+        if !renew {
+            if let Some(g) = self.guest.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|g| g.usable(now)) {
+                return Ok(Some(g.clone()));
+            }
+        }
+        let (status, body) = self.api_request(reqwest::Method::POST, "/auth/guest/token", None, None).await?;
+        if status == 404 || status == 405 {
+            info!("coordinator: no guest tokens on this coordinator — connecting without credentials");
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("POST /auth/guest/token returned {}", status));
+        }
+        let g = GuestToken::from_response(&body).ok_or("POST /auth/guest/token returned no token")?;
+        info!("coordinator: guest token issued ({}, expires_at={})", g.user_id, g.expires_at);
+        *self.guest.lock().unwrap_or_else(|e| e.into_inner()) = Some(g.clone());
+        Ok(Some(g))
+    }
+
+    /// Open the WS with the best credential (see `credentials`).
+    async fn open_authenticated(&self, core: &Arc<CoreState>, ws_url: &str) -> Result<(WsStream, Option<Credential>), ConnectOutcome> {
+        // 1. OIDC, unless the Coordinator already refused it.
+        let oidc = || async { core.identity.read().await.as_ref().and_then(access_token) };
+        if !self.oidc_rejected() {
+            if let Some(token) = oidc().await {
+                match self.open_ws(ws_url, Some(&token)).await {
+                    Ok(s) => return Ok((s, Some(Credential::Oidc(token)))),
+                    Err(e) if !is_auth_required_error(&e) => return Err(self.failed(core, e).await),
+                    Err(_) => {}
+                }
+                info!("coordinator: HTTP 401 — attempting token refresh before re-auth prompt");
+                match self.refresh_token(core).await {
+                    Refresh::Refreshed => {
+                        let token = oidc().await.unwrap_or_default();
+                        match self.open_ws(ws_url, Some(&token)).await {
+                            Ok(s) => return Ok((s, Some(Credential::Oidc(token)))),
+                            Err(e) if !is_auth_required_error(&e) => return Err(self.failed(core, e).await),
+                            Err(_) => {}
+                        }
+                    }
+                    // Can't tell whether the credentials are dead: retry later.
+                    Refresh::Unavailable => {
+                        self.set_state(core, ConnectionState::Disconnected).await;
+                        return Err(ConnectOutcome::Failed);
+                    }
+                    Refresh::Rejected => {}
+                }
+                warn!("coordinator: MSST access authentication required (token refresh did not resolve 401) — continuing as a guest (room mode only)");
+                self.oidc_rejected.store(true, Ordering::SeqCst);
+                core.net.write().await.local_authenticated = false;
+                self.report_auth_required(core);
+            }
+        }
+
+        // 2. Guest token; a 401 means the Coordinator forgot it (restart).
+        for renew in [false, true] {
+            let guest = match self.guest_token(renew).await {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!("coordinator: cannot get a guest token: {}", e);
+                    self.set_state(core, ConnectionState::Disconnected).await;
+                    return Err(ConnectOutcome::Failed);
+                }
+            };
+            let token = guest.map(|g| g.token);
+            match self.open_ws(ws_url, token.as_deref()).await {
+                Ok(s) => return Ok((s, token.map(Credential::Guest))),
+                Err(e) if !is_auth_required_error(&e) => return Err(self.failed(core, e).await),
+                Err(_) if token.is_some() && !renew => info!("coordinator: guest token rejected — requesting a new one"),
+                Err(_) => break,
+            }
+        }
+        warn!("coordinator: guest access refused (HTTP 401)");
+        self.set_state(core, ConnectionState::AuthRequired).await;
+        Err(ConnectOutcome::AuthRequired)
+    }
+
+    async fn failed(&self, core: &Arc<CoreState>, e: tokio_tungstenite::tungstenite::Error) -> ConnectOutcome {
+        warn!("coordinator: connection failed: {}", e);
+        self.set_state(core, ConnectionState::Disconnected).await;
+        ConnectOutcome::Failed
     }
 
     // ── Connection loop ────────────────────────────────────────────────────
@@ -295,29 +432,12 @@ impl CoordinatorClient {
         info!("coordinator: connecting to {}", ws_url);
         self.set_state(core, ConnectionState::Connecting).await;
 
-        let mut result = self.open_ws(&ws_url, access_token(&identity).as_deref()).await;
-        if matches!(&result, Err(e) if is_auth_required_error(e)) {
-            info!("coordinator: HTTP 401 — attempting token refresh before re-auth prompt");
-            if self.try_refresh_token(core).await {
-                let token = core.identity.read().await.as_ref().and_then(access_token);
-                result = self.open_ws(&ws_url, token.as_deref()).await;
-            }
-        }
-
-        let ws_stream = match result {
-            Ok(s) => s,
-            Err(e) if is_auth_required_error(&e) => {
-                warn!("coordinator: MSST access authentication required (token refresh did not resolve 401)");
-                self.set_state(core, ConnectionState::AuthRequired).await;
-                return ConnectOutcome::AuthRequired;
-            }
-            Err(e) => {
-                warn!("coordinator: connection failed: {}", e);
-                self.set_state(core, ConnectionState::Disconnected).await;
-                return ConnectOutcome::Failed;
-            }
+        let (ws_stream, credential) = match self.open_authenticated(core, &ws_url).await {
+            Ok(v) => v,
+            Err(outcome) => return outcome,
         };
-        info!("coordinator: WebSocket connected");
+        info!("coordinator: WebSocket connected ({})", credential.as_ref().map_or("no credential", Credential::kind));
+        *self.credential.write().unwrap_or_else(|e| e.into_inner()) = credential;
 
         // Key proof (keyproof v1): one fresh challenge per registration,
         // requested after the WS is open so it can't expire in between.
@@ -354,7 +474,14 @@ impl CoordinatorClient {
         let writer_task = tokio::spawn(writer_loop(ws_writer, rx, core.clone()));
 
         let mut outcome = ConnectOutcome::Disconnected;
-        while let Some(msg) = ws_reader.next().await {
+        loop {
+            let msg = tokio::select! {
+                m = ws_reader.next() => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+                _ = self.reconnect.notified() => break,
+            };
             match msg {
                 Ok(Message::Text(text)) => match self.parse_incoming(&text) {
                     Ok(Some(CoordinatorEvent::Error { code: Some(code), .. }))
@@ -397,19 +524,13 @@ impl CoordinatorClient {
         }
 
         *self.conn_tx.write().await = None;
+        *self.credential.write().unwrap_or_else(|e| e.into_inner()) = None;
         writer_task.abort();
         self.set_state(core, ConnectionState::Disconnected).await;
         outcome
     }
 
-    async fn open_ws(
-        &self,
-        ws_url: &str,
-        token: Option<&str>,
-    ) -> Result<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-        tokio_tungstenite::tungstenite::Error,
-    > {
+    async fn open_ws(&self, ws_url: &str, token: Option<&str>) -> Result<WsStream, tokio_tungstenite::tungstenite::Error> {
         // Connect the TCP stream ourselves so it can be protected from the
         // device's VPN (embedded Core), then do TLS + the WS handshake on it.
         let req = build_ws_request(ws_url, token)?;
@@ -425,6 +546,12 @@ impl CoordinatorClient {
     /// On success the identity is updated and persisted.  Returns `true` if a
     /// fresh access token is now available.
     pub async fn try_refresh_token(&self, core: &Arc<CoreState>) -> bool {
+        self.refresh_token(core).await == Refresh::Refreshed
+    }
+
+    /// [`try_refresh_token`](Self::try_refresh_token), telling apart a
+    /// refresh the IdP refused from one that could not be attempted.
+    async fn refresh_token(&self, core: &Arc<CoreState>) -> Refresh {
         let refresh_token = core
             .identity
             .read()
@@ -435,7 +562,7 @@ impl CoordinatorClient {
             .filter(|t| !t.is_empty());
         let Some(refresh_token) = refresh_token else {
             debug!("try_refresh_token: no refresh token available");
-            return false;
+            return Refresh::Rejected;
         };
 
         let url = format!("{}/auth/token/refresh", self.config.coord_url.trim_end_matches('/'));
@@ -449,26 +576,26 @@ impl CoordinatorClient {
             Ok(r) => r,
             Err(e) => {
                 warn!("token refresh request failed: {}", e);
-                return false;
+                return Refresh::Unavailable;
             }
         };
         if !resp.status().is_success() {
             warn!("token refresh failed (HTTP {})", resp.status());
-            return false;
+            return if resp.status().is_client_error() { Refresh::Rejected } else { Refresh::Unavailable };
         }
         let body: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
                 warn!("token refresh response decode error: {}", e);
-                return false;
+                return Refresh::Unavailable;
             }
         };
 
         let mut guard = core.identity.write().await;
-        let Some(id) = guard.as_mut() else { return false };
+        let Some(id) = guard.as_mut() else { return Refresh::Unavailable };
         if !apply_token_refresh(id, &body) {
             warn!("token refresh response contained no access_token");
-            return false;
+            return Refresh::Unavailable;
         }
         if let Err(e) = identity::save(&core.data_dir, id) {
             warn!("failed to persist refreshed token: {}", e);
@@ -478,7 +605,9 @@ impl CoordinatorClient {
             "OIDC token refreshed; expires_at={}",
             id.auth.as_ref().map(|a| a.expires_at).unwrap_or(0)
         );
-        true
+        drop(guard);
+        self.credentials_changed(core).await;
+        Refresh::Refreshed
     }
 
     // ── Outgoing messages ──────────────────────────────────────────────────
@@ -535,7 +664,11 @@ impl CoordinatorClient {
     /// `POST <coord_url><path>` with a JSON body; errors on non-2xx.
     pub async fn api_post(&self, path: &str, body: &Value) -> Result<(), String> {
         let url = format!("{}{}", self.config.coord_url.trim_end_matches('/'), path);
-        let resp = self.http.post(&url).json(body).timeout(Duration::from_secs(10)).send().await.map_err(|e| e.to_string())?;
+        let mut req = self.http.post(&url).json(body).timeout(Duration::from_secs(10));
+        if let Some(t) = self.bearer() {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -1298,5 +1431,149 @@ mod tests {
         let json = r#"{"type":"member_left","data":{"device_id":"device-aabbccdd"}}"#;
         assert!(matches!(client.parse_incoming(json).unwrap().unwrap(),
             CoordinatorEvent::MemberLeft { device_id, .. } if device_id == "device-aabbccdd"));
+    }
+
+    // ── Credentials: OIDC → guest token ───────────────────────────────────
+
+    use crate::test_support::{core_state, FakeCoordinator};
+    use std::collections::HashSet;
+
+    type Allowed = Arc<std::sync::Mutex<HashSet<String>>>;
+
+    fn allow(tokens: &[&str]) -> Allowed {
+        Arc::new(std::sync::Mutex::new(tokens.iter().map(|t| t.to_string()).collect()))
+    }
+
+    /// A coordinator whose WS accepts the `allowed` bearer tokens (and none
+    /// without a token); refresh answers `refresh_status`; each guest token
+    /// request gets the next of `guests`.
+    async fn auth_coordinator(allowed: Allowed, refresh_status: u16, guests: &[&str]) -> FakeCoordinator {
+        let guests: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(guests.iter().rev().map(|g| g.to_string()).collect()));
+        FakeCoordinator::start_with_ws_auth(
+            move |req| match req.path.as_str() {
+                "/auth/token/refresh" => (refresh_status, json!({})),
+                "/auth/guest/token" => match guests.lock().unwrap().pop() {
+                    Some(g) => (200, json!({ "token": g, "user_id": "guest-0000000a", "expires_at": unix_now() + 86_400 })),
+                    None => (404, json!({})),
+                },
+                _ => (404, json!({})),
+            },
+            |_| vec![],
+            move |t| t.is_some_and(|t| allowed.lock().unwrap().contains(t)),
+        )
+        .await
+    }
+
+    async fn start_client(core: &Arc<CoreState>, url: &str) -> (Arc<CoordinatorClient>, tokio::task::JoinHandle<()>) {
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let client = Arc::new(CoordinatorClient::new(CoordinatorConfig { coord_url: url.into() }, event_tx));
+        let runner = {
+            let (client, core) = (client.clone(), core.clone());
+            tokio::spawn(async move { client.run(core).await })
+        };
+        (client, runner)
+    }
+
+    async fn set_oidc(core: &Arc<CoreState>, token: &str) {
+        let mut id = core.identity.write().await;
+        id.as_mut().unwrap().auth = Some(crate::identity::AuthCredentials {
+            user_id: "user-00000001".into(),
+            access_token: token.into(),
+            refresh_token: "rt".into(),
+            expires_at: unix_now() + 3600,
+        });
+        drop(id);
+        core.net.write().await.local_authenticated = true;
+    }
+
+    async fn wait_for(mut f: impl FnMut() -> bool) {
+        for _ in 0..250 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    #[tokio::test]
+    async fn rejected_oidc_falls_back_to_a_guest_token_and_back_after_login() {
+        let allowed = allow(&["g1"]);
+        let coord = auth_coordinator(allowed.clone(), 401, &["g1"]).await;
+        let (core, _ipc) = core_state("coord-guest").await;
+        set_oidc(&core, "stale").await;
+        let (client, runner) = start_client(&core, &coord.url).await;
+
+        wait_for(|| client.credential_kind() == "guest").await;
+        assert!(client.oidc_rejected());
+        assert!(core.access_auth_required.load(Ordering::SeqCst));
+        assert!(!core.net.read().await.local_authenticated, "room-mode rules apply");
+        let attempts: Vec<(Option<String>, bool)> = coord.ws_auth_log.lock().unwrap().clone();
+        // Refused once; the refresh was refused too, so no second try with it.
+        assert_eq!(attempts, [(Some("stale".into()), false), (Some("g1".into()), true)]);
+        assert!(coord.ws_types().contains(&"register".to_string()));
+
+        // The HTTP API uses the same credential (it used to send none).
+        client.api_post("/device/endpoint", &json!({ "deviceId": "device-00000001", "endpoints": [] })).await.ok();
+        let ep = coord.http_log.lock().unwrap().iter().rev().find(|r| r.path == "/device/endpoint").cloned().unwrap();
+        assert_eq!(ep.authorization.as_deref(), Some("Bearer g1"));
+
+        // Logging in again: reconnect with the new OIDC token at once.
+        allowed.lock().unwrap().insert("fresh".into());
+        set_oidc(&core, "fresh").await;
+        client.credentials_changed(&core).await;
+        wait_for(|| client.credential_kind() == "oidc").await;
+        assert!(!client.oidc_rejected());
+        assert_eq!(coord.ws_accepted_tokens().last().cloned().flatten().as_deref(), Some("fresh"));
+        assert_eq!(client.bearer().as_deref(), Some("fresh"));
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn forgotten_guest_token_is_replaced() {
+        // Never logged in: straight to a guest token.
+        let allowed = allow(&["g1"]);
+        let coord = auth_coordinator(allowed.clone(), 401, &["g1", "g2"]).await;
+        let (core, _ipc) = core_state("coord-guest-renew").await;
+        let (client, runner) = start_client(&core, &coord.url).await;
+        wait_for(|| client.credential_kind() == "guest").await;
+        assert_eq!(client.bearer().as_deref(), Some("g1"));
+        assert!(!client.oidc_rejected(), "nothing was rejected");
+
+        // The coordinator restarts (guest tokens are in memory): the cached
+        // token is refused once, then a new one is used.
+        *allowed.lock().unwrap() = ["g2".to_string()].into();
+        client.reconnect.notify_waiters();
+        wait_for(|| client.bearer().as_deref() == Some("g2")).await;
+        let attempts: Vec<Option<String>> = coord.ws_auth_log.lock().unwrap().iter().map(|(t, _)| t.clone()).collect();
+        assert_eq!(attempts, [Some("g1".into()), Some("g1".into()), Some("g2".into())]);
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_refresh_keeps_the_oidc_credentials() {
+        // The IdP is down (5xx): don't give up on the login.
+        let coord = auth_coordinator(allow(&[]), 503, &["g1"]).await;
+        let (core, _ipc) = core_state("coord-refresh-down").await;
+        set_oidc(&core, "stale").await;
+        let (client, runner) = start_client(&core, &coord.url).await;
+        wait_for(|| coord.http_log.lock().unwrap().iter().any(|r| r.path == "/auth/token/refresh")).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!client.oidc_rejected());
+        assert_eq!(client.credential_kind(), "none");
+        assert!(!coord.http_log.lock().unwrap().iter().any(|r| r.path == "/auth/guest/token"));
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn coordinator_without_guest_tokens_is_joined_without_credentials() {
+        let coord = FakeCoordinator::start(|_| (404, json!({})), |_| vec![]).await;
+        let (core, _ipc) = core_state("coord-anonymous").await;
+        let (client, runner) = start_client(&core, &coord.url).await;
+        wait_for(|| coord.ws_types().contains(&"register".to_string())).await;
+        assert_eq!(coord.ws_accepted_tokens(), [None]);
+        assert_eq!(client.credential_kind(), "none");
+        runner.abort();
     }
 }

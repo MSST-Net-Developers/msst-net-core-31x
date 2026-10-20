@@ -12,6 +12,7 @@
 | C2 | Coordinator | `features` 存储与透传 | 已实现，未提交 |
 | C3 | Coordinator | `device_key_proof` 改为 `required` | 待做 |
 | C4 | Coordinator | 客户端依赖的现有行为 | 无需改动，请保持 |
+| C5 | Coordinator | 访客设备的端点上报 `/device/endpoint` | 待做 |
 | R1 | 中转 | 退役 `0x06`/`0x07` 转发 | 待做 |
 | R2 | 中转 | 退役 `0x03` | 待做 |
 | R3 | 中转 | `relay.register_auth` 改为 `required` | 待做（最后一步） |
@@ -49,6 +50,14 @@
 - `member_joined` / `member_left` 的 `room_id` 放在外层 `WSMessage.RoomID`，客户端从外层读取。
 - `room_state`、`member_joined` 和 `/nodes/*` 为每台设备返回 `public_key`。它就是 WireGuard 公钥，缺失时客户端无法与该设备通信（路径视图显示 `no_key`）。
 - `GET /relays` 每项带 `pub_key`。没有 `pub_key` 的中转对客户端来说既没有游戏发现，也不能用 `0x0E` 注册。
+
+### C5 访客设备的端点上报 — 待做
+
+客户端在没有有效 MSST 登录时改用访客令牌（`POST /auth/guest/token`）接入：WS、`/nodes/*` 都正常。但 `/device/endpoint` 会核对“令牌的用户 ID 就是设备的所有者”：访客令牌的用户 ID 是 `guest-<8hex>`，而设备注册时上报的是它自己的 `user-<hash>`，于是返回 403，访客设备的 P2P 端点无法上报，只能走中转。
+
+建议：WS 连接用访客令牌注册设备时，记下“这个访客令牌可以代表这台设备”，`/device/endpoint` 收到访客令牌时按这条记录放行（令牌过期或 Coordinator 重启后自然失效）。不建议让客户端改用 `guest-<8hex>` 作为用户 ID：它每 24 小时或 Coordinator 重启就会变，会连带改变 ezPlay 主机名和按用户 ID 写的规则。
+
+另：`POST /device/register` 只认 OIDC 令牌，访客设备通过 HTTP 改名不会立即同步（`synced: false`），会在下次 WS 注册时生效。这是现有行为，可按需放开。
 
 ## 中转
 

@@ -11,6 +11,7 @@
       "data": {
         "access_auth_required": false,
         "auth_expires_at": null,
+        "coordinator_credential": "none",
         "coordinator_state": "Disconnected",
         "device_display_name": null,
         "device_handle": null,

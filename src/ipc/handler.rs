@@ -143,9 +143,9 @@ fn respond(result: Result<serde_json::Value, IpcError>) -> IpcResponse {
 
 async fn handle_health(state: &Arc<CoreState>, session: &Session) -> IpcResponse {
     let now = crate::runtime::current_unix();
-    let coordinator = match state.coordinator.get() {
-        Some(c) => c.connection_state().await,
-        None => crate::coordinator::ConnectionState::Disconnected,
+    let (coordinator, credential, oidc_rejected) = match state.coordinator.get() {
+        Some(c) => (c.connection_state().await, c.credential_kind(), c.oidc_rejected()),
+        None => (crate::coordinator::ConnectionState::Disconnected, "none", false),
     };
     let net = state.net.read().await;
     let id = state.identity.read().await;
@@ -164,10 +164,12 @@ async fn handle_health(state: &Arc<CoreState>, session: &Session) -> IpcResponse
         user_display_name: id.and_then(|i| set(&i.user.display_name)),
         device_display_name: id.and_then(|i| set(&i.device.display_name)),
         device_hostname: id.and_then(|i| set(&i.device.hostname)),
-        is_authenticated: auth.is_some_and(|a| !a.access_token.is_empty() && a.expires_at > now),
+        // Stored credentials the Coordinator refused don't count.
+        is_authenticated: auth.is_some_and(|a| !a.access_token.is_empty() && a.expires_at > now) && !oidc_rejected,
         auth_expires_at: auth.map(|a| a.expires_at),
         ws_connected: coordinator == crate::coordinator::ConnectionState::Connected,
         coordinator_state: format!("{:?}", coordinator),
+        coordinator_credential: credential.into(),
         tun_ready: state.tun_attached.load(std::sync::atomic::Ordering::SeqCst),
         access_auth_required: state.access_auth_required.load(std::sync::atomic::Ordering::SeqCst),
         relay: net.relay_addr.clone(),

@@ -303,6 +303,8 @@ pub async fn auth_poll(state: &Arc<CoreState>, session_id: &str) -> Result<Value
         })
         .await?;
         info!("account: OIDC authentication completed; user_id={}", user_id);
+        // Stop using a guest token: reconnect with the new credentials.
+        client.credentials_changed(state).await;
         let st = state.clone();
         tokio::spawn(async move {
             if let Err(e) = re_register(&st).await {

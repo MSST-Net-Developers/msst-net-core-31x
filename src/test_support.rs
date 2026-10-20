@@ -20,11 +20,15 @@ pub struct HttpReq {
 type HttpHandler = Arc<dyn Fn(&HttpReq) -> (u16, Value) + Send + Sync>;
 /// WS handler: given a client message, returns messages to send back.
 type WsHandler = Arc<dyn Fn(&Value) -> Vec<Value> + Send + Sync>;
+/// WS upgrade gate: given the bearer token (if any), accept (else 401).
+type WsAuth = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
 
 pub struct FakeCoordinator {
     pub url: String,
     pub http_log: Arc<Mutex<Vec<HttpReq>>>,
     pub ws_log: Arc<Mutex<Vec<Value>>>,
+    /// Bearer token of every WS upgrade attempt, and whether it was accepted.
+    pub ws_auth_log: Arc<Mutex<Vec<(Option<String>, bool)>>>,
 }
 
 impl FakeCoordinator {
@@ -32,27 +36,43 @@ impl FakeCoordinator {
         http: impl Fn(&HttpReq) -> (u16, Value) + Send + Sync + 'static,
         ws: impl Fn(&Value) -> Vec<Value> + Send + Sync + 'static,
     ) -> Self {
+        Self::start_with_ws_auth(http, ws, |_| true).await
+    }
+
+    /// Like [`start`](Self::start), but WS upgrades whose bearer token
+    /// `ws_auth` refuses get HTTP 401 (as the Coordinator's `handleWS`).
+    pub async fn start_with_ws_auth(
+        http: impl Fn(&HttpReq) -> (u16, Value) + Send + Sync + 'static,
+        ws: impl Fn(&Value) -> Vec<Value> + Send + Sync + 'static,
+        ws_auth: impl Fn(Option<&str>) -> bool + Send + Sync + 'static,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let http_log = Arc::new(Mutex::new(Vec::new()));
         let ws_log = Arc::new(Mutex::new(Vec::new()));
-        let (http, ws): (HttpHandler, WsHandler) = (Arc::new(http), Arc::new(ws));
-        let (hl, wl) = (http_log.clone(), ws_log.clone());
+        let ws_auth_log = Arc::new(Mutex::new(Vec::new()));
+        let (http, ws, auth): (HttpHandler, WsHandler, WsAuth) = (Arc::new(http), Arc::new(ws), Arc::new(ws_auth));
+        let (hl, wl, al) = (http_log.clone(), ws_log.clone(), ws_auth_log.clone());
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (http, ws, hl, wl) = (http.clone(), ws.clone(), hl.clone(), wl.clone());
+                let (http, ws, auth, hl, wl, al) = (http.clone(), ws.clone(), auth.clone(), hl.clone(), wl.clone(), al.clone());
                 tokio::spawn(async move {
                     let mut peek = [0u8; 8];
                     let n = stream.peek(&mut peek).await.unwrap_or(0);
                     if peek[..n].starts_with(b"GET /ws") {
-                        serve_ws(stream, ws, wl).await;
+                        serve_ws(stream, ws, wl, auth, al).await;
                     } else {
                         serve_http(stream, http, hl).await;
                     }
                 });
             }
         });
-        FakeCoordinator { url, http_log, ws_log }
+        FakeCoordinator { url, http_log, ws_log, ws_auth_log }
+    }
+
+    /// Bearer tokens of the accepted WS connections, in order.
+    pub fn ws_accepted_tokens(&self) -> Vec<Option<String>> {
+        self.ws_auth_log.lock().unwrap().iter().filter(|(_, ok)| *ok).map(|(t, _)| t.clone()).collect()
     }
 
     pub fn ws_types(&self) -> Vec<String> {
@@ -60,8 +80,26 @@ impl FakeCoordinator {
     }
 }
 
-async fn serve_ws(stream: tokio::net::TcpStream, handler: WsHandler, log: Arc<Mutex<Vec<Value>>>) {
-    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
+async fn serve_ws(stream: tokio::net::TcpStream, handler: WsHandler, log: Arc<Mutex<Vec<Value>>>, auth: WsAuth, auth_log: Arc<Mutex<Vec<(Option<String>, bool)>>>) {
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    let gate = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+        let token = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_string);
+        let ok = auth(token.as_deref());
+        auth_log.lock().unwrap().push((token, ok));
+        if ok {
+            Ok(resp)
+        } else {
+            let mut e = ErrorResponse::new(Some("unauthorized".into()));
+            *e.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+            Err(e)
+        }
+    };
+    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, gate).await else { return };
     while let Some(Ok(msg)) = ws.next().await {
         if let Message::Text(t) = msg {
             let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);

@@ -313,14 +313,8 @@ pub fn spawn_fetcher(state: Arc<CoreState>) -> tokio::task::JoinHandle<()> {
 /// Perform one fetch; returns whether the demanded node is now known.
 async fn fetch(state: &Arc<CoreState>, d: &FetchDemand) -> bool {
     let Some(client) = state.coordinator.get() else { return false };
-    let bearer = state
-        .identity
-        .read()
-        .await
-        .as_ref()
-        .and_then(|i| i.auth.as_ref())
-        .map(|a| a.access_token.clone())
-        .filter(|t| !t.is_empty());
+    // The connection's credential (OIDC or guest token).
+    let bearer = client.bearer();
     let path = match d {
         FetchDemand::ByDevice(id) => format!("/nodes/by-device?ids={}", id),
         FetchDemand::ByUser(id) => format!("/nodes/by-user/{}", id),
