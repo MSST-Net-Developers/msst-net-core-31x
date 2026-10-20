@@ -167,6 +167,16 @@ Add `"async": true` to a command request:
   - if applying a decision fails (e.g. `persist_failed` when saving the
     rule), the request stays pending and can be answered again; no
     `AccessRequestResolved` is sent for the failed attempt.
+- **Rooms** (`docs/ROOM_RELAY_3.1.md`):
+  - one room at a time: `CreateRoom` / `JoinRoom` while in a room fail
+    with the new code `already_in_room` (leave first); the Coordinator
+    enforces it too and its refusal maps to the same code.  Room
+    operations (create, join, leave) run one after another;
+  - room passwords are still given to Core in plain text, but leave
+    Core only as Argon2id verifiers.  `JoinRoom` without `password` for a
+    room that has one fails with the new code `room_password_required`
+    before anything is sent; a password given for a room without one is
+    ignored.  An unknown or malformed room ID fails with `room_rejected`.
 - **Removed from `Health`:** `local_device_id` and `local_user_id`
   (3.1.0-alpha aliases); use `device_id` and `user_id`.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`

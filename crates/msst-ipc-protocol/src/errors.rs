@@ -38,8 +38,12 @@ pub const REGISTER_FAILED: &str = "register_failed";
 pub const RELAY_UNAVAILABLE: &str = "relay_unavailable";
 /// The coordinator refused to create the room.
 pub const ROOM_CREATE_FAILED: &str = "room_create_failed";
-/// The coordinator refused the join (e.g. wrong password).
+/// The coordinator refused the join (e.g. wrong password, unknown room).
 pub const ROOM_REJECTED: &str = "room_rejected";
+/// The room has a password and none was given (`JoinRoom`).
+pub const ROOM_PASSWORD_REQUIRED: &str = "room_password_required";
+/// This device is already in a room: leave it first (one room at a time).
+pub const ALREADY_IN_ROOM: &str = "already_in_room";
 /// Core could not save the change to disk (nothing was changed).
 pub const PERSIST_FAILED: &str = "persist_failed";
 
@@ -59,6 +63,6 @@ pub const ALL: &[&str] = &[
     INVALID_DISPLAY_NAME,
     NOT_FOUND, MNEMONIC_NOT_FOUND, NOT_INITIALIZED, NOT_AUTHENTICATED, AUTH_FAILED,
     COORDINATOR_UNAVAILABLE, COORDINATOR_ERROR, REGISTER_FAILED, RELAY_UNAVAILABLE,
-    ROOM_CREATE_FAILED, ROOM_REJECTED, PERSIST_FAILED, PERMISSION_DENIED, BUSY, INCOMPATIBLE_VERSION,
+    ROOM_CREATE_FAILED, ROOM_REJECTED, ROOM_PASSWORD_REQUIRED, ALREADY_IN_ROOM, PERSIST_FAILED, PERMISSION_DENIED, BUSY, INCOMPATIBLE_VERSION,
     RESPONSE_TOO_LARGE,
 ];

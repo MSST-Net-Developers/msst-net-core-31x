@@ -552,10 +552,10 @@ async fn coordinator_event_loop(
             }
 
             // ── Coordinator error ─────────────────────────────────────────
-            CoordinatorEvent::Error { message, .. } => {
+            CoordinatorEvent::Error { message, code } => {
                 warn!("coordinator error: {}", message);
                 // Fail a pending join fast (e.g. wrong room password).
-                crate::rooms::notify_room_waiter(state, Err(message));
+                crate::rooms::notify_room_waiter(state, Err(crate::rooms::JoinRefused { code, message }));
             }
         }
     }

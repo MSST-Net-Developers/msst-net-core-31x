@@ -459,7 +459,7 @@ impl CoordinatorClient {
         let _ = tx.send(register.to_string()).await;
         let rooms: Vec<(String, Option<String>)> = {
             let net = core.net.read().await;
-            net.joined_rooms.keys().map(|id| (id.clone(), net.room_password_hashes.get(id).cloned())).collect()
+            net.joined_rooms.keys().map(|id| (id.clone(), net.room_password_verifiers.get(id).cloned())).collect()
         };
         for (room_id, pw) in &rooms {
             // The coordinator checks the password on every join, and ties
@@ -623,8 +623,8 @@ impl CoordinatorClient {
     }
 
     /// Send a join room message.
-    pub async fn send_join(&self, room_id: &str, password_hash: Option<&str>) -> Result<(), NotConnected> {
-        self.send(&join_message(room_id, password_hash).to_string()).await
+    pub async fn send_join(&self, room_id: &str, password_verifier: Option<&str>) -> Result<(), NotConnected> {
+        self.send(&join_message(room_id, password_verifier).to_string()).await
     }
 
     /// Send a leave room message.
@@ -817,10 +817,10 @@ pub fn build_register_message(id: &Identity) -> Value {
     })
 }
 
-fn join_message(room_id: &str, password_hash: Option<&str>) -> Value {
+fn join_message(room_id: &str, password_verifier: Option<&str>) -> Value {
     let mut msg = json!({ "type": "join", "data": { "room_id": room_id } });
-    if let Some(pw) = password_hash {
-        msg["data"]["password_hash"] = json!(pw);
+    if let Some(v) = password_verifier {
+        msg["data"]["password_verifier"] = json!(v);
     }
     msg
 }
@@ -1287,8 +1287,8 @@ mod tests {
         assert_eq!(room_keepalive_message("r1")["data"]["room_id"], "r1");
         assert_eq!(discovery_join_message("r1")["type"], "discovery_join");
         assert_eq!(join_message("r1", None)["type"], "join");
-        assert!(join_message("r1", None)["data"].get("password_hash").is_none());
-        assert_eq!(join_message("r1", Some("h"))["data"]["password_hash"], "h");
+        assert!(join_message("r1", None)["data"].get("password_verifier").is_none());
+        assert_eq!(join_message("r1", Some("v"))["data"]["password_verifier"], "v");
     }
 
     #[test]
@@ -1362,7 +1362,7 @@ mod tests {
         {
             let mut net = core.net.write().await;
             net.joined_rooms.insert("space-1".into(), "Room".into());
-            net.room_password_hashes.insert("space-1".into(), "pwhash".into());
+            net.room_password_verifiers.insert("space-1".into(), "pwverifier".into());
         }
 
         let (event_tx, _event_rx) = mpsc::channel(16);
@@ -1406,7 +1406,7 @@ mod tests {
             let types: Vec<&str> = msgs.iter().map(|v| v["type"].as_str().unwrap()).collect();
             assert_eq!(types, ["register", "join", "discovery_join"], "round {}", round);
             // A password-protected room is re-joined with its password.
-            assert_eq!(msgs[1]["data"]["password_hash"], "pwhash", "round {}", round);
+            assert_eq!(msgs[1]["data"]["password_verifier"], "pwverifier", "round {}", round);
             if round == 0 {
                 // Messages sent while connected go out on the live connection.
                 client.send_leave("space-1").await.unwrap();

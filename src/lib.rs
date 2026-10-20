@@ -28,6 +28,7 @@ mod inbound;
 mod ip;
 mod ipc;
 mod observability;
+mod passwords;
 mod relay;
 mod rooms;
 mod sdisc;

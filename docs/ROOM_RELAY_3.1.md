@@ -95,6 +95,15 @@ verifier = Argon2id(password, salt = "msst-room-pw-v1" ‖ salt)            # 32
 - **重入**：Core 在内存中保存 `verifier`（取代 K1 保存的 SHA-256 哈希），重连时直接带上，不必重新计算。
 - **限流**：Coordinator 对同一设备、同一来源 IP 的错误密码尝试限流（例如每分钟 10 次），防止在线穷举。
 - 3.1 不兼容 3.0.x 协议，房间又是临时的，因此不需要迁移：Coordinator 只接受新方案。
+- 编码：`salt` 与 `verifier` 在 JSON 中都用标准 base64（带填充）。`GET /room/{id}/password-salt` 返回 `{"salt": "<base64>"}` 或 `{"salt": null}`。
+
+测试向量（与参考实现 `argon2` 20190702 核对过；客户端 `src/passwords.rs` 固定了它）：
+
+```
+password = "correct horse"，salt = 16 × 0x5a
+Argon2id 的 salt 输入 = "msst-room-pw-v1ZZZZZZZZZZZZZZZZ"（31 字节）
+verifier = 71e7aa44e64ecd1cb0ddbc6049b81a191738151aa8e662402735e1a6a6224dab
+```
 
 这一项不依赖房间中转，可以先行实施。
 

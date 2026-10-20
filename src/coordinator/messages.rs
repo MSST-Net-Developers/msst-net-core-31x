@@ -210,6 +210,7 @@ pub struct RegisterMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomAction {
     pub room_id: String,
+    /// Base64 Argon2id room password verifier (`crate::passwords`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub password_hash: Option<String>,
+    pub password_verifier: Option<String>,
 }

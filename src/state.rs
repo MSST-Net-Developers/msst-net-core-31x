@@ -40,10 +40,11 @@ pub struct NetState {
     /// Rooms this device has joined: room_id → room_name.  Re-joined on
     /// every coordinator (re)connect and kept alive with `room_keepalive`.
     pub joined_rooms: HashMap<String, String>,
-    /// Password hashes of joined rooms that have one: room_id → hex
-    /// SHA-256.  Memory only; sent with every re-join, because the
-    /// coordinator checks the password on each `join`.
-    pub room_password_hashes: HashMap<String, String>,
+    /// Password verifiers of joined rooms that have one: room_id → base64
+    /// Argon2id verifier (`crate::passwords`).  Memory only; sent with
+    /// every re-join, because the coordinator checks the password on each
+    /// `join`.
+    pub room_password_verifiers: HashMap<String, String>,
     /// Local device ID (set during init).
     pub local_device_id: String,
     /// Local user ID (set during init).
@@ -77,7 +78,7 @@ impl NetState {
             local_authenticated: false,
             room_peers: HashSet::new(),
             joined_rooms: HashMap::new(),
-            room_password_hashes: HashMap::new(),
+            room_password_verifiers: HashMap::new(),
             local_device_id: String::new(),
             local_user_id: String::new(),
             ping_enabled: false,
@@ -157,6 +158,8 @@ pub struct CoreState {
     pub endpoint_detect_running: std::sync::atomic::AtomicBool,
     /// Pending room join waiting for the next room_state / error.
     pub room_waiter: crate::rooms::RoomWaiter,
+    /// Serializes create / join / leave (one room at a time, one waiter).
+    pub room_op: tokio::sync::Mutex<()>,
     /// Local DNS resolver (set when the TUN is up).
     pub dns: std::sync::OnceLock<Arc<crate::dns::DnsResolver>>,
     /// Prometheus metrics, when enabled (`--metrics`).
@@ -229,6 +232,7 @@ impl CoreState {
             relay_reg: Default::default(),
             relay_path_ok_at: std::sync::atomic::AtomicI64::new(0),
             room_waiter: std::sync::Mutex::new(None),
+            room_op: tokio::sync::Mutex::new(()),
             stun_waiters: std::sync::Mutex::new(HashMap::new()),
             endpoint_history: std::sync::Mutex::new(Default::default()),
             endpoint_detect_running: std::sync::atomic::AtomicBool::new(false),

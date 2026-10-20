@@ -63,6 +63,8 @@ sha2 = "0.10"
 # Secure discovery (sdisc v1) and device key proof (keyproof v1).
 hkdf = "0.12"
 hmac = "0.12"
+# Room and relay password verifiers (Argon2id).
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 # Interface enumeration for discovery (already used by msst-core-state).
 if-addrs = "0.13"
 # Coordinator HTTP API (token refresh; later: nodes, relays, rooms). Same as 3.0.x.
