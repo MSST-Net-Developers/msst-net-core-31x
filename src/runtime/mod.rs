@@ -323,6 +323,9 @@ async fn scheduler_tick_loop(state: Arc<CoreState>) {
             execute_scheduler_action(action, &state, udp).await;
         }
 
+        // Unanswered interactive-auth requests time out on time (60 s).
+        crate::inbound::expire_auth_requests(&state, now).await;
+
         // WireGuard timers (retransmit, rekey, keepalive) and negotiation
         // timeouts; messages go over each peer's current path.
         let (msgs, changes) = {
@@ -360,17 +363,14 @@ async fn housekeeping_loop(state: Arc<CoreState>) {
             crate::peer_cache::save(&state).await;
         }
 
-        // 3. Interactive-auth timeouts.
-        crate::inbound::expire_auth_requests(&state, now).await;
-
-        // 3b. ACL rule expiry (removes, persists, emits AclChanged).
+        // 2. ACL rule expiry (removes, persists, emits AclChanged).
         crate::acl::expire_rules(&state, now).await;
 
-        // 4. Contacts: prune stale entries and persist changes.
+        // 3. Contacts: prune stale entries and persist changes.
         state.contacts.lock().unwrap_or_else(|e| e.into_inner()).prune(now);
         state.save_contacts();
 
-        // 5. Connection-tracking expiry.
+        // 4. Connection-tracking expiry.
         state.conn_track.lock().unwrap_or_else(|e| e.into_inner()).cleanup(now);
 
         debug!("housekeeping: tick complete");

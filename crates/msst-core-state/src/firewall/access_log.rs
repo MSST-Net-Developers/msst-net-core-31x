@@ -61,6 +61,9 @@ pub enum AccessReason {
     },
     InteractiveAuth,
     InteractiveAuthTimeout,
+    /// No prompt: too many requests already pending (from this source, or
+    /// in total).
+    InteractiveAuthLimit,
     DefaultDeny,
 }
 

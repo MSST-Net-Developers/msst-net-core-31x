@@ -27,6 +27,10 @@ const AUTH_QUEUE_MAX_PACKETS: usize = 32;
 const AUTH_QUEUE_MAX_BYTES: usize = 256 * 1024;
 /// Timeout for interactive auth requests (seconds).
 const AUTH_TIMEOUT_SECS: i64 = 60;
+/// Pending auth requests one source device may have at once.
+pub const MAX_PENDING_AUTH_PER_SOURCE: usize = 3;
+/// Pending auth requests in total.
+pub const MAX_PENDING_AUTH: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Firewall
@@ -170,8 +174,38 @@ impl Firewall {
             queued_packets: VecDeque::new(),
             queued_bytes: 0,
             log_entry_id,
+            resolving: false,
         });
         request_id
+    }
+
+    /// Whether `src_device_id` may open another request: at most
+    /// [`MAX_PENDING_AUTH_PER_SOURCE`] from it and [`MAX_PENDING_AUTH`] in
+    /// total, so a port scan can't flood the user with prompts.
+    pub fn auth_capacity(&self, src_device_id: &str) -> bool {
+        self.pending_auth.len() < MAX_PENDING_AUTH
+            && self.pending_auth.iter().filter(|p| p.key.src_device_id == src_device_id).count() < MAX_PENDING_AUTH_PER_SOURCE
+    }
+
+    /// Start applying a decision: marks the request as resolving and returns
+    /// its key.  `None` if it doesn't exist, is already being resolved, or
+    /// has expired (a late answer must not count; the timeout sweep reports
+    /// it).  Finish with [`resolve_auth`](Self::resolve_auth), or undo with
+    /// [`abort_resolve_auth`](Self::abort_resolve_auth).
+    pub fn begin_resolve_auth(&mut self, request_id: &str, now_unix: i64) -> Option<AuthKey> {
+        let p = self.pending_auth.iter_mut().find(|p| p.request_id == request_id && !p.resolving)?;
+        if now_unix - p.created_at_unix >= AUTH_TIMEOUT_SECS {
+            return None;
+        }
+        p.resolving = true;
+        Some(p.key.clone())
+    }
+
+    /// Applying the decision failed: the request is pending again.
+    pub fn abort_resolve_auth(&mut self, request_id: &str) {
+        if let Some(p) = self.pending_auth.iter_mut().find(|p| p.request_id == request_id) {
+            p.resolving = false;
+        }
     }
 
     /// Enqueue a packet for a pending auth request.
@@ -228,7 +262,7 @@ impl Firewall {
     pub fn collect_timed_out_auth(&mut self, now_unix: i64) -> Vec<(AuthKey, String, String)> {
         let timed_out: Vec<_> = self.pending_auth
             .iter()
-            .filter(|p| now_unix - p.created_at_unix >= AUTH_TIMEOUT_SECS)
+            .filter(|p| !p.resolving && now_unix - p.created_at_unix >= AUTH_TIMEOUT_SECS)
             .map(|p| (p.key.clone(), p.request_id.clone(), p.log_entry_id.clone()))
             .collect();
 
@@ -519,6 +553,56 @@ mod tests {
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0].0, key);
         assert!(!fw.has_pending_auth(&key));
+    }
+
+    fn key(src: &str, port: u16) -> AuthKey {
+        AuthKey { src_device_id: src.into(), proto: Protocol::Tcp, dst_port: port }
+    }
+
+    #[test]
+    fn pending_requests_are_capped_per_source_and_in_total() {
+        let mut fw = Firewall::new();
+        for port in 0..MAX_PENDING_AUTH_PER_SOURCE as u16 {
+            assert!(fw.auth_capacity("device-0000000a"));
+            let id = fw.next_id();
+            fw.register_pending_auth(key("device-0000000a", port), "device-0000000a".into(), id);
+        }
+        assert!(!fw.auth_capacity("device-0000000a"), "per-source cap");
+        assert!(fw.auth_capacity("device-0000000b"));
+        let mut n = 0u16;
+        while fw.pending_auth.len() < MAX_PENDING_AUTH {
+            let src = format!("device-1{:07x}", n);
+            let id = fw.next_id();
+            fw.register_pending_auth(key(&src, 1), src, id);
+            n += 1;
+        }
+        assert!(!fw.auth_capacity("device-0000000b"), "total cap");
+    }
+
+    #[test]
+    fn two_step_resolve() {
+        let mut fw = Firewall::new();
+        let log_id = fw.next_id();
+        let id = fw.register_pending_auth(key("device-0000000a", 80), "device-0000000a".into(), log_id);
+        let now = fw.pending_auth[0].created_at_unix;
+
+        assert_eq!(fw.begin_resolve_auth(&id, now), Some(key("device-0000000a", 80)));
+        // Being resolved: no second decision, no timeout, still pending.
+        assert!(fw.begin_resolve_auth(&id, now).is_none());
+        assert!(fw.collect_timed_out_auth(now + AUTH_TIMEOUT_SECS).is_empty());
+        assert!(fw.has_pending_auth(&key("device-0000000a", 80)));
+        // Creating the rule failed: the user can answer again.
+        fw.abort_resolve_auth(&id);
+        assert!(fw.begin_resolve_auth(&id, now).is_some());
+        assert!(fw.resolve_auth(&id, Action::Allow, true).is_some());
+        assert!(!fw.has_pending_auth(&key("device-0000000a", 80)));
+
+        // A late answer doesn't count.
+        let log_id = fw.next_id();
+        let late = fw.register_pending_auth(key("device-0000000a", 81), "device-0000000a".into(), log_id);
+        let created = fw.pending_auth[0].created_at_unix;
+        assert!(fw.begin_resolve_auth(&late, created + AUTH_TIMEOUT_SECS).is_none());
+        assert_eq!(fw.collect_timed_out_auth(created + AUTH_TIMEOUT_SECS).len(), 1);
     }
 
     #[test]

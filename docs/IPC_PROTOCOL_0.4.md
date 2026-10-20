@@ -150,6 +150,18 @@ Add `"async": true` to a command request:
     (disconnected, or a Coordinator without guest tokens);
   - `Health.is_authenticated` is now `false` while the Coordinator refuses
     the stored credentials, even if their expiry time hasn't passed.
+- **Interactive authorization:**
+  - an unanswered request times out 60 s after it was raised
+    (`AccessRequestTimeout` within about a second; it used to take up to
+    another minute).  `AuthDecision` for an expired request fails with
+    `not_found`, even before the timeout event — so a Controller whose
+    countdown reached 0 can close the prompt;
+  - at most 3 requests per source device and 16 in total are pending at
+    once.  Beyond that no prompt is raised; the access log records
+    `silent_deny` with reason `{"type": "interactive_auth_limit"}`;
+  - if applying a decision fails (e.g. `persist_failed` when saving the
+    rule), the request stays pending and can be answered again; no
+    `AccessRequestResolved` is sent for the failed attempt.
 - **Removed from `Health`:** `local_device_id` and `local_user_id`
   (3.1.0-alpha aliases); use `device_id` and `user_id`.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`

@@ -37,6 +37,9 @@ pub struct PendingAuth {
     pub queued_bytes: usize,
     /// ID of the access log entry created when this request was triggered.
     pub log_entry_id: String,
+    /// A decision is being applied (its rule is being created): no second
+    /// decision, no timeout.  Cleared again if creating the rule fails.
+    pub resolving: bool,
 }
 
 /// The outcome of resolving an interactive auth request.

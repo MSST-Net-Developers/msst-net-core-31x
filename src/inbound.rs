@@ -168,6 +168,24 @@ async fn on_need_auth(state: &Arc<CoreState>, src: String, proto: Protocol, pars
             }
             return;
         }
+        if !fw.auth_capacity(&src) {
+            // Too many open prompts (e.g. a port scan): drop without asking.
+            debug!("inbound: auth request limit reached, dropping {} → {}:{}", src, proto_str(proto), parsed.dst_port);
+            let log_id = fw.new_id();
+            fw.log_access(AccessLogEntry {
+                id: log_id,
+                src_device_id: src.clone(),
+                service_name,
+                proto,
+                dst_port: parsed.dst_port,
+                decision: AccessDecision::SilentDeny,
+                reason: AccessReason::InteractiveAuthLimit,
+                timestamp_ms: crate::runtime::current_time_ms(),
+                rule_id: None,
+                count: 1,
+            });
+            return;
+        }
         let log_id = fw.new_id();
         fw.log_access(AccessLogEntry {
             id: log_id.clone(),
@@ -233,6 +251,10 @@ async fn auth_eligible(state: &CoreState, src: &str) -> bool {
 /// Apply the user's decision: create the corresponding device-level rule
 /// (expiring after 10 min for "once"), finalize the access-log entry and,
 /// on allow, deliver the packets queued while waiting.
+///
+/// The request stays pending (marked as being resolved) until its rule
+/// exists, so a failure leaves it answerable.  An expired request is
+/// `not_found`, even before the timeout sweep has reported it.
 pub async fn resolve_auth(state: &Arc<CoreState>, request_id: &str, decision: AuthDecision) -> Result<Value, IpcError> {
     let now = crate::runtime::current_unix();
     let (action, expires_at, name) = match decision {
@@ -241,20 +263,12 @@ pub async fn resolve_auth(state: &Arc<CoreState>, request_id: &str, decision: Au
         AuthDecision::DenyOnce => (Action::Deny, Some(now + ONCE_RULE_TTL_SECS), "deny_once"),
         AuthDecision::AlwaysDeny => (Action::Deny, None, "always_deny"),
     };
-    let outcome = state
-        .firewall
-        .lock()
-        .await
-        .resolve_auth(request_id, action.clone(), expires_at.is_none())
-        .inspect(|_| {
-            state.next_generation();
-        })
-        .ok_or_else(|| IpcError {
-            code: "not_found".into(),
-            message: format!("Auth request '{}' not found or already resolved", request_id),
-        })?;
-
-    let key = &outcome.key;
+    let not_found = || IpcError {
+        code: "not_found".into(),
+        message: format!("Auth request '{}' not found, expired or already resolved", request_id),
+    };
+    let key = state.firewall.lock().await.begin_resolve_auth(request_id, now).ok_or_else(not_found)?;
+    let key = &key;
     let rule = FirewallRule {
         id: crate::acl::parse::new_id(),
         permission_group: PermissionGroup::Devices { ids: vec![key.src_device_id.clone()] },
@@ -268,8 +282,20 @@ pub async fn resolve_auth(state: &Arc<CoreState>, request_id: &str, decision: Au
             name, key.src_device_id, proto_str(key.proto), key.dst_port, request_id
         )),
     };
-    let view = crate::acl::insert_rule(state, rule.clone()).await?;
-    state.firewall.lock().await.access_log.set_rule_id(&outcome.log_entry_id, rule.id.clone());
+    let view = match crate::acl::insert_rule(state, rule.clone()).await {
+        Ok(v) => v,
+        Err(e) => {
+            state.firewall.lock().await.abort_resolve_auth(request_id);
+            return Err(e);
+        }
+    };
+    let outcome = {
+        let mut fw = state.firewall.lock().await;
+        let outcome = fw.resolve_auth(request_id, action.clone(), expires_at.is_none()).ok_or_else(not_found)?;
+        fw.access_log.set_rule_id(&outcome.log_entry_id, rule.id.clone());
+        outcome
+    };
+    state.next_generation();
     info!("inbound: auth decision '{}' applied for {} {}:{}", name, key.src_device_id, proto_str(key.proto), key.dst_port);
     state.emit_ipc_event(IpcEvent::AccessRequestResolved {
         request_id: request_id.to_string(),
@@ -287,7 +313,7 @@ pub async fn resolve_auth(state: &Arc<CoreState>, request_id: &str, decision: Au
     Ok(json!({ "ok": true, "rule": view }))
 }
 
-/// Expire unanswered requests (called from housekeeping).
+/// Expire unanswered requests (called every second by the scheduler tick).
 pub async fn expire_auth_requests(state: &CoreState, now: i64) {
     let timed_out = {
         let mut fw = state.firewall.lock().await;
@@ -631,6 +657,70 @@ mod tests {
         // Retrying the SYN must not be admitted via connection tracking.
         deliver_inbound(&h.state, &h.tun_tx, syn).await;
         assert!(h.tun_rx.try_recv().is_err());
+    }
+
+    /// A TCP SYN from the peer (172.22.1.1) to `port`.
+    fn syn_to(port: u16) -> Vec<u8> {
+        let mut p = syn_v4();
+        p[22..24].copy_from_slice(&port.to_be_bytes());
+        p
+    }
+
+    fn created_ports(rx: &mut crate::state::EventReceiver) -> Vec<u16> {
+        let mut ports = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let IpcEvent::AccessRequestCreated { dst_port, .. } = ev {
+                ports.push(dst_port);
+            }
+        }
+        ports
+    }
+
+    #[tokio::test]
+    async fn a_port_scan_opens_a_bounded_number_of_prompts() {
+        let mut h = harness("cap", true).await;
+        for port in 1000..1010 {
+            deliver_inbound(&h.state, &h.tun_tx, syn_to(port)).await;
+        }
+        let max = msst_core_state::firewall::MAX_PENDING_AUTH_PER_SOURCE;
+        assert_eq!(created_ports(&mut h.ipc_rx), (1000..1000 + max as u16).collect::<Vec<_>>());
+        let log = access_log(&h.state, Some(5)).await;
+        assert!(log["entries"].as_array().unwrap().iter().any(|e| e["reason"]["type"] == "interactive_auth_limit"), "{}", log);
+        // Answering one frees a slot.
+        let req = h.state.firewall.lock().await.pending_auth[0].request_id.clone();
+        resolve_auth(&h.state, &req, AuthDecision::DenyOnce).await.unwrap();
+        deliver_inbound(&h.state, &h.tun_tx, syn_to(2000)).await;
+        assert_eq!(created_ports(&mut h.ipc_rx), [2000]);
+    }
+
+    #[tokio::test]
+    async fn late_answer_is_refused_before_the_sweep() {
+        let mut h = harness("late", true).await;
+        deliver_inbound(&h.state, &h.tun_tx, udp_v4(b"x")).await;
+        let req = auth_request_id(&mut h.ipc_rx).unwrap();
+        h.state.firewall.lock().await.pending_auth[0].created_at_unix -= AUTH_TIMEOUT_SECS;
+        assert_eq!(resolve_auth(&h.state, &req, AuthDecision::AllowOnce).await.unwrap_err().code, "not_found");
+        assert!(h.state.net.read().await.acl_rules.is_empty(), "no rule from a late answer");
+        // The sweep then reports the timeout.
+        expire_auth_requests(&h.state, crate::runtime::current_unix()).await;
+        assert!(std::iter::from_fn(|| h.ipc_rx.try_recv().ok()).any(|e| matches!(e, IpcEvent::AccessRequestTimeout { request_id } if request_id == req)));
+    }
+
+    #[tokio::test]
+    async fn failed_rule_creation_leaves_the_request_answerable() {
+        let mut h = harness("persist-fail", true).await;
+        deliver_inbound(&h.state, &h.tun_tx, udp_v4(b"x")).await;
+        let req = auth_request_id(&mut h.ipc_rx).unwrap();
+        // Rules can't be saved: a directory sits where the file goes.
+        let blocker = h.state.data_dir.join(crate::acl::store::RULES_FILE);
+        std::fs::create_dir_all(blocker.join("x")).unwrap();
+        assert_eq!(resolve_auth(&h.state, &req, AuthDecision::AllowOnce).await.unwrap_err().code, "persist_failed");
+        assert_eq!(pending_requests(&h.state).await["requests"][0]["request_id"], req.as_str());
+        assert!(!std::iter::from_fn(|| h.ipc_rx.try_recv().ok()).any(|e| matches!(e, IpcEvent::AccessRequestResolved { .. })));
+        // Fixed: the same request can be answered, and the queued packet goes out.
+        std::fs::remove_dir_all(&blocker).unwrap();
+        resolve_auth(&h.state, &req, AuthDecision::AllowOnce).await.unwrap();
+        assert!(h.tun_rx.try_recv().is_ok());
     }
 
     #[tokio::test]
