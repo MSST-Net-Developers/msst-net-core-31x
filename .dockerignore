@@ -1,5 +1,8 @@
-# The Core image needs only the Rust sources (Dockerfile).
+# The Core image needs only the Rust sources and the license texts
+# (Dockerfile).
 *
+!LICENSE
+!THIRD_PARTY_LICENSES.txt
 !Cargo.toml
 !Cargo.lock
 !src

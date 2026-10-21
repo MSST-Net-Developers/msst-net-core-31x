@@ -1,0 +1,41 @@
+# Third-party license list (THIRD_PARTY_LICENSES.txt), generated with
+# cargo-about:
+#
+#   cargo about generate --locked --workspace -o THIRD_PARTY_LICENSES.txt about.hbs
+#   sed -i 's/\r$//' THIRD_PARTY_LICENSES.txt   # some upstream texts use CRLF
+#
+# CI fails if the committed file is out of date.
+
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "MPL-2.0",
+    "WTFPL",
+    "CDLA-Permissive-2.0",
+]
+
+# Every platform a release is built for (target-specific crates included).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# Only what ends up in the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Our own crates are under the repository's LICENSE.
+private = { ignore = true }

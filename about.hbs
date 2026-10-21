@@ -1,0 +1,23 @@
+Third-party software in MSST-Net Core
+=====================================
+
+MSST-Net Core is licensed under the MIT license (see LICENSE).  It includes
+the following third-party crates, under the licenses reproduced below.
+
+Overview
+--------
+{{#each overview}}
+{{{name}}} ({{count}})
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{{name}}} ({{{id}}})
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} <{{{crate.repository}}}>{{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

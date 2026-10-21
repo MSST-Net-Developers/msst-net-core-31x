@@ -2,7 +2,8 @@
 # (msst-net-installer-31x docs/DEPLOYMENT_CONTRACT.md, section 2):
 # msst-net-core-<os>-<arch>[.exe], the abjust/msstnet31x-core:<version>
 # image, and a signed manifest.json (product msst-net-core) on the GitHub
-# Release of tag v<version>, synced to Gitee.
+# Release of tag v<version>, synced to Gitee, with LICENSE and
+# THIRD_PARTY_LICENSES.txt.
 #
 # Repository secrets: MSST_RELEASE_SIGNING_KEY (Core's Ed25519 key from
 # `msst-net-installer release keygen`), DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
@@ -64,6 +65,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      - name: THIRD_PARTY_LICENSES.txt is up to date (see about.toml)
+        run: |
+          cargo about generate --locked --workspace -o THIRD_PARTY_LICENSES.txt about.hbs
+          sed -i 's/\r$//' THIRD_PARTY_LICENSES.txt
+          git diff --exit-code THIRD_PARTY_LICENSES.txt
 
   build:
     name: Build (${{ matrix.asset }})
@@ -198,11 +207,19 @@ jobs:
         run: |
           test -n "$KEY" || { echo "set the MSST_RELEASE_SIGNING_KEY secret" >&2; exit 1; }
           test -n "$PUBKEYS" || { echo "set the MSST_CORE_RELEASE_PUBKEYS variable" >&2; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            LICENSE
+            THIRD_PARTY_LICENSES.txt
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: msst-net-core-*
           merge-multiple: true
+      # Not in the manifest (the installer only takes named artifacts).
+      - run: cp LICENSE THIRD_PARTY_LICENSES.txt dist/
       - uses: dtolnay/rust-toolchain@stable
       # The manifest is written and checked by the installer's own code, so
       # the two sides can't drift apart.

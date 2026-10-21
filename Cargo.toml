@@ -12,6 +12,8 @@ members = [
 version = "3.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
+# Not published to crates.io (also keeps them out of THIRD_PARTY_LICENSES.txt).
+publish = false
 
 # ── Shared dependency versions ────────────────────────────────────────────────
 [workspace.dependencies]
@@ -24,6 +26,7 @@ thiserror = "2"
 name = "msst-net-core"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 license.workspace = true
 description = "MSST-Net Core — the privileged networking daemon."
 

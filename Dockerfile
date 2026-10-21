@@ -25,6 +25,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/msst-net-core /usr/local/bin/msst-net-core
+COPY LICENSE THIRD_PARTY_LICENSES.txt /usr/share/doc/msst-net-core/
 # Config and data in /var/lib/msst (the 3.0.x volume).
 ENV CORE_MODE=container
 VOLUME ["/var/lib/msst"]
