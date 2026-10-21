@@ -57,6 +57,7 @@
 - `member_joined` / `member_left` 的 `room_id` 放在外层 `WSMessage.RoomID`，客户端从外层读取。
 - `room_state`、`member_joined` 和 `/nodes/*` 为每台设备返回 `public_key`。它就是 WireGuard 公钥，缺失时客户端无法与该设备通信（路径视图显示 `no_key`）。
 - `GET /relays` 每项带 `pub_key`。没有 `pub_key` 的中转对客户端来说既没有游戏发现，也不能用 `0x0E` 注册。
+- `POST /dns/lookup`（PowerDNS 远程后端）对客户端保持可达：客户端用 `{"method":"lookup","parameters":{"qtype":"ANY","qname":…}}` 取自定义命名空间的 TXT / SRV / CNAME 记录（`/dns/resolve` 只给 A / AAAA）。不要在反向代理上把它限制为只允许 PowerDNS 访问；若要限制，请先提供等价的客户端接口。SRV 的 `content` 按控制器写入的 `优先级 权重 端口 目标` 解析（也接受 `权重 端口 目标`），TXT 的 `content` 按原文或带引号的区域文件格式解析。
 
 ### C5 访客设备的端点上报 — 已完成（`54d0d04`）
 
