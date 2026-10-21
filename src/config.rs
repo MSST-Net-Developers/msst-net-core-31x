@@ -1,7 +1,9 @@
 //! Configuration — TOML config file + CLI argument overrides.
 //!
 //! Config file location: `~/.config/msst-net/core.toml` (Linux/macOS)
-//! or `%APPDATA%\msst-net\core.toml` (Windows).
+//! or `%APPDATA%\msst-net\core.toml` (Windows).  In a container
+//! (`CORE_MODE=container`) the config and the data directory are in the
+//! `/var/lib/msst` volume.
 //!
 //! Every field has a default value.  The config file is auto-created on
 //! first run.  CLI arguments override config file values.
@@ -32,7 +34,8 @@ pub struct CoreConfig {
     /// Log level filter (default: "info").
     pub log_level: String,
     /// Data directory for identity, config, and cache files.
-    /// Default: `~/.local/share/msst-net` (Linux), `~/Library/msst-net` (macOS).
+    /// Default: `~/.local/share/msst-net` (Linux), `~/Library/msst-net` (macOS),
+    /// `/var/lib/msst` in a container.
     pub data_dir: Option<String>,
     /// Whether to run as a background daemon (default: false on TTY).
     pub daemon: bool,
@@ -68,10 +71,15 @@ impl CoreConfig {
     ///
     /// Without an explicit `data_dir`, a 3.0.x data directory that already
     /// holds an `identity.json` takes precedence over the 3.1.x default, so
-    /// upgrading keeps the device's keypair, IDs and virtual IPs.
+    /// upgrading keeps the device's keypair, IDs and virtual IPs.  In a
+    /// container the default is the `/var/lib/msst` volume (also 3.0.x's),
+    /// so a re-created container keeps them too.
     pub fn resolve_data_dir(&self) -> PathBuf {
         let dir = if let Some(ref d) = self.data_dir {
             PathBuf::from(d)
+        } else if container_mode() {
+            let earlier = dirs::data_dir().map(|b| b.join("msst-net"));
+            prefer_existing(PathBuf::from(CONTAINER_DIR), earlier, |d| d.join("identity.json").exists())
         } else if let Some(legacy) = legacy_data_dir().filter(|d| d.join("identity.json").exists()) {
             legacy
         } else if let Some(base) = dirs::data_dir() {
@@ -129,11 +137,30 @@ fn legacy_coordinator_url(path: &std::path::Path) -> Option<String> {
     })
 }
 
+/// The container volume for config and data (`CORE_MODE=container`; the
+/// 3.0.x data directory there).
+const CONTAINER_DIR: &str = "/var/lib/msst";
+
+/// Running in a container (3.0.x's `CORE_MODE=container`).
+fn container_mode() -> bool {
+    std::env::var("CORE_MODE").as_deref() == Ok("container")
+}
+
+/// `primary`, unless only an `earlier` location is in use (`in_use`): a
+/// 3.1 container started before Core kept its files in the volume, whose
+/// files must not be abandoned while they still exist.
+fn prefer_existing(primary: PathBuf, earlier: Option<PathBuf>, in_use: impl Fn(&std::path::Path) -> bool) -> PathBuf {
+    match earlier {
+        Some(e) if !in_use(&primary) && in_use(&e) => e,
+        _ => primary,
+    }
+}
+
 /// The 3.0.x data directory: `/var/lib/msst` when `CORE_MODE=container`,
 /// otherwise `~/MSST-Net`.
 fn legacy_data_dir() -> Option<PathBuf> {
-    if std::env::var("CORE_MODE").as_deref() == Ok("container") {
-        return Some(PathBuf::from("/var/lib/msst"));
+    if container_mode() {
+        return Some(PathBuf::from(CONTAINER_DIR));
     }
     dirs::home_dir().map(|home| home.join("MSST-Net"))
 }
@@ -142,8 +169,12 @@ fn legacy_data_dir() -> Option<PathBuf> {
 // Config file I/O
 // ---------------------------------------------------------------------------
 
-/// Default config file path.
+/// Default config file path (`/var/lib/msst/core.toml` in a container).
 pub fn default_config_path() -> PathBuf {
+    if container_mode() {
+        let earlier = dirs::config_dir().map(|d| d.join("msst-net").join("core.toml"));
+        return prefer_existing(PathBuf::from(CONTAINER_DIR).join("core.toml"), earlier, |p| p.exists());
+    }
     if let Some(config_dir) = dirs::config_dir() {
         config_dir.join("msst-net").join("core.toml")
     } else {
@@ -346,5 +377,22 @@ mod tests {
         assert_eq!(legacy_coordinator_url(&p).as_deref(), Some("http://10.0.0.1:8080"));
         assert_eq!(legacy_coordinator_url(&dir.join("missing.yaml")), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn container_volume_unless_only_an_earlier_location_is_in_use() {
+        let volume = PathBuf::from("/var/lib/msst");
+        let earlier = Some(PathBuf::from("/root/.local/share/msst-net"));
+        let in_use = |used: &'static [&'static str]| move |p: &std::path::Path| used.iter().any(|u| p == std::path::Path::new(u));
+        // New installation, and 3.0.x upgrades (identity in the volume).
+        assert_eq!(prefer_existing(volume.clone(), earlier.clone(), in_use(&[])), volume);
+        assert_eq!(prefer_existing(volume.clone(), earlier.clone(), in_use(&["/var/lib/msst"])), volume);
+        assert_eq!(
+            prefer_existing(volume.clone(), earlier.clone(), in_use(&["/var/lib/msst", "/root/.local/share/msst-net"])),
+            volume
+        );
+        // A 3.1 container that kept its identity in the home directory.
+        assert_eq!(prefer_existing(volume.clone(), earlier.clone(), in_use(&["/root/.local/share/msst-net"])), earlier.unwrap());
+        assert_eq!(prefer_existing(volume.clone(), None, in_use(&[])), volume);
     }
 }

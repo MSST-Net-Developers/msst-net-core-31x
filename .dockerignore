@@ -1,0 +1,6 @@
+# The Core image needs only the Rust sources (Dockerfile).
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!crates
