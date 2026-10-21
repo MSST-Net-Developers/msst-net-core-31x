@@ -1,0 +1,248 @@
+# Release per the installer's deployment contract
+# (msst-net-installer-31x docs/DEPLOYMENT_CONTRACT.md, section 2):
+# msst-net-core-<os>-<arch>[.exe], the abjust/msstnet31x-core:<version>
+# image, and a signed manifest.json (product msst-net-core) on the GitHub
+# Release of tag v<version>, synced to Gitee.
+#
+# Repository secrets: MSST_RELEASE_SIGNING_KEY (Core's Ed25519 key from
+# `msst-net-installer release keygen`), DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
+# GITEE_TOKEN.  Repository variables: MSST_CORE_RELEASE_PUBKEYS (the public
+# key, as built into the installer); optionally MSST_INSTALLER_REPO and
+# MSST_INSTALLER_REF (where the `release` tool is built from).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: abjust/msstnet31x-core
+
+jobs:
+  meta:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      ipc_protocol: ${{ steps.v.outputs.ipc_protocol }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Tag must match the Cargo version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "$version" != "$cargo_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match workspace version $cargo_version" >&2
+            exit 1
+          fi
+          case "$version" in
+            3.1.*) ;;
+            *) echo "the installer only accepts 3.1.x releases" >&2; exit 1 ;;
+          esac
+          # PROTOCOL_VERSION = make_version(major, minor, patch) → "major.minor"
+          ipc=$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = make_version(\([0-9]*\), *\([0-9]*\), *[0-9]*);/\1.\2/p' \
+            crates/msst-ipc-protocol/src/version.rs)
+          test -n "$ipc" || { echo "cannot read PROTOCOL_VERSION" >&2; exit 1; }
+          {
+            echo "version=$version"
+            echo "prerelease=$([[ $version == *-* ]] && echo true || echo false)"
+            echo "ipc_protocol=$ipc"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  build:
+    name: Build (${{ matrix.asset }})
+    needs: [meta, test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc 2.35 (Ubuntu 22.04, Debian 12 and later).
+          # `native`: the runner can run the binary (self-check).
+          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  native: true,  asset: msst-net-core-linux-x86_64 }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, native: true,  asset: msst-net-core-linux-aarch64 }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    native: true,  asset: msst-net-core-windows-x86_64.exe }
+          - { os: windows-latest,   target: aarch64-pc-windows-msvc,   native: false, asset: msst-net-core-windows-aarch64.exe }
+          - { os: macos-latest,     target: x86_64-apple-darwin,       native: false, asset: msst-net-core-macos-x86_64 }
+          - { os: macos-latest,     target: aarch64-apple-darwin,      native: true,  asset: msst-net-core-macos-aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} --bin msst-net-core
+      - name: Rename
+        shell: bash
+        run: |
+          ext=""
+          [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          cp "target/${{ matrix.target }}/release/msst-net-core$ext" "${{ matrix.asset }}"
+      - name: Self-check (the installer runs --version)
+        if: matrix.native
+        shell: bash
+        run: |
+          chmod +x "${{ matrix.asset }}"
+          out=$("./${{ matrix.asset }}" --version)
+          echo "$out"
+          [ "$out" = "msst-net-core ${{ needs.meta.outputs.version }}" ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  # One native build per platform, pushed by digest, then merged into one
+  # multi-arch tag (no QEMU: an emulated Rust release build takes hours).
+  image:
+    name: Image (${{ matrix.platform }})
+    needs: [meta, test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,     platform: linux/amd64 }
+          - { os: ubuntu-24.04-arm,  platform: linux/arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - name: Export digest
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: digests/*
+          if-no-files-found: error
+
+  image-merge:
+    name: Image (multi-arch)
+    needs: [meta, image]
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.merge.outputs.ref }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - id: merge
+        name: Tag <version> (and latest for a stable release)
+        run: |
+          tags=(-t "$IMAGE:$VERSION")
+          [ "$PRERELEASE" = "false" ] && tags+=(-t "$IMAGE:latest")
+          docker buildx imagetools create "${tags[@]}" $(printf "$IMAGE@sha256:%s " $(ls digests))
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "ref=$IMAGE:$VERSION@$digest" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+
+  release:
+    name: Manifest and GitHub Release
+    needs: [meta, build, image-merge]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      INSTALLER_REPO: ${{ vars.MSST_INSTALLER_REPO || 'MSST-Net-Developers/msst-net-installer-31x' }}
+      INSTALLER_REF: ${{ vars.MSST_INSTALLER_REF || 'main' }}
+    steps:
+      - name: Require the signing key and its public key
+        env:
+          KEY: ${{ secrets.MSST_RELEASE_SIGNING_KEY }}
+          PUBKEYS: ${{ vars.MSST_CORE_RELEASE_PUBKEYS }}
+        run: |
+          test -n "$KEY" || { echo "set the MSST_RELEASE_SIGNING_KEY secret" >&2; exit 1; }
+          test -n "$PUBKEYS" || { echo "set the MSST_CORE_RELEASE_PUBKEYS variable" >&2; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: msst-net-core-*
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@stable
+      # The manifest is written and checked by the installer's own code, so
+      # the two sides can't drift apart.
+      - name: Build the installer's release tool
+        run: |
+          # A branch or a tag.
+          git clone --depth 1 --branch "$INSTALLER_REF" "https://github.com/$INSTALLER_REPO" "$RUNNER_TEMP/installer-src"
+          cargo install --locked --path "$RUNNER_TEMP/installer-src" --bin msst-net-installer --root "$RUNNER_TEMP/installer"
+          echo "$RUNNER_TEMP/installer/bin" >> "$GITHUB_PATH"
+      - name: Manifest, sign, verify
+        env:
+          MSST_RELEASE_SIGNING_KEY: ${{ secrets.MSST_RELEASE_SIGNING_KEY }}
+          PUBKEYS: ${{ vars.MSST_CORE_RELEASE_PUBKEYS }}
+        run: |
+          chmod +x dist/msst-net-core-linux-* dist/msst-net-core-macos-*
+          msst-net-installer release manifest --product core --dir dist --version "$VERSION" \
+            --ipc-protocol "${{ needs.meta.outputs.ipc_protocol }}" --image "${{ needs.image-merge.outputs.ref }}"
+          msst-net-installer release sign --dir dist
+          args=()
+          IFS=',' read -ra keys <<< "$PUBKEYS"
+          for k in "${keys[@]}"; do args+=(--pubkey "$k"); done
+          msst-net-installer release verify --product core --dir dist "${args[@]}"
+          cat dist/manifest.json
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  sync-gitee:
+    name: Sync the Release to Gitee
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: trustedinster/sync-release-gitee@v1.3
+        with:
+          gitee_owner: Abjust
+          gitee_repo: msst-net-core-31x
+          gitee_token: ${{ secrets.GITEE_TOKEN }}
+          github_owner: MSST-Net-Developers
+          github_repo: msst-net-core-31x
+          gitee_upload_retry_times: 3
