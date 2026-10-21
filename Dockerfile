@@ -2,7 +2,7 @@
 #
 # MSST-Net Core image (3.1).  Build from the repository root:
 #
-#   docker buildx build -t msstnet/core .
+#   docker buildx build -t abjust/msstnet31x-core .
 #
 # Run with host networking, NET_ADMIN and /dev/net/tun, the /var/lib/msst
 # volume (identity, core.toml) and the IPC socket directory shared with the
