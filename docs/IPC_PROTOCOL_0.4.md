@@ -259,6 +259,14 @@ Add `"async": true` to a command request:
   and `NodeStateChanged` (previously `""` was passed through); a peer
   without a device ID is ignored instead of failing the whole
   `room_state`.
+- **`StartDiagPing` measures the path the peer's traffic takes:** its
+  active direct endpoint (P2P ping) while the path is direct, otherwise a
+  probe inside the WireGuard session through the relays, answered by the
+  peer's Core (a handshake is started if there is no session, so the
+  first result may include it).  It used to always ping the first
+  announced direct endpoint, which timed out for every relayed peer and
+  sent direct packets with P2P disabled.  `GetDiagPingResult` adds
+  `path`: `"direct"` | `"relay"`.
 - **Typed bodies** (`msst_ipc_protocol::views`): `Health`, `GetNodes`
   (`Nodes`), `GetNode` (`NodeDetail`), `OperationAccepted`,
   `OperationView`.  JSON is unchanged; Rust Controllers can decode with

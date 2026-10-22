@@ -176,7 +176,8 @@ pub enum IpcRequest {
     DnsUpdateRecord { domain: String, record_id: String, patch: serde_json::Value },
     /// Delete a DNS record.
     DnsDeleteRecord { domain: String, record_id: String },
-    /// Start a diagnostic ping to a peer.
+    /// Start a diagnostic ping to a peer, over the path its traffic takes
+    /// (direct endpoint, or in-tunnel through the relays).
     StartDiagPing { device_id: String },
     /// Get a diagnostic ping result.
     GetDiagPingResult { job_id: String },

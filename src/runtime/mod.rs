@@ -740,6 +740,29 @@ async fn send_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: &crat
     }
 }
 
+/// Send a diagnostic ping (`crate::diagnostics`) to a peer inside its
+/// WireGuard session over the relay route.  Unlike the relay-path probe it
+/// may start a handshake: the probe waits in boringtun's queue, as a ping
+/// from the TUN would.  Returns false if it could not be sent or queued.
+pub(crate) async fn send_diag_probe(state: &Arc<CoreState>, device_id: &str, seq: u32) -> bool {
+    let (Some(src), Some(dst)) = (vpn_ipv4(state).await, peer_ipv4(state, device_id).await) else { return false };
+    let Some(target) = relay_target(state, device_id).await else { return false };
+    let probe = crate::tunnel_probe::Probe { kind: crate::tunnel_probe::Kind::Ping, src, dst, seq, sent_ms: current_time_ms() };
+    let (out, changes) = {
+        let mut enc = state.encryption.lock().await;
+        (enc.outbound(device_id, &probe.encode(), current_unix()), enc.take_changes())
+    };
+    state.emit_encryption_changes(changes);
+    match out {
+        Outbound::Send(msg) => send_wg(state, device_id, target, std::slice::from_ref(&msg)).await,
+        Outbound::Queued => true,
+        Outbound::NoKey => {
+            crate::nodes::demand(state, crate::nodes::FetchDemand::ByDevice(device_id.to_string()));
+            false
+        }
+    }
+}
+
 /// Answer or account for a relay-path probe that arrived in `device_id`'s
 /// session from `src` (the relay it came through).
 async fn on_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: crate::tunnel_probe::Probe, src: std::net::SocketAddr) {
@@ -747,6 +770,9 @@ async fn on_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: crate::
     match probe.kind {
         Kind::Ping => send_tunnel_probe(state, device_id, &probe.pong()).await,
         Kind::Pong => {
+            if crate::diagnostics::on_probe_pong(state, device_id, probe.seq) {
+                return;
+            }
             let src = msst_core_state::net::relay::unmap_addr(src);
             let now = current_unix();
             let rtt_ms = current_time_ms().saturating_sub(probe.sent_ms) as f64;
@@ -1823,6 +1849,33 @@ mod tests {
         // One initiation, the packets queued; nothing in plaintext.
         assert_eq!(*seen.lock().unwrap(), [msst_packet::TYPE_WG]);
         assert_eq!(enc_state(&a, &b).await, Some(EncState::Handshaking));
+    }
+
+    #[tokio::test]
+    async fn diag_ping_through_the_relay_starts_the_session_and_measures() {
+        let a = wg_core("diag-a", 0x77).await;
+        let mut b = wg_core("diag-b", 0x78).await;
+        let (relay, seen) = relay_pair(&a, &b).await;
+        know(&a, &b, relay).await;
+        know(&b, &a, relay).await;
+        // No session yet, P2P never used: the ping goes through the relay.
+        let job = crate::diagnostics::start_ping(&a.state, b.id.device.id.clone()).await.unwrap()["job_id"].as_str().unwrap().to_string();
+        let mut done = serde_json::Value::Null;
+        for _ in 0..60 {
+            done = crate::diagnostics::ping_result(&a.state, &job).unwrap();
+            if done["done"] == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(done["path"], "relay");
+        let results = done["results"].as_array().unwrap();
+        assert_eq!(results.len(), crate::diagnostics::DIAG_PING_COUNT);
+        assert!(results.iter().all(|r| r.is_number()), "{:?}", results);
+        assert!(seen.lock().unwrap().iter().all(|t| *t == msst_packet::TYPE_WG));
+        // Probes are Core's own: never delivered to the peer's TUN.
+        assert_eq!(recv_tun(&mut b).await, None);
+        assert!(a.state.diag_probe_waiters.lock().unwrap().is_empty());
     }
 
     // ── Relay selection against a fake coordinator + fake relay ──────────

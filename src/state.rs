@@ -227,6 +227,7 @@ pub struct CoreState {
     pub traffic: crate::diagnostics::TrafficMap,
     /// Diagnostic ping jobs.
     pub ping_jobs: crate::diagnostics::PingJobs,
+    pub diag_probe_waiters: crate::diagnostics::ProbeWaiters,
     /// Room members as last told to the peer cache.
     pub room_cache_members: std::sync::Mutex<HashSet<String>>,
     /// Devices referenced by active rules, as last told to the peer cache.
@@ -274,6 +275,7 @@ impl CoreState {
             access_auth_required: std::sync::atomic::AtomicBool::new(false),
             traffic: std::sync::RwLock::new(HashMap::new()),
             ping_jobs: std::sync::Mutex::new(HashMap::new()),
+            diag_probe_waiters: std::sync::Mutex::new(HashMap::new()),
             room_cache_members: std::sync::Mutex::new(HashSet::new()),
             rule_ref_devices: std::sync::Mutex::new(HashSet::new()),
             dns: std::sync::OnceLock::new(),
