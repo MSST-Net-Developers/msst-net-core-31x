@@ -209,8 +209,8 @@ async fn inbound_loop(
                         }
                         let res = wg_inbound(&state, &src_id, &pkt.payload, src, now).await;
                         if let Some(ip) = res.packet {
-                            if !crate::inbound::from_peer_address(&state, &src_id, &ip).await {
-                                debug!("inbound: dropped WireGuard packet from {} with a foreign source address", src_id);
+                            if !crate::inbound::from_peer_to_us(&state, &src_id, &ip).await {
+                                debug!("inbound: dropped WireGuard packet from {}: not from its address to ours", src_id);
                             } else if let Some(probe) = crate::tunnel_probe::Probe::decode(&ip) {
                                 // Relay-path probe: Core's own, never the TUN's.
                                 on_tunnel_probe(&state, &src_id, probe, src).await;
@@ -1870,8 +1870,16 @@ mod tests {
         a.state.udp_socket.send_to(&ping, b_addr).await.unwrap();
         assert_eq!(recv_tun(&mut b).await, None);
 
-        // A decrypted packet must carry a's own address.
+        // A decrypted packet must carry a's own address …
         route_outbound_packet(&icmp_echo("172.22.9.9", &b4), &a.state).await;
+        assert_eq!(recv_tun(&mut b).await, None);
+        // … and be addressed to b: nothing for b's other networks.
+        let foreign = icmp_echo(&a4, "192.168.1.10");
+        let msg = match a.state.encryption.lock().await.outbound(&b.id.device.id, &foreign, current_unix()) {
+            Outbound::Send(m) => m,
+            other => panic!("{:?}", other),
+        };
+        send_wg(&a.state, &b.id.device.id, relay, std::slice::from_ref(&msg)).await;
         assert_eq!(recv_tun(&mut b).await, None);
 
         // The other direction.

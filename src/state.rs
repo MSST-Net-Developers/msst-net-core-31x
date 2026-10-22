@@ -35,6 +35,9 @@ pub struct NetState {
     /// Whether this device is authenticated (has OIDC credentials).  Used
     /// by the guest restriction on inbound traffic.
     pub local_authenticated: bool,
+    /// Our virtual IPv4/IPv6 addresses (the TUN's, set with the identity at
+    /// startup): the only destinations peer packets may have.
+    pub local_ips: Vec<std::net::IpAddr>,
     /// Device IDs currently in a shared room with us.
     pub room_peers: HashSet<String>,
     /// Rooms this device has joined: room_id → room_name.  Re-joined on
@@ -112,6 +115,7 @@ impl NetState {
             acl_rules: Vec::new(),
             acl_labels: HashMap::new(),
             local_authenticated: false,
+            local_ips: Vec::new(),
             room_peers: HashSet::new(),
             joined_rooms: HashMap::new(),
             room_password_verifiers: HashMap::new(),
@@ -309,6 +313,8 @@ impl CoreState {
             net.local_device_id = identity.device.id.clone();
             net.local_user_id = identity.user.id.clone();
             net.local_authenticated = identity.auth.is_some();
+            let (v4, v6) = identity.virtual_ips();
+            net.local_ips = [v4, v6].iter().filter_map(|a| a.parse().ok()).collect();
         }
         *self.scheduler.lock().await = P2PScheduler::new(identity.device.id.clone());
         self.encryption.lock().await.set_local_keypair(identity.secret_key);

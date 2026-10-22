@@ -3,7 +3,7 @@
 //! `trigger_interactive_auth` / `auth_decision`).
 //!
 //! Every IP packet from a peer (decrypted from its WireGuard session, see
-//! [`from_peer_address`]) goes through [`deliver_inbound`].  The only other
+//! [`from_peer_to_us`]) goes through [`deliver_inbound`].  The only other
 //! way into the TUN is verified discovery broadcasts (`crate::discovery`).
 
 use crate::state::CoreState;
@@ -38,12 +38,16 @@ fn proto_str(p: Protocol) -> &'static str {
     }
 }
 
-/// Whether a packet decrypted from `device_id`'s WireGuard session carries
-/// that peer's own virtual address as its source (WireGuard "AllowedIPs").
-pub async fn from_peer_address(state: &CoreState, device_id: &str, pkt: &[u8]) -> bool {
+/// Whether a packet decrypted from `device_id`'s WireGuard session goes
+/// from that peer's own virtual address (WireGuard "AllowedIPs") to one of
+/// ours.  Any other destination would be routed on by the kernel where IP
+/// forwarding is on, letting a peer reach this host's other networks
+/// through any port the ACL opens to it (the ACL matches ports only).
+pub async fn from_peer_to_us(state: &CoreState, device_id: &str, pkt: &[u8]) -> bool {
     let Some(parsed) = crate::runtime::parse_ip_packet(pkt) else { return false };
     let net = state.net.read().await;
-    net.peer_list.get(device_id).is_some_and(|e| e.ipv4 == parsed.src_ip || e.ipv6 == parsed.src_ip)
+    net.local_ips.contains(&parsed.dst_ip)
+        && net.peer_list.get(device_id).is_some_and(|e| e.ipv4 == parsed.src_ip || e.ipv6 == parsed.src_ip)
 }
 
 /// The verdict of a fragmented datagram's first fragment, applied to its
