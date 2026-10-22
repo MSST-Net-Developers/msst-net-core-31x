@@ -190,10 +190,9 @@ pub async fn relays(state: &CoreState) -> Result<Value, IpcError> {
     if body.is_object() {
         body["current"] = json!(net.relay_addr);
         body["rtt_ms"] = json!(net.relay_rtt.all());
-        // Additive: secure discovery state for the current relay.
-        let mut sd = state.sdisc_stats.snapshot();
-        sd["active"] = json!(net.relay_pub_key.is_some());
-        body["secure_discovery"] = sd;
+        // Game discovery (over WireGuard since 3.1.6; `secure_discovery`,
+        // the retired relay-based sdisc, is gone).
+        body["discovery"] = state.discovery_stats.snapshot();
         // Registration with the current relay (sreg v1 or legacy 0x01/0x02).
         let tx_sreg = state.relay_reg.lock().unwrap_or_else(|e| e.into_inner()).tx_sreg;
         let path_ok = state.relay_path_ok_at.load(std::sync::atomic::Ordering::Relaxed);

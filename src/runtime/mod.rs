@@ -113,7 +113,7 @@ impl CoreRuntime {
 
     /// Start the local DNS resolver (+ system split-DNS) and the game
     /// discovery proxy.  Requires the TUN (`iface`).
-    pub async fn start_dns_and_discovery(&mut self, iface: &str, tun_tx: mpsc::Sender<Vec<u8>>) {
+    pub async fn start_dns_and_discovery(&mut self, iface: &str) {
         let resolver = crate::dns::DnsResolver::new(&self.state);
         let _ = self.state.dns.set(resolver.clone());
         let mode = self.state.net_settings.read().await.linux_dns_mode;
@@ -129,7 +129,7 @@ impl CoreRuntime {
                 warn!("dns: failed to persist iptables fallback: {}", e);
             }
         }
-        let (disc_tx, handles) = crate::discovery::start(self.state.clone(), tun_tx).await;
+        let (disc_tx, handles) = crate::discovery::start(self.state.clone()).await;
         let _ = self.state.discovery_tx.set(disc_tx);
         for h in handles {
             self.tasks.push(TaskHandle::new("discovery", h));
@@ -214,6 +214,8 @@ async fn inbound_loop(
                             } else if let Some(probe) = crate::tunnel_probe::Probe::decode(&ip) {
                                 // Relay-path probe: Core's own, never the TUN's.
                                 on_tunnel_probe(&state, &src_id, probe, src).await;
+                            } else if crate::discovery::on_tunnel_message(&state, &tun_tx, &src_id, &ip).await {
+                                // A member's game discovery broadcast.
                             } else {
                                 crate::inbound::deliver_inbound(&state, &tun_tx, ip).await;
                             }
@@ -522,6 +524,7 @@ async fn coordinator_event_loop(
                     if !endpoints.is_empty() {
                         net.set_peer_on_room_relay(&device_id, crate::room_relay::reports_room_relay(&endpoints));
                         net.set_peer_candidates(&device_id, crate::endpoints::direct_candidates(&endpoints));
+                        net.set_peer_discovery(&device_id, &endpoints);
                     }
                 } else if referenced {
                     // A node we care about is online: fetch it even if a
@@ -790,6 +793,27 @@ pub(crate) async fn replay_pending_handshake(state: &CoreState, device_id: &str)
     }
 }
 
+/// Send a Core-generated IP packet to a peer inside its WireGuard session,
+/// over its current path (direct or relay), as `route_packet` would; it may
+/// start a handshake (the packet then waits in boringtun's queue).
+/// Returns false if it could not be sent or queued.
+pub(crate) async fn send_in_tunnel(state: &CoreState, device_id: &str, pkt: &[u8]) -> bool {
+    let Some(target) = peer_target(state, device_id).await else { return false };
+    let (out, changes) = {
+        let mut enc = state.encryption.lock().await;
+        (enc.outbound(device_id, pkt, current_unix()), enc.take_changes())
+    };
+    state.emit_encryption_changes(changes);
+    match out {
+        Outbound::Send(msg) => send_wg(state, device_id, target, std::slice::from_ref(&msg)).await,
+        Outbound::Queued => true,
+        Outbound::NoKey => {
+            crate::nodes::demand(state, crate::nodes::FetchDemand::ByDevice(device_id.to_string()));
+            false
+        }
+    }
+}
+
 /// Send a diagnostic ping (`crate::diagnostics`) to a peer inside its
 /// WireGuard session over the relay route.  Unlike the relay-path probe it
 /// may start a handshake: the probe waits in boringtun's queue, as a ping
@@ -1000,7 +1024,7 @@ async fn relay_registration_packet(state: &Arc<CoreState>, device_id: &str, firs
         .relay_reg
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .packet(&sk, crate::sdisc::wire_id(device_id), &relay_pk?, current_time_ms());
+        .packet(&sk, crate::sreg::wire_id(device_id), &relay_pk?, current_time_ms());
     if pkt.is_none() {
         warn!("relay: the relay's key is invalid (low-order) — cannot register");
     }
@@ -1044,7 +1068,7 @@ async fn relay_keepalive_loop(state: Arc<CoreState>) {
 
 /// Take the room relay from a `room_state`.  It never changes, so a repeated
 /// `room_state` (e.g. after a reconnect) keeps its health and registration.
-/// An unusable one (bad key, no `sreg1`/`sdisc1`) is ignored: everyone
+/// An unusable one (bad key, no `sreg1`) is ignored: everyone
 /// then uses their preferred relays.
 pub(crate) async fn apply_room_relay(state: &Arc<CoreState>, room_id: &str, relay: Option<&crate::coordinator::messages::RoomStateRelay>) {
     use crate::room_relay::RoomRelay;
@@ -1111,7 +1135,7 @@ async fn send_room_relay_registration(state: &Arc<CoreState>, addr: &str, relay_
         return;
     }
     let Some(sk) = state.identity.read().await.as_ref().map(|i| i.secret_key) else { return };
-    let pkt = state.room_relay_reg.lock().unwrap_or_else(|e| e.into_inner()).packet(&sk, crate::sdisc::wire_id(device_id), relay_pk, current_time_ms());
+    let pkt = state.room_relay_reg.lock().unwrap_or_else(|e| e.into_inner()).packet(&sk, crate::sreg::wire_id(device_id), relay_pk, current_time_ms());
     let Some(pkt) = pkt else {
         warn!("room relay: its key is invalid (low-order) — cannot register");
         return;
@@ -1950,6 +1974,71 @@ mod tests {
         assert!(evicted.is_empty(), "evicted while in use: {:?}", evicted);
     }
 
+    /// Put a core in a room with `peer`, discovery running, and record
+    /// whether `peer` announced discovery over WireGuard.
+    async fn discovery_room(core: &WgCore, peer: &WgCore, peer_supports: bool) {
+        let (tx, _) = crate::discovery::start(core.state.clone()).await;
+        let _ = core.state.discovery_tx.set(tx);
+        let mut net = core.state.net.write().await;
+        net.joined_rooms.insert("space-1".into(), "Room".into());
+        let eps: Vec<String> = if peer_supports { vec![crate::discovery::FEATURE_ENDPOINT.into()] } else { vec!["relay:r:1".into()] };
+        net.set_peer_discovery(&peer.id.device.id, &eps);
+    }
+
+    /// A Bedrock-style LAN broadcast from `core`'s address.
+    fn lan_broadcast(core: &WgCore, payload: &[u8]) -> Vec<u8> {
+        let src: std::net::Ipv4Addr = core.id.virtual_ips().0.parse().unwrap();
+        crate::ippkt::build_udp(src.into(), 19132, std::net::Ipv4Addr::new(172, 22, 255, 255).into(), 19132, payload)
+    }
+
+    #[tokio::test]
+    async fn discovery_goes_to_each_member_end_to_end() {
+        let a = wg_core("disc-a", 0x81).await;
+        let mut b = wg_core("disc-b", 0x82).await;
+        let (relay, seen) = relay_pair(&a, &b).await;
+        know(&a, &b, relay).await;
+        know(&b, &a, relay).await;
+        discovery_room(&a, &b, true).await;
+        discovery_room(&b, &a, true).await;
+
+        // A game on a broadcasts: b's TUN gets it, from a's address.
+        let pkt = lan_broadcast(&a, b"MCPE;world");
+        a.state.discovery_tx.get().unwrap().send(pkt.clone()).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), b.tun.recv()).await.unwrap().unwrap();
+        assert_eq!(got, pkt);
+        // Only WireGuard crossed the relay (no sdisc, no plaintext).
+        assert!(seen.lock().unwrap().iter().all(|t| *t == msst_packet::TYPE_WG));
+        assert_eq!(a.state.discovery_stats.snapshot()["tx_messages"], 1);
+        assert_eq!(b.state.discovery_stats.snapshot()["rx_accepted"], 1);
+        let room = crate::rooms::room_view(&a.state).await;
+        let peer = room["peers"].as_array().unwrap().iter().find(|p| p["device_id"] == b.id.device.id.as_str()).unwrap().clone();
+        assert_eq!(peer["discovery"], "ok");
+
+        // b leaves the room on its side: a's next broadcast is refused there.
+        b.state.net.write().await.room_peers.remove(&a.id.device.id);
+        a.state.discovery_tx.get().unwrap().send(lan_broadcast(&a, b"MCPE;world 2")).await.unwrap();
+        assert!(crate::test_support::eventually(|| b.state.discovery_stats.drop_not_member.load(std::sync::atomic::Ordering::Relaxed) == 1).await);
+        assert_eq!(recv_tun(&mut b).await, None);
+    }
+
+    #[tokio::test]
+    async fn no_discovery_to_a_member_without_support() {
+        let a = wg_core("disc-old-a", 0x83).await;
+        let mut b = wg_core("disc-old-b", 0x84).await;
+        let (relay, seen) = relay_pair(&a, &b).await;
+        know(&a, &b, relay).await;
+        know(&b, &a, relay).await;
+        // b announced endpoints without the feature (an older Core).
+        discovery_room(&a, &b, false).await;
+        discovery_room(&b, &a, true).await;
+        a.state.discovery_tx.get().unwrap().send(lan_broadcast(&a, b"MCPE;world")).await.unwrap();
+        assert!(crate::test_support::eventually(|| a.state.discovery_stats.tx_skipped_unsupported.load(std::sync::atomic::Ordering::Relaxed) == 1).await);
+        assert_eq!(recv_tun(&mut b).await, None);
+        assert!(seen.lock().unwrap().is_empty(), "nothing sent, through the relay or otherwise");
+        let room = crate::rooms::room_view(&a.state).await;
+        assert!(room["peers"].as_array().unwrap().iter().any(|p| p["discovery"] == "unsupported"));
+    }
+
     #[tokio::test]
     async fn diag_ping_through_the_relay_starts_the_session_and_measures() {
         let a = wg_core("diag-a", 0x77).await;
@@ -2063,7 +2152,7 @@ mod tests {
         let got = collect(&relay, std::time::Duration::from_millis(1600)).await;
         keepalive.abort();
         assert_eq!(got.len(), 2, "{:?}", got);
-        let id = crate::sdisc::wire_id("device-11111111");
+        let id = crate::sreg::wire_id("device-11111111");
         let key = crate::sreg::derive_key(&[1u8; 32], id, &relay_pk).unwrap();
         let mut last = 0;
         for p in &got {
@@ -2170,7 +2259,7 @@ mod tests {
             features: vec!["sdisc1".into(), "sreg1".into()],
             self_hosted: true,
         };
-        let id = crate::sdisc::wire_id("device-11111111");
+        let id = crate::sreg::wire_id("device-11111111");
         let key = crate::sreg::derive_key(&[1u8; 32], id, &relay_pk).unwrap();
 
         // Registered at once, then ~1 s later by the keepalive loop.

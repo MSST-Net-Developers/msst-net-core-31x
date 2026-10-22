@@ -111,6 +111,7 @@ pub async fn evict_expired(state: &CoreState) {
             let mut net = state.net.write().await;
             net.peer_list.remove(id);
             net.peer_endpoints.remove(id);
+            net.peer_discovery.remove(id);
         }
         state.traffic.write().unwrap_or_else(|e| e.into_inner()).remove(id);
         state.next_generation();

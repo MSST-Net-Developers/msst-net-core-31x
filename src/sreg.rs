@@ -21,7 +21,6 @@
 //! `0x01`: `features` comes from the coordinator over HTTPS, while "it
 //! doesn't seem to work" can be caused by an attacker.  Never log `k_reg`.
 
-use crate::sdisc::next_counter;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use msst_core_state::net::msst_packet::{MsstPacket, VERSION};
@@ -29,6 +28,8 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const TYPE_SREG: u8 = 0x0E;
+/// Counters are `unix_ms << COUNTER_SHIFT | seq`.
+const COUNTER_SHIFT: u32 = 16;
 /// The relay feature that means "accepts 0x0E".
 pub const FEATURE: &str = "sreg1";
 pub const PACKET_LEN: usize = 47;
@@ -45,6 +46,18 @@ impl std::fmt::Debug for SregKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SregKey(..)")
     }
+}
+
+/// The 64-bit wire ID of `device-xxxxxxxx` (big-endian u64 of the 8 hex
+/// digits), as carried in MSST headers.
+pub fn wire_id(device_id: &str) -> u64 {
+    u64::from_be_bytes(msst_core_state::net::msst_packet::encode_id(device_id))
+}
+
+/// Strictly increasing counter `unix_ms << 16 | seq` (the relay rejects
+/// counters too far from its clock, and any not above the last one).
+pub fn next_counter(last: u64, now_ms: u64) -> u64 {
+    (last + 1).max(now_ms << COUNTER_SHIFT)
 }
 
 /// Derive `k_reg`.  `None` for a low-order relay key (all-zero secret).
@@ -164,7 +177,7 @@ mod tests {
             hex(PublicKey::from(&StaticSecret::from([1u8; 32])).as_bytes()),
             "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209"
         );
-        let id = crate::sdisc::wire_id("device-a1b2c3d4");
+        let id = wire_id("device-a1b2c3d4");
         assert_eq!(id, 0xa1b2c3d4);
         let key = derive_key(&[1u8; 32], id, &relay_pk).unwrap();
         assert_eq!(hex(&key.0), "600586d9b33a5bcb970b6998524c7974ef368a4d2c48d4cdb649fe194840c2cc");

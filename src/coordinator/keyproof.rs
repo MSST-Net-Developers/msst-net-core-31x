@@ -54,7 +54,7 @@ pub fn proof_mac(device_sk: &[u8; 32], device_id: &str, server_pub: &[u8; 32], c
         return None;
     }
     let mut info = Vec::with_capacity(8 + 32 + 32);
-    info.extend_from_slice(&crate::sdisc::wire_id(device_id).to_be_bytes());
+    info.extend_from_slice(&crate::sreg::wire_id(device_id).to_be_bytes());
     info.extend_from_slice(device_pub.as_bytes());
     info.extend_from_slice(server_pub);
     let mut k = [0u8; 32];

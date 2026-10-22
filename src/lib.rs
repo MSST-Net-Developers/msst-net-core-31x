@@ -33,7 +33,6 @@ mod relay;
 mod room_relay;
 mod rooms;
 mod routing;
-mod sdisc;
 mod sreg;
 mod tunnel_probe;
 mod runtime;

@@ -18,6 +18,7 @@
         "peers": [
           {
             "device_id": "device-0000000b",
+            "discovery": "unsupported",
             "display_name": "Bob PC",
             "hostname": "pc.bob.ezplay.msst.net",
             "ipv4": "172.22.1.1",

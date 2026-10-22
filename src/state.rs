@@ -60,9 +60,9 @@ pub struct NetState {
     pub ping_enabled: bool,
     /// The relay server address we're registered with (numeric `IP:port`).
     pub relay_addr: Option<String>,
-    /// The key `GET /relays` advertised for `relay_addr` (sdisc v1 and
-    /// sreg v1).  `None`: the relay doesn't support them — no game
-    /// discovery.  Always set together with `relay_addr`.
+    /// The key `GET /relays` advertised for `relay_addr` (sreg v1).
+    /// `None`: the relay doesn't support it — legacy registration.  Always
+    /// set together with `relay_addr`.
     pub relay_pub_key: Option<[u8; 32]>,
     /// Register with `relay_addr` using `0x0E` (sreg v1) instead of
     /// `0x01`/`0x02`.  Always set together with `relay_addr`.
@@ -70,6 +70,9 @@ pub struct NetState {
     /// Peers' announced direct endpoints (P2P candidates), from room
     /// state, node fetches and node events.
     pub peer_endpoints: HashMap<String, Vec<std::net::SocketAddr>>,
+    /// Whether each peer's latest endpoint list announced discovery over
+    /// WireGuard (`set_peer_discovery`); absent: no endpoints seen yet.
+    pub peer_discovery: HashMap<String, bool>,
     /// Relay RTT measurements (own relay + peers' relays).
     pub relay_rtt: crate::relay::RelayRttTracker,
     /// Coordinator base URL.
@@ -96,6 +99,35 @@ impl NetState {
         } else {
             self.peers_on_room_relay.remove(device_id);
         }
+    }
+
+    /// Record from a peer's latest (non-empty) endpoint list whether it
+    /// takes part in discovery over WireGuard (`crate::discovery`).
+    pub fn set_peer_discovery(&mut self, device_id: &str, endpoints: &[String]) {
+        let s = crate::discovery::DiscoverySupport::of_endpoints(endpoints);
+        self.peer_discovery.insert(device_id.to_string(), s == crate::discovery::DiscoverySupport::Supported);
+    }
+
+    pub fn discovery_support(&self, device_id: &str) -> crate::discovery::DiscoverySupport {
+        use crate::discovery::DiscoverySupport;
+        match self.peer_discovery.get(device_id) {
+            Some(true) => DiscoverySupport::Supported,
+            Some(false) => DiscoverySupport::Unsupported,
+            None => DiscoverySupport::Unknown,
+        }
+    }
+
+    /// The other members of our room with a virtual IPv4 address, and
+    /// whether each takes part in discovery.
+    pub fn discovery_members(&self) -> Vec<(String, std::net::Ipv4Addr, crate::discovery::DiscoverySupport)> {
+        self.room_peers
+            .iter()
+            .filter(|id| **id != self.local_device_id)
+            .filter_map(|id| match self.peer_list.get(id)?.ipv4 {
+                std::net::IpAddr::V4(a) => Some((id.clone(), a, self.discovery_support(id))),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Replace a peer's direct-path candidates with those of its latest
@@ -129,6 +161,7 @@ impl NetState {
             relay_sreg: false,
             relay_rtt: crate::relay::RelayRttTracker::default(),
             peer_endpoints: HashMap::new(),
+            peer_discovery: HashMap::new(),
             coord_url: String::new(),
         }
     }
@@ -217,8 +250,10 @@ pub struct CoreState {
     pub metrics: std::sync::OnceLock<Arc<crate::observability::metrics::CoreMetrics>>,
     /// Outbound discovery-proxy queue (set when the TUN is up).
     pub discovery_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    /// Secure-discovery (sdisc v1) counters.
-    pub sdisc_stats: crate::discovery::SdiscStats,
+    /// Game discovery counters (`GetRelays.discovery`).
+    pub discovery_stats: crate::discovery::DiscoveryStats,
+    /// Receive-side discovery rate limits (`crate::discovery::RxLimits`).
+    pub discovery_rx_limits: std::sync::Mutex<crate::discovery::RxLimits>,
     /// Registration with the current relay (sreg v1 key, counter, schedule).
     pub relay_reg: std::sync::Mutex<crate::sreg::Registration>,
     /// Registration with the room relay (sreg v1; see `crate::room_relay`).
@@ -289,7 +324,8 @@ impl CoreState {
             dns: std::sync::OnceLock::new(),
             metrics: std::sync::OnceLock::new(),
             discovery_tx: std::sync::OnceLock::new(),
-            sdisc_stats: Default::default(),
+            discovery_stats: Default::default(),
+            discovery_rx_limits: Default::default(),
             relay_reg: Default::default(),
             room_relay_reg: Default::default(),
             relay_path_ok_at: std::sync::atomic::AtomicI64::new(0),

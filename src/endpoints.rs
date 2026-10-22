@@ -118,6 +118,7 @@ async fn detect_public_ipv4(state: &CoreState) -> Option<SocketAddr> {
 }
 
 /// Build the endpoint list (pure).
+#[allow(clippy::too_many_arguments)]
 pub fn build_endpoints(
     disable_p2p: bool,
     stun_addr: Option<SocketAddr>,
@@ -126,6 +127,7 @@ pub fn build_endpoints(
     port: u16,
     relay: Option<&str>,
     room_relay: Option<&str>,
+    discovery: bool,
 ) -> Vec<String> {
     let mut eps = Vec::new();
     if !disable_p2p {
@@ -135,6 +137,10 @@ pub fn build_endpoints(
     }
     eps.extend(relay.map(|r| format!("relay:{}", r)));
     eps.extend(room_relay.map(|r| format!("{}{}", crate::room_relay::ENDPOINT_PREFIX, r)));
+    // Not an address: what we support (older clients ignore it).
+    if discovery && !eps.is_empty() {
+        eps.push(crate::discovery::FEATURE_ENDPOINT.to_string());
+    }
     eps
 }
 
@@ -172,7 +178,7 @@ async fn detect_and_report(state: &Arc<CoreState>) -> Result<(), String> {
         (net.local_device_id.clone(), net.relay_addr.clone(), room_relay)
     };
     let (lan, v6) = if disable_p2p { (Vec::new(), Vec::new()) } else { (stun::detect_lan_ipv4(), stun::detect_public_ipv6()) };
-    let endpoints = build_endpoints(disable_p2p, stun_addr, &lan, &v6, port, relay.as_deref(), room_relay.as_deref());
+    let endpoints = build_endpoints(disable_p2p, stun_addr, &lan, &v6, port, relay.as_deref(), room_relay.as_deref(), crate::discovery::enabled(state));
     if endpoints.is_empty() {
         return Err("no endpoints to report (no public address and no relay)".into());
     }
@@ -206,12 +212,14 @@ mod tests {
         let lan = ["192.168.1.5".parse().unwrap()];
         let v6 = ["2001:db8::5".parse().unwrap()];
         assert_eq!(
-            build_endpoints(false, Some(stun_addr), &lan, &v6, 21031, Some("5.6.7.8:7000"), None),
-            vec!["1.2.3.4:40000", "192.168.1.5:21031", "[2001:db8::5]:21031", "relay:5.6.7.8:7000"]
+            build_endpoints(false, Some(stun_addr), &lan, &v6, 21031, Some("5.6.7.8:7000"), None, true),
+            vec!["1.2.3.4:40000", "192.168.1.5:21031", "[2001:db8::5]:21031", "relay:5.6.7.8:7000", "feature:wgdisc1"]
         );
         // disable_p2p → relays only; a working room relay is announced.
-        assert_eq!(build_endpoints(true, Some(stun_addr), &lan, &v6, 21031, Some("r:1"), Some("9.9.9.9:7000")), vec!["relay:r:1", "room-relay:9.9.9.9:7000"]);
-        assert!(build_endpoints(true, None, &[], &[], 21031, None, None).is_empty());
+        assert_eq!(build_endpoints(true, Some(stun_addr), &lan, &v6, 21031, Some("r:1"), Some("9.9.9.9:7000"), true), vec!["relay:r:1", "room-relay:9.9.9.9:7000", "feature:wgdisc1"]);
+        assert!(build_endpoints(true, None, &[], &[], 21031, None, None, true).is_empty());
+        // No discovery here (embedded Core): not announced.
+        assert_eq!(build_endpoints(true, None, &[], &[], 21031, Some("r:1"), None, false), vec!["relay:r:1"]);
     }
 
     #[test]

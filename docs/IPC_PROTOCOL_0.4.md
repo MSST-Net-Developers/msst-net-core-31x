@@ -130,15 +130,22 @@ Add `"async": true` to a command request:
     and `last_handshake_at` (Unix seconds) while a session exists;
   - new event `EncryptionChanged {device_id, old_state, new_state}` with
     the session states (`unknown`, `handshaking`, `encrypted`, `failed`).
-- **Secure discovery only** (`GetRelays.secure_discovery`): with a relay
-  that has no `pub_key` there is no game discovery (`active: false`).
-  `0x0C` from a sender the relay did not verify is now dropped:
-  `rx_unverified_sender` is replaced by `drop.unverified_sender`.
-  Discovery goes to every relay a room member uses (ours and each
-  member's, identified by key through `GET /relays`), so it works across
-  relays: `relays` lists those (`IP:port`, empty outside a room), and
-  `drop.duplicate` counts packets that arrived again through another
-  relay (injected once).  `active` still describes our own relay.
+- **Game discovery over WireGuard (Core 3.1.6)** — replaces the
+  relay-based secure discovery (`GetRelays.secure_discovery`, removed):
+  each discovery datagram goes to every room member separately inside its
+  WireGuard session, so the sender is authenticated end to end
+  (`docs/SECURITY_3.1.6.md`).  There is no fallback to the relays.
+  - `GetRelays.discovery`: `transport` (`"wireguard"`), `tx_messages`
+    (one per member per datagram), `tx_skipped_unsupported` (datagrams a
+    member didn't get because it doesn't support this), `rx_accepted`
+    (datagrams injected), `drop.not_member`, `drop.not_discovery`,
+    `drop.rate_limited` (over 10/s per sender or 100/s in total).
+  - Room view (`GetSystemState.room.peers[]`, `RoomStateChanged.peers[]`):
+    each member has `discovery` (`null` for ourselves): `"ok"`,
+    `"unsupported"` (Core 3.1.5 or older, or the embedded Android Core:
+    no game discovery with it in either direction — show it, e.g. "该成员
+    版本过旧，无法互相发现游戏") or `"unknown"` (no endpoints from it
+    yet).
 - **`GetRelays.registration`** (relay registration, see
   `docs/RELAY_REQUIREMENTS_3.1.md`): `mode` (`"sreg1"` — authenticated
   `0x0E` — or `"legacy"`), `tx_sreg` (`0x0E` packets sent) and

@@ -358,6 +358,10 @@ pub async fn room_view(state: &CoreState) -> Value {
             "ipv6": e.ipv6.to_string(),
             "hostname": e.hostname,
             "display_name": e.display_name,
+            // Game discovery with this member: "ok", "unsupported" (an
+            // older Core: no discovery either way) or "unknown"; null for
+            // ourselves.
+            "discovery": (e.device_id != net.local_device_id).then(|| net.discovery_support(&e.device_id).name()),
         }))
         .collect();
     let relay = net.relay_addr.clone();

@@ -26,8 +26,8 @@ pub const RELAY_PING_STALE: Duration = Duration::from_secs(6);
 #[derive(Debug, Deserialize)]
 struct RelayEntry {
     addr: String,
-    /// Secure-discovery key (base64 X25519); absent for relays without
-    /// sdisc v1.
+    /// The relay's key (base64 X25519), for authenticated registration;
+    /// absent for relays without it.
     #[serde(default)]
     pub_key: Option<String>,
     /// Protocol features, e.g. `["sdisc1", "sreg1"]`; absent = none.
@@ -37,13 +37,13 @@ struct RelayEntry {
 
 impl RelayEntry {
     /// The advertised key, if well-formed.  A malformed key is treated as
-    /// absent (no game discovery), never as a failure of the relay.
+    /// absent (legacy registration), never as a failure of the relay.
     fn key(&self) -> Option<[u8; 32]> {
         let raw = STANDARD.decode(self.pub_key.as_deref()?).ok()?;
         match raw.try_into() {
             Ok(k) => Some(k),
             Err(_) => {
-                warn!("relay: {} advertises a malformed pub_key — no game discovery or authenticated registration through it", self.addr);
+                warn!("relay: {} advertises a malformed pub_key — no authenticated registration with it", self.addr);
                 None
             }
         }
@@ -65,7 +65,7 @@ pub struct SelectedRelay {
     /// name (resolved through [`resolve_addr`]'s cache).
     pub addr: String,
     /// The relay's key from `GET /relays` (pinned for this selection): used
-    /// by secure discovery and authenticated registration.
+    /// by authenticated registration.
     pub pub_key: Option<[u8; 32]>,
     /// Register with `0x0E` (sreg v1): the relay lists `sreg1` in its
     /// `features` and has a valid `pub_key`.
@@ -118,8 +118,8 @@ pub struct KnownRelay {
     pub pub_key: [u8; 32],
 }
 
-/// The relays `GET /relays` lists with a key (game discovery to room
-/// members' relays identifies them by address).  Relays whose name doesn't
+/// The relays `GET /relays` lists with a key (an official relay named as a
+/// room relay is identified by address).  Relays whose name doesn't
 /// resolve are left out.
 pub async fn fetch_known_relays(http: &reqwest::Client, coord_url: &str) -> Result<Vec<KnownRelay>> {
     let mut out = Vec::new();
@@ -222,10 +222,9 @@ pub async fn select_best_relay(
         None => anyhow::bail!("could not reach any relay server"),
         Some((selected, rtt)) => {
             info!(
-                "relay: selected {} ({:.1} ms, secure discovery {}, registration {})",
+                "relay: selected {} ({:.1} ms, registration {})",
                 selected.addr,
                 rtt,
-                if selected.pub_key.is_some() { "available" } else { "unavailable" },
                 if selected.sreg { "sreg1" } else { "legacy" }
             );
             Ok(selected)

@@ -127,16 +127,16 @@ pub struct RoomRelay {
 
 impl RoomRelay {
     /// The room relay from `room_state.relay`.  A room relay must support
-    /// authenticated registration and secure discovery (D7).
+    /// authenticated registration (D7).  Secure discovery (`sdisc1`) was
+    /// required too until it was retired in 3.1.6 (discovery now goes over
+    /// WireGuard, `crate::discovery`).
     pub fn from_room_state(room_id: &str, r: &RoomStateRelay) -> Result<RoomRelay, String> {
         if r.address.is_empty() {
             return Err("no address".into());
         }
         let pub_key = decode_key(&STANDARD, &r.pub_key).ok_or("invalid pub_key")?;
-        for f in [crate::sreg::FEATURE, "sdisc1"] {
-            if !r.features.iter().any(|x| x == f) {
-                return Err(format!("does not support {}", f));
-            }
+        if !r.features.iter().any(|x| x == crate::sreg::FEATURE) {
+            return Err(format!("does not support {}", crate::sreg::FEATURE));
         }
         Ok(RoomRelay {
             room_id: room_id.to_string(),
@@ -254,7 +254,7 @@ mod tests {
         let numeric = RoomStateRelay { address: "1.2.3.4:7000".into(), ..relay(&["sdisc1", "sreg1"], &key) };
         assert_eq!(RoomRelay::from_room_state("space-1", &numeric).unwrap().addr.as_deref(), Some("1.2.3.4:7000"));
         assert!(RoomRelay::from_room_state("space-1", &relay(&["sdisc1"], &key)).is_err(), "needs sreg1");
-        assert!(RoomRelay::from_room_state("space-1", &relay(&["sreg1"], &key)).is_err(), "needs sdisc1");
+        assert!(RoomRelay::from_room_state("space-1", &relay(&["sreg1"], &key)).is_ok(), "sdisc1 no longer needed");
         assert!(RoomRelay::from_room_state("space-1", &relay(&["sdisc1", "sreg1"], "AAAA")).is_err());
         assert!(RoomRelay::from_room_state("space-1", &RoomStateRelay { address: String::new(), ..relay(&["sdisc1", "sreg1"], &key) }).is_err());
     }

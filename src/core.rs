@@ -194,8 +194,7 @@ impl Core {
     /// Desktop extras that need the TUN interface: local DNS (+ system
     /// split-DNS) and the game discovery proxy.
     pub async fn start_dns_and_discovery(&mut self, iface: &str) {
-        let tun_tx = self.state.tun_tx.get().cloned().expect("tun_tx set in start");
-        self.rt.start_dns_and_discovery(iface, tun_tx).await;
+        self.rt.start_dns_and_discovery(iface).await;
     }
 
     /// Embedded (Android) DNS: a resolver answering queries the system sends
