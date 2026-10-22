@@ -64,6 +64,9 @@ pub struct NetState {
     /// `None`: the relay doesn't support it — legacy registration.  Always
     /// set together with `relay_addr`.
     pub relay_pub_key: Option<[u8; 32]>,
+    /// The relays `GET /relays` listed at the last selection (as listed):
+    /// the only relays a peer's `relay:` endpoint may name.
+    pub official_relays: HashSet<String>,
     /// Register with `relay_addr` using `0x0E` (sreg v1) instead of
     /// `0x01`/`0x02`.  Always set together with `relay_addr`.
     pub relay_sreg: bool,
@@ -89,7 +92,25 @@ impl NetState {
         if let Some(addr) = room_relay.filter(|_| self.room_peers.contains(device_id) && self.peers_on_room_relay.contains(device_id)) {
             return Some(addr);
         }
-        self.peer_list.get(device_id)?.preferred_relay.as_deref()
+        // A peer's own relay only if it is an official one: otherwise a peer
+        // could have us send (and ping, `relay_rtt_loop`) wherever it likes,
+        // and learn our address even with P2P disabled.  Our relay is used
+        // instead.
+        self.peer_list.get(device_id)?.preferred_relay.as_deref().filter(|r| self.is_official_relay(r))
+    }
+
+    /// Whether `addr` (as a peer announced it) is in the coordinator's relay
+    /// list (`official_relays`) or is our own relay.
+    pub fn is_official_relay(&self, addr: &str) -> bool {
+        self.official_relays.contains(addr) || self.relay_addr.as_deref() == Some(addr)
+    }
+
+    /// Remember the relay list of a selection (an empty one, from a failed
+    /// fetch, keeps the previous list).
+    pub fn set_official_relays(&mut self, listed: &[String]) {
+        if !listed.is_empty() {
+            self.official_relays = listed.iter().cloned().collect();
+        }
     }
 
     /// Record whether a peer's latest endpoint list includes `room-relay:`.
@@ -158,6 +179,7 @@ impl NetState {
             ping_enabled: false,
             relay_addr: None,
             relay_pub_key: None,
+            official_relays: HashSet::new(),
             relay_sreg: false,
             relay_rtt: crate::relay::RelayRttTracker::default(),
             peer_endpoints: HashMap::new(),
@@ -232,6 +254,8 @@ pub struct CoreState {
     pub fetch_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<crate::nodes::FetchDemand>>,
     /// In-flight / negative-cache bookkeeping for node fetches.
     pub fetch_gate: std::sync::Mutex<crate::nodes::FetchGate>,
+    /// Rate limit on fetches for unknown WireGuard senders.
+    pub unsolicited_fetches: std::sync::Mutex<crate::nodes::UnsolicitedLimit>,
     /// STUN transactions awaiting a response.
     pub stun_waiters: crate::endpoints::StunWaiters,
     /// Reported endpoint sets (current + history).
@@ -337,6 +361,7 @@ impl CoreState {
             endpoint_detect_again: std::sync::atomic::AtomicBool::new(false),
             fetch_tx: std::sync::OnceLock::new(),
             fetch_gate: std::sync::Mutex::new(crate::nodes::FetchGate::default()),
+            unsolicited_fetches: Default::default(),
         }
     }
 

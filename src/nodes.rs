@@ -24,6 +24,11 @@ use tracing::{debug, info, warn};
 
 /// Don't repeat a lookup that found nothing for this long.
 pub const NEGATIVE_TTL_SECS: i64 = 30;
+/// Negative results kept before expired ones are swept.
+const NEGATIVE_SWEEP_AT: usize = 1024;
+/// Unsolicited fetches (for the sender of a WireGuard message we have no
+/// key for: anyone can send one, with any device ID) per second.
+pub const UNSOLICITED_PER_SEC: u32 = 5;
 
 /// A request to learn about a node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,6 +91,10 @@ impl FetchGate {
         if self.pending.contains(d) || self.negative_until.get(d).is_some_and(|&t| t > now) {
             return false;
         }
+        // Random device IDs (forged messages) must not grow this forever.
+        if self.negative_until.len() >= NEGATIVE_SWEEP_AT {
+            self.negative_until.retain(|_, t| *t > now);
+        }
         self.negative_until.remove(d);
         self.pending.insert(d.clone());
         true
@@ -129,6 +138,27 @@ pub struct PeerData<'a> {
     pub is_authenticated: bool,
 }
 
+/// Whether a peer's virtual addresses (from the coordinator) are usable:
+/// an IPv4 and an IPv6 address in MSST-Net's ranges, neither ours nor
+/// another known device's.  A peer packet is accepted from its address and
+/// routed to it by address, so an address outside the ranges would let it
+/// pose as that host to local services, and a duplicate would let it take
+/// over another device's traffic.
+fn peer_addresses_ok(net: &crate::state::NetState, device_id: &str, ipv4: IpAddr, ipv6: IpAddr) -> Result<(), &'static str> {
+    if !ipv4.is_ipv4() || !ipv6.is_ipv6() || !crate::ip::is_msst_ip(&ipv4) || !crate::ip::is_msst_ip(&ipv6) {
+        return Err("addresses outside MSST-Net's ranges");
+    }
+    if net.local_ips.contains(&ipv4) || net.local_ips.contains(&ipv6) {
+        return Err("our own address");
+    }
+    for ip in [ipv4, ipv6] {
+        if net.peer_list.lookup_device_id_by_ip(&ip).is_some_and(|other| other != device_id) {
+            return Err("another device's address");
+        }
+    }
+    Ok(())
+}
+
 /// Upsert one peer into the peer list, scheduler and WireGuard engine.
 /// Returns `false` (and changes nothing) if its addresses are invalid.
 pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
@@ -146,6 +176,10 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         debug!("nodes: ignoring {} with invalid addresses ({:?}, {:?})", p.device_id, p.ipv4, p.ipv6);
         return false;
     };
+    if let Err(why) = peer_addresses_ok(&*state.net.read().await, p.device_id, ipv4, ipv6) {
+        warn!("nodes: ignoring {} ({}, {}): {}", p.device_id, ipv4, ipv6, why);
+        return false;
+    }
     let now = crate::runtime::current_unix();
     let (is_new, changed) = {
         let mut net = state.net.write().await;
@@ -260,6 +294,38 @@ async fn apply_nodes(state: &CoreState, nodes: &[NodeInfo]) -> usize {
 
 /// Queue a fetch (non-blocking; dropped if the queue is full or the
 /// fetcher isn't running — the next trigger will ask again).
+/// Rate limit for unsolicited fetches ([`demand_unsolicited`]).
+#[derive(Debug, Default)]
+pub struct UnsolicitedLimit {
+    second: i64,
+    count: u32,
+}
+
+impl UnsolicitedLimit {
+    /// Whether another unsolicited fetch may be queued at `now` (Unix s).
+    pub fn allow(&mut self, now: i64) -> bool {
+        if self.second != now {
+            (self.second, self.count) = (now, 0);
+        }
+        self.count += 1;
+        self.count <= UNSOLICITED_PER_SEC
+    }
+}
+
+/// Learn the sender of a WireGuard message we have no key for.  Anyone can
+/// send such a message with any device ID, so these fetches are
+/// rate-limited ([`UNSOLICITED_PER_SEC`]): forged ones can't flood the
+/// coordinator with lookups (and get us rate-limited there) or crowd out
+/// the fetches we need.
+pub fn demand_unsolicited(state: &CoreState, device_id: String) {
+    let now = crate::runtime::current_unix();
+    if state.unsolicited_fetches.lock().unwrap_or_else(|e| e.into_inner()).allow(now) {
+        demand(state, FetchDemand::ByDevice(device_id));
+    } else {
+        debug!("nodes: unsolicited fetch for {} dropped (rate limit)", device_id);
+    }
+}
+
 pub fn demand(state: &CoreState, d: FetchDemand) {
     if let Some(tx) = state.fetch_tx.get() {
         if tx.try_send(d).is_err() {
@@ -374,6 +440,50 @@ async fn is_known(state: &CoreState, d: &FetchDemand, applied: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsolicited_fetches_are_rate_limited() {
+        let mut l = UnsolicitedLimit::default();
+        let allowed = (0..100).filter(|_| l.allow(1000)).count();
+        assert_eq!(allowed, UNSOLICITED_PER_SEC as usize);
+        assert!(l.allow(1001), "the next second has a fresh budget");
+    }
+
+    #[test]
+    fn negative_results_of_forged_ids_dont_pile_up() {
+        let mut g = FetchGate::default();
+        for i in 0..5000u32 {
+            let d = FetchDemand::ByDevice(format!("device-{:08x}", i));
+            assert!(g.try_start(&d, i as i64 / 100));
+            g.finish(&d, false, i as i64 / 100);
+        }
+        // Expired entries are swept: never more than the sweep threshold
+        // plus what is still within its negative TTL.
+        assert!(g.negative_until.len() < NEGATIVE_SWEEP_AT + 100 * NEGATIVE_TTL_SECS as usize, "{}", g.negative_until.len());
+    }
+
+    #[tokio::test]
+    async fn peers_get_only_their_own_msst_net_addresses() {
+        let (state, _rx) = crate::test_support::core_state("nodes-addrs").await;
+        let peer = |id: &'static str, v4: &'static str, v6: &'static str| PeerData { device_id: id, ipv4: v4, ipv6: v6, ..Default::default() };
+        let (own4, own6) = state.identity.read().await.as_ref().unwrap().virtual_ips();
+        // Outside MSST-Net: it could pose as that host to local services.
+        assert!(!apply_peer(&state, peer("device-0000000b", "8.8.8.8", "fd22:2222:2222:2222::b")).await);
+        assert!(!apply_peer(&state, peer("device-0000000b", "172.22.1.1", "2001:db8::1")).await);
+        assert!(!apply_peer(&state, peer("device-0000000b", "fd22:2222:2222:2222::b", "172.22.1.1")).await);
+        // Ours.
+        assert!(!apply_peer(&state, PeerData { ipv4: &own4, ..peer("device-0000000b", "", "fd22:2222:2222:2222::b") }).await);
+        assert!(!apply_peer(&state, PeerData { ipv6: &own6, ..peer("device-0000000b", "172.22.1.1", "") }).await);
+        // Valid; then another device claiming the same address is refused,
+        // while the device itself may be updated.
+        assert!(apply_peer(&state, peer("device-0000000b", "172.22.1.1", "fd22:2222:2222:2222::b")).await);
+        assert!(!apply_peer(&state, peer("device-0000000c", "172.22.1.1", "fd22:2222:2222:2222::c")).await);
+        assert!(!apply_peer(&state, peer("device-0000000c", "172.22.1.2", "fd22:2222:2222:2222::b")).await);
+        assert!(apply_peer(&state, peer("device-0000000b", "172.22.1.1", "fd22:2222:2222:2222::b")).await);
+        let net = state.net.read().await;
+        assert_eq!(net.peer_list.lookup_device_id_by_ip(&"172.22.1.1".parse().unwrap()), Some("device-0000000b"));
+        assert!(!net.peer_list.contains("device-0000000c"));
+    }
 
     #[tokio::test]
     async fn peer_without_device_id_is_ignored_and_empty_names_are_unset() {

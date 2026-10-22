@@ -3,7 +3,7 @@
 //! This module implements the client side of the Coordinator protocol:
 //! - WebSocket connection with bounded exponential backoff
 //! - Device registration on every (re)connect
-//! - Re-joining rooms (`join` + `discovery_join`) after a reconnect
+//! - Re-joining rooms (`join`) after a reconnect
 //! - Node heartbeat, room keepalive and WS ping, bound to the connection
 //! - Bearer-token auth: OIDC, else a guest token (see `credentials`).  The
 //!   OIDC access token is short-lived (5 min on the MSST platform) and the
@@ -570,11 +570,10 @@ impl CoordinatorClient {
             net.joined_rooms.keys().map(|id| (id.clone(), net.room_password_verifiers.get(id).cloned())).collect()
         };
         for (room_id, pw) in &rooms {
-            // The coordinator checks the password on every join, and ties
-            // discovery-proxy registration to the WS connection, so
-            // `discovery_join` must be resent with `join`.
+            // The coordinator checks the password on every join.  (No
+            // `discovery_join` since 3.1.6: it registered for the relays'
+            // secure discovery, retired — discovery goes over WireGuard.)
             let _ = tx.send(join_message(room_id, pw.as_deref()).to_string()).await;
-            let _ = tx.send(discovery_join_message(room_id).to_string()).await;
             info!("coordinator: re-joining room {} after (re)connect", room_id);
         }
         *self.conn_tx.write().await = Some(tx);
@@ -849,17 +848,6 @@ impl CoordinatorClient {
         self.send(&msg.to_string()).await
     }
 
-    /// Send a discovery join.
-    pub async fn send_discovery_join(&self, room_id: &str) -> Result<(), NotConnected> {
-        self.send(&discovery_join_message(room_id).to_string()).await
-    }
-
-    /// Send a discovery leave.
-    pub async fn send_discovery_leave(&self, room_id: &str) -> Result<(), NotConnected> {
-        let msg = json!({ "type": "discovery_leave", "data": { "room_id": room_id } });
-        self.send(&msg.to_string()).await
-    }
-
     /// `GET <coord_url><path>` returning JSON; `Ok(None)` on 404.
     pub async fn api_get(&self, path: &str, bearer: Option<&str>) -> Result<Option<Value>, String> {
         let url = format!("{}{}", self.config.coord_url.trim_end_matches('/'), path);
@@ -1052,10 +1040,6 @@ fn join_message(room_id: &str, password_verifier: Option<&str>) -> Value {
         msg["data"]["password_verifier"] = json!(v);
     }
     msg
-}
-
-fn discovery_join_message(room_id: &str) -> Value {
-    json!({ "type": "discovery_join", "data": { "room_id": room_id } })
 }
 
 fn room_keepalive_message(room_id: &str) -> Value {
@@ -1515,7 +1499,6 @@ mod tests {
     fn periodic_messages_match_3_0_x() {
         assert_eq!(heartbeat_message().to_string(), r#"{"data":{},"type":"node_heartbeat"}"#);
         assert_eq!(room_keepalive_message("r1")["data"]["room_id"], "r1");
-        assert_eq!(discovery_join_message("r1")["type"], "discovery_join");
         assert_eq!(join_message("r1", None)["type"], "join");
         assert!(join_message("r1", None)["data"].get("password_verifier").is_none());
         assert_eq!(join_message("r1", Some("v"))["data"]["password_verifier"], "v");
@@ -1628,13 +1611,13 @@ mod tests {
                 .await.expect("client did not (re)connect").unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let mut msgs = Vec::new();
-            while msgs.len() < 3 {
+            while msgs.len() < 2 {
                 if let Some(Ok(Message::Text(t))) = ws.next().await {
                     msgs.push(serde_json::from_str::<Value>(&t).unwrap());
                 }
             }
             let types: Vec<&str> = msgs.iter().map(|v| v["type"].as_str().unwrap()).collect();
-            assert_eq!(types, ["register", "join", "discovery_join"], "round {}", round);
+            assert_eq!(types, ["register", "join"], "round {}", round);
             // A password-protected room is re-joined with its password.
             assert_eq!(msgs[1]["data"]["password_verifier"], "pwverifier", "round {}", round);
             if round == 0 {

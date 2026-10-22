@@ -46,6 +46,61 @@ pub fn is_msst_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// Whether a peer may announce `addr` as a direct-path candidate: never
+/// loopback, unspecified, multicast, broadcast or link-local (the latter
+/// need a scope we don't have), and never port 0.  Private LAN addresses
+/// are fine (peers on the same LAN).  Anything else would make us send
+/// probes wherever a peer (or the coordinator) points, including this
+/// host's own services.
+pub fn is_valid_candidate(addr: &std::net::SocketAddr) -> bool {
+    use std::net::IpAddr;
+    let ok = match addr.ip() {
+        IpAddr::V4(a) => !(a.is_loopback() || a.is_unspecified() || a.is_multicast() || a.is_broadcast() || a.is_link_local()),
+        IpAddr::V6(a) => {
+            let link_local = (a.segments()[0] & 0xffc0) == 0xfe80;
+            let mapped = a.to_ipv4_mapped().is_some();
+            !(a.is_loopback() || a.is_unspecified() || a.is_multicast() || link_local || mapped)
+        }
+    };
+    ok && addr.port() != 0
+}
+
+/// Whether `ip` is a public unicast address: what a relay we were told
+/// about (a room relay) must resolve to.  Not loopback, private, CGNAT
+/// (100.64/10), link-local, unique-local, multicast, broadcast,
+/// unspecified, documentation, benchmarking or reserved, and not in
+/// MSST-Net's own ranges — otherwise a room creator could have every
+/// member send traffic into its own LAN or to its own host.
+pub fn is_public_unicast(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    if is_msst_ip(ip) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            !(a.is_loopback() || a.is_private() || a.is_link_local() || a.is_multicast() || a.is_broadcast()
+                || a.is_unspecified() || a.is_documentation()
+                || o[0] == 0                                   // "this network"
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)        // CGNAT 100.64/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)     // IETF protocol assignments
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)        // benchmarking 198.18/15
+                || o[0] >= 240)                                // reserved
+        }
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_public_unicast(&IpAddr::V4(v4));
+            }
+            !(a.is_loopback() || a.is_unspecified() || a.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00                   // unique local
+                || (s[0] & 0xffc0) == 0xfe80                   // link local
+                || (s[0] == 0x2001 && s[1] == 0x0db8)          // documentation
+                || (s[0] & 0xe000) != 0x2000)                  // outside global unicast 2000::/3
+        }
+    }
+}
+
 /// Extract the 8-char hex suffix from a `device-XXXXXXXX` ID.  Without the
 /// prefix the input is returned as-is (best-effort).  3.0.x `dev-` IDs are
 /// migrated when the identity is loaded.
@@ -92,6 +147,30 @@ pub fn derive_ips(device_id_hex: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_addresses() {
+        for ok in ["203.0.113.7:21031", "192.168.1.5:21031", "10.0.0.2:5", "[2001:db8::1]:21031", "[fd00::1]:9"] {
+            assert!(is_valid_candidate(&ok.parse().unwrap()), "{}", ok);
+        }
+        for bad in ["127.0.0.1:21031", "0.0.0.0:21031", "224.0.0.1:1", "255.255.255.255:1", "169.254.1.1:1",
+                    "[::1]:21031", "[::]:1", "[ff02::1]:1", "[fe80::1]:1", "[::ffff:127.0.0.1]:1", "1.2.3.4:0"] {
+            assert!(!is_valid_candidate(&bad.parse().unwrap()), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn public_unicast_addresses() {
+        for ok in ["203.0.114.7", "115.159.198.144", "2a0e:6901:410:86:26a3:f0ff:fe49:df02", "2402:4e00:c032:6700::1"] {
+            assert!(is_public_unicast(&ok.parse().unwrap()), "{}", ok);
+        }
+        for bad in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "100.64.0.1", "169.254.0.1", "224.0.0.1",
+                    "255.255.255.255", "0.0.0.0", "0.1.2.3", "192.0.2.1", "198.18.0.1", "240.0.0.1", "172.22.0.5",
+                    "::1", "::", "fd22:2222:2222:2222::5", "fd00::1", "fe80::1", "ff02::1", "2001:db8::1",
+                    "::ffff:192.168.1.1", "64:ff9b::1"] {
+            assert!(!is_public_unicast(&bad.parse().unwrap()), "{}", bad);
+        }
+    }
 
     #[test]
     fn test_derive_ips_example() {

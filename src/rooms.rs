@@ -9,7 +9,7 @@
 //! random salt; a joiner fetches it (`GET /room/{id}/password-salt`) and
 //! sends the verifier with `join`.
 //!
-//! Joining sends `join` (+ `discovery_join`) over the coordinator WS and
+//! Joining sends `join` over the coordinator WS and
 //! waits up to 2 s for the room's `room_state` (or a coordinator `error`,
 //! e.g. wrong password) so the reply can carry the room name and peers.
 //! A timeout is not an error — the room state arrives as an event later.
@@ -121,7 +121,7 @@ async fn room_password_salt(client: &CoordinatorClient, room_id: &str) -> Result
 }
 
 /// Bookkeeping after a successful join.
-async fn joined(state: &Arc<CoreState>, client: &CoordinatorClient, room_id: &str, room_name: &str, verifier: Option<String>) -> Value {
+async fn joined(state: &Arc<CoreState>, room_id: &str, room_name: &str, verifier: Option<String>) -> Value {
     {
         let mut net = state.net.write().await;
         net.joined_rooms.insert(room_id.to_string(), room_name.to_string());
@@ -129,9 +129,6 @@ async fn joined(state: &Arc<CoreState>, client: &CoordinatorClient, room_id: &st
             Some(v) => net.room_password_verifiers.insert(room_id.to_string(), v),
             None => net.room_password_verifiers.remove(room_id),
         };
-    }
-    if let Err(e) = client.send_discovery_join(room_id).await {
-        warn!("rooms: discovery_join for {} failed: {}", room_id, e);
     }
     crate::endpoints::spawn_detect_and_report(state.clone());
     state.next_generation();
@@ -233,7 +230,7 @@ pub async fn create_room(
     // The creator joins with the password too: the coordinator checks it
     // on every join.
     join_and_wait(state, &client, &room_id, verifier.as_deref()).await?;
-    Ok(joined(state, &client, &room_id, &room_name, verifier).await)
+    Ok(joined(state, &room_id, &room_name, verifier).await)
 }
 
 pub async fn join_room(state: &Arc<CoreState>, room_id: String, password: Option<String>) -> Result<Value, IpcError> {
@@ -258,16 +255,13 @@ pub async fn join_room(state: &Arc<CoreState>, room_id: String, password: Option
     }
     let room_name = join_and_wait(state, &client, &room_id, verifier.as_deref()).await?;
     info!("rooms: joined {}", room_id);
-    Ok(joined(state, &client, &room_id, &room_name, verifier).await)
+    Ok(joined(state, &room_id, &room_name, verifier).await)
 }
 
 pub async fn leave_room(state: &Arc<CoreState>, room_id: String) -> Result<Value, IpcError> {
     let _op = state.room_op.lock().await;
     let client = client(state)?;
     client.send_leave(&room_id).await.map_err(|e| err("coordinator_unavailable", e.to_string()))?;
-    if let Err(e) = client.send_discovery_leave(&room_id).await {
-        warn!("rooms: discovery_leave for {} failed: {}", room_id, e);
-    }
     forget_room(state, &room_id).await;
     info!("rooms: left {}", room_id);
     Ok(json!({ "ok": true }))
@@ -457,7 +451,8 @@ mod tests {
         let verifier = b64v("pw", &salt);
         assert_eq!(create.body["password"]["verifier"], verifier);
         assert_eq!(joins()[0]["data"]["password_verifier"], verifier);
-        assert!(eventually(|| coord.ws_types().contains(&"discovery_join".to_string())).await);
+        // No discovery_join any more: it registered for the retired sdisc.
+        assert!(!coord.ws_types().iter().any(|t| t.starts_with("discovery_")));
         {
             // Kept for re-joins after a reconnect.
             let net = state.net.read().await;
@@ -474,7 +469,7 @@ mod tests {
 
         // Leave.
         leave_room(&state, "space-1".into()).await.unwrap();
-        assert!(eventually(|| coord.ws_types().ends_with(&["leave".to_string(), "discovery_leave".to_string()])).await);
+        assert!(eventually(|| coord.ws_types().ends_with(&["leave".to_string()])).await);
         {
             let net = state.net.read().await;
             assert!(net.joined_rooms.is_empty() && net.room_peers.is_empty() && net.room_password_verifiers.is_empty());

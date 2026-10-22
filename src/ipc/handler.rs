@@ -239,6 +239,16 @@ async fn set_net_settings(state: &Arc<CoreState>, patch: serde_json::Value) -> R
         let mut s = state.net_settings.write().await;
         let mut next = s.clone();
         next.apply_patch(&patch).map_err(|e| err("invalid_settings", e))?;
+        // The preferred relay supports official relays only (by design); the
+        // list is known once a relay was selected.
+        if let Some(r) = next.preferred_relay.as_deref().filter(|r| next.preferred_relay != s.preferred_relay && !r.is_empty()) {
+            let net = state.net.read().await;
+            if !net.official_relays.is_empty() && !net.official_relays.contains(r) {
+                let mut listed: Vec<&str> = net.official_relays.iter().map(String::as_str).collect();
+                listed.sort_unstable();
+                return Err(err("invalid_settings", format!("{} is not an official relay (one of: {})", r, listed.join(", "))));
+            }
+        }
         next.save(&state.data_dir).map_err(|e| err("persist_failed", format!("failed to save settings: {}", e)))?;
         let p2p_toggled = next.disable_p2p != s.disable_p2p;
         *s = next;
@@ -289,5 +299,25 @@ async fn dns_proxy(
     } else {
         warn!("IPC: DNS {} {} returned {}", method, path, status);
         Err(err("coordinator_error", format!("HTTP {}: {}", status, resp)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn only_an_official_relay_can_be_preferred() {
+        let (state, _ipc) = crate::test_support::core_state("settings-relay").await;
+        state.net.write().await.set_official_relays(&["us1.example:21031".into(), "cn1.example:21031".into()]);
+        let e = set_net_settings(&state, serde_json::json!({ "preferred_relay": "evil.example:7000" })).await.unwrap_err();
+        assert_eq!(e.code, "invalid_settings");
+        assert!(e.message.contains("cn1.example:21031, us1.example:21031"), "{}", e.message);
+        assert_eq!(state.net_settings.read().await.preferred_relay, None, "nothing saved");
+        let v = set_net_settings(&state, serde_json::json!({ "preferred_relay": "cn1.example:21031" })).await.unwrap();
+        assert_eq!(v["preferred_relay"], "cn1.example:21031");
+        // Automatic selection again.
+        let v = set_net_settings(&state, serde_json::json!({ "preferred_relay": null })).await.unwrap();
+        assert!(v["preferred_relay"].is_null());
     }
 }

@@ -125,6 +125,27 @@ pub struct RoomRelay {
     pub health: Health,
 }
 
+/// Whether a room relay may be reached at `addr`: a public unicast address
+/// (`crate::ip::is_public_unicast`).  The room's creator chooses the relay
+/// and every member registers with it, pings it and sends through it, so a
+/// private or local address would aim all members' traffic into their own
+/// networks or hosts.  (Tests use loopback relays.)
+pub fn acceptable_addr(addr: std::net::SocketAddr) -> bool {
+    let ip = msst_core_state::net::relay::unmap_addr(addr).ip();
+    crate::ip::is_public_unicast(&ip) || (cfg!(test) && ip.is_loopback())
+}
+
+/// A room relay name's resolved address, if acceptable ([`acceptable_addr`]).
+pub fn checked_resolution(address: &str, resolved: Option<std::net::SocketAddr>) -> Option<String> {
+    let a = msst_core_state::net::relay::unmap_addr(resolved?);
+    if acceptable_addr(a) {
+        Some(a.to_string())
+    } else {
+        tracing::warn!("room relay: {} resolves to {}, not a public address — not used", address, a);
+        None
+    }
+}
+
 impl RoomRelay {
     /// The room relay from `room_state.relay`.  A room relay must support
     /// authenticated registration (D7).  Secure discovery (`sdisc1`) was
@@ -138,10 +159,14 @@ impl RoomRelay {
         if !r.features.iter().any(|x| x == crate::sreg::FEATURE) {
             return Err(format!("does not support {}", crate::sreg::FEATURE));
         }
+        let numeric = r.address.parse::<std::net::SocketAddr>().ok();
+        if numeric.is_some_and(|a| !acceptable_addr(a)) {
+            return Err("not a public address".into());
+        }
         Ok(RoomRelay {
             room_id: room_id.to_string(),
             address: r.address.clone(),
-            addr: r.address.parse::<std::net::SocketAddr>().ok().map(|a| a.to_string()),
+            addr: numeric.map(|a| a.to_string()),
             pub_key,
             self_hosted: r.self_hosted,
             health: Health::default(),
@@ -256,6 +281,13 @@ mod tests {
         assert!(RoomRelay::from_room_state("space-1", &relay(&["sdisc1"], &key)).is_err(), "needs sreg1");
         assert!(RoomRelay::from_room_state("space-1", &relay(&["sreg1"], &key)).is_ok(), "sdisc1 no longer needed");
         assert!(RoomRelay::from_room_state("space-1", &relay(&["sdisc1", "sreg1"], "AAAA")).is_err());
+        // Never a private or local address: every member would send there.
+        for private in ["192.168.1.1:7000", "10.0.0.1:53", "[fd00::1]:7000", "172.22.0.5:7000", "[::ffff:192.168.1.1]:7000"] {
+            let r = RoomStateRelay { address: private.into(), ..relay(&["sreg1"], &key) };
+            assert!(RoomRelay::from_room_state("space-1", &r).is_err(), "{}", private);
+        }
+        assert_eq!(checked_resolution("relay.example:7000", Some("10.0.0.1:7000".parse().unwrap())), None);
+        assert_eq!(checked_resolution("relay.example:7000", Some("203.0.114.9:7000".parse().unwrap())).as_deref(), Some("203.0.114.9:7000"));
         assert!(RoomRelay::from_room_state("space-1", &RoomStateRelay { address: String::new(), ..relay(&["sdisc1", "sreg1"], &key) }).is_err());
     }
 

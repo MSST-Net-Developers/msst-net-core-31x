@@ -67,6 +67,10 @@ pub struct SelectedRelay {
     /// The relay's key from `GET /relays` (pinned for this selection): used
     /// by authenticated registration.
     pub pub_key: Option<[u8; 32]>,
+    /// The relays `GET /relays` listed at this selection (as listed; empty
+    /// if the list was unavailable): the only relays peers may announce
+    /// (`NetState::official_relays`).
+    pub listed: Vec<String>,
     /// Register with `0x0E` (sreg v1): the relay lists `sreg1` in its
     /// `features` and has a valid `pub_key`.
     pub sreg: bool,
@@ -77,7 +81,7 @@ impl SelectedRelay {
     /// uses the address (and family) the selection measured.
     fn new(name: &str, target: SocketAddr, pub_key: Option<[u8; 32]>, sreg: bool) -> Self {
         pin_resolved(name, target);
-        SelectedRelay { addr: name.to_string(), pub_key, sreg }
+        SelectedRelay { addr: name.to_string(), pub_key, sreg, listed: Vec::new() }
     }
 }
 
@@ -143,10 +147,14 @@ pub async fn fetch_known_relays(http: &reqwest::Client, coord_url: &str) -> Resu
 
 /// The relay list entry for a preferred relay reached at `target`: matched
 /// by address string, else by resolved address.
-async fn entry_for_preferred<'a>(relays: &'a [RelayEntry], pref: &str, target: SocketAddr) -> Option<&'a RelayEntry> {
+/// The listed relay a preferred relay setting names: by its listed name,
+/// else by address (a numeric setting, or a name that resolves to a listed
+/// relay's address).
+async fn entry_for_preferred<'a>(relays: &'a [RelayEntry], pref: &str) -> Option<&'a RelayEntry> {
     if let Some(e) = relays.iter().find(|e| e.addr == pref) {
         return Some(e);
     }
+    let target = resolve_addr(pref).await?;
     for e in relays {
         if resolve_addr(&e.addr).await == Some(target) {
             return Some(e);
@@ -159,11 +167,13 @@ async fn entry_for_preferred<'a>(relays: &'a [RelayEntry], pref: &str, target: S
 /// lowest average ping RTT (its address as listed, a name stays a name),
 /// with the secure-discovery key it advertises.
 ///
-/// A `preferred` relay is probed first and used only if it responds; an
-/// unresponsive preferred relay falls through to auto-selection (silently
-/// pinning to a dead relay would break all relay-routed traffic).  Its key
-/// comes from the relay list too; if the list is unavailable, or doesn't
-/// include it, it is used without one (no game discovery).
+/// A `preferred` relay must be one of the listed (official) relays — the
+/// setting supports nothing else — and is then used under its listed name,
+/// so peers recognise it (`NetState::official_relays`).  It is probed first
+/// and used only if it responds; an unresponsive or unlisted preferred
+/// relay falls through to auto-selection (silently pinning to a dead relay
+/// would break all relay-routed traffic).  Without the list nothing can be
+/// selected.
 pub async fn select_best_relay(
     http: &reqwest::Client,
     coord_url: &str,
@@ -172,29 +182,30 @@ pub async fn select_best_relay(
 ) -> Result<SelectedRelay> {
     let src_id = encode_id(device_id);
     let listed = fetch_relays(http, coord_url).await;
+    let names: Vec<String> = listed.as_ref().map(|r| r.iter().map(|e| e.addr.clone()).collect()).unwrap_or_default();
+    let mut selected = choose_relay(listed, src_id, preferred).await?;
+    selected.listed = names;
+    Ok(selected)
+}
 
+async fn choose_relay(listed: Result<Vec<RelayEntry>>, src_id: [u8; 8], preferred: Option<&str>) -> Result<SelectedRelay> {
+    let relays = listed?;
     if let Some(pref) = preferred {
-        info!("relay: probing preferred relay {}", pref);
-        match probe_relay(pref, src_id).await {
-            Some((target, rtt)) => {
-                info!("relay: preferred relay {} reachable at {} ({:.1} ms)", pref, target, rtt);
-                let unlisted = SelectedRelay::new(pref, target, None, false);
-                return Ok(match &listed {
-                    Ok(relays) => entry_for_preferred(relays, pref, target).await.map_or(unlisted, |e| e.selected(pref, target)),
-                    Err(e) => {
-                        warn!("relay: relay list unavailable ({}) — preferred relay used without a key", e);
-                        unlisted
+        match entry_for_preferred(&relays, pref).await {
+            None => warn!("relay: preferred relay {} is not an official relay — ignored, selecting automatically", pref),
+            Some(e) => {
+                info!("relay: probing preferred relay {}", e.addr);
+                match probe_relay(&e.addr, src_id).await {
+                    Some((target, rtt)) => {
+                        info!("relay: preferred relay {} reachable at {} ({:.1} ms)", e.addr, target, rtt);
+                        return Ok(e.selected(&e.addr, target));
                     }
-                });
+                    None => warn!("relay: preferred relay {} did not respond — falling back to auto-selection", e.addr),
+                }
             }
-            None => warn!(
-                "relay: preferred relay {} did not respond — falling back to auto-selection",
-                pref
-            ),
         }
     }
 
-    let relays = listed?;
     if relays.is_empty() {
         anyhow::bail!("coordinator returned an empty relay list");
     }
@@ -591,20 +602,26 @@ mod tests {
         let http = reqwest::Client::new();
 
         let auto = select_best_relay(&http, &coord.url, "device-11111111", None).await.unwrap();
-        assert_eq!(auto, SelectedRelay { addr: relay.to_string(), pub_key: Some([5u8; 32]), sreg: true });
+        assert_eq!(auto, SelectedRelay { addr: relay.to_string(), pub_key: Some([5u8; 32]), sreg: true, listed: vec![relay.to_string()] });
         // Preferred relay: key and features looked up in the same list.
         let pref = select_best_relay(&http, &coord.url, "device-11111111", Some(&relay.to_string())).await.unwrap();
         assert_eq!((pref.pub_key, pref.sreg), (Some([5u8; 32]), true));
     }
 
     #[tokio::test]
-    async fn preferred_relay_not_listed_has_no_key() {
+    async fn only_an_official_relay_can_be_preferred() {
         use crate::test_support::{echo_relay, FakeCoordinator};
         use serde_json::json;
-        let relay = echo_relay().await;
-        let coord = FakeCoordinator::start(|_| (200, json!({ "relays": [{ "addr": "127.0.0.1:9", "pub_key": STANDARD.encode([5u8; 32]) }] })), |_| vec![]).await;
-        let pref = select_best_relay(&reqwest::Client::new(), &coord.url, "device-11111111", Some(&relay.to_string())).await.unwrap();
-        assert_eq!(pref, SelectedRelay { addr: relay.to_string(), pub_key: None, sreg: false });
+        let (official, unlisted) = (echo_relay().await, echo_relay().await);
+        let listed = json!({ "relays": [{ "addr": official.to_string(), "pub_key": STANDARD.encode([5u8; 32]) }] });
+        let coord = FakeCoordinator::start(move |_| (200, listed.clone()), |_| vec![]).await;
+        let http = reqwest::Client::new();
+        // Not listed: ignored, the official relay is selected.
+        let s = select_best_relay(&http, &coord.url, "device-11111111", Some(&unlisted.to_string())).await.unwrap();
+        assert_eq!(s.addr, official.to_string());
+        // No list: nothing to verify a preferred relay against.
+        let down = FakeCoordinator::start(|_| (503, json!({})), |_| vec![]).await;
+        assert!(select_best_relay(&http, &down.url, "device-11111111", Some(&official.to_string())).await.is_err());
     }
 
     #[test]

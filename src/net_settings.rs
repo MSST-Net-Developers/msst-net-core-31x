@@ -37,7 +37,9 @@ pub struct NetworkSettings {
     /// Freeze all peer paths (no upgrades or downgrades).
     #[serde(default)]
     pub lock_path: bool,
-    /// Use this relay instead of auto-selecting (if it responds).
+    /// Use this relay instead of auto-selecting (if it responds).  Official
+    /// relays (`GET /relays`) only, by design; anything else is ignored
+    /// (`relay::select_best_relay`) and refused when set over IPC.
     #[serde(default)]
     pub preferred_relay: Option<String>,
     /// TUN MTU override; applied on next start.

@@ -96,10 +96,21 @@ async fn deliver_fragment(state: &CoreState, tun_tx: &mpsc::Sender<Vec<u8>>, ver
 /// with the transport header; the later fragments follow that verdict
 /// (`msst_core_state::packet::fragment`).
 pub async fn deliver_inbound(state: &Arc<CoreState>, tun_tx: &mpsc::Sender<Vec<u8>>, pkt: Vec<u8>) {
-    let Some(parsed) = crate::runtime::parse_ip_packet(&pkt) else {
+    let Some((parsed, l4)) = crate::runtime::parse_ip_packet_at(&pkt) else {
         debug!("inbound: malformed or unevaluable IP packet ({} bytes), dropping", pkt.len());
         return;
     };
+    // ICMP is not subject to the ACL: only what a peer may legitimately
+    // send passes (`packet::icmp`).  Later fragments follow their first.
+    if parsed.proto == TransportProtocol::Icmp && !parsed.is_later_fragment()
+        && packet::icmp::classify(&pkt, l4, parsed.src_ip, parsed.dst_ip) == packet::icmp::IcmpFromPeer::Refused
+    {
+        if let Some(src) = state.net.read().await.peer_list.lookup_device_id_by_ip(&parsed.src_ip) {
+            crate::diagnostics::traffic(state, src).drop.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        debug!("inbound: ICMP type {} from {} refused", pkt.get(l4).copied().unwrap_or(0), parsed.src_ip);
+        return;
+    }
     let now = crate::runtime::current_unix();
     let frag_key = packet::FragKey::of(&parsed);
 
@@ -775,6 +786,7 @@ mod tests {
             net.peer_list.upsert("device-0000000b", "172.22.1.1".parse().unwrap(), "fd22:2222:2222:2222::b".parse().unwrap(),
                 Some("user-0000000b"), Some("pc"), Some("bob"), Some("pc.bob.ezplay.msst.net"), Some("Bob PC".into()), None, true, 0);
             net.peer_list.update_relay("device-0000000b", &relay.local_addr().unwrap().to_string());
+            net.set_official_relays(&[relay.local_addr().unwrap().to_string()]);
             if in_room {
                 net.joined_rooms.insert("space-1".into(), "Room".into());
                 net.room_peers.insert("device-0000000b".into());
@@ -1139,6 +1151,41 @@ mod tests {
         h.state.net.write().await.room_peers.clear();
         revoke_room_flows(&h.state).await;
         assert!(!passes(&mut h).await);
+    }
+
+    /// ICMP 172.22.1.1 (bob) → 172.22.0.1 of `kind`, quoting a TCP packet
+    /// `src` → `dst`.
+    fn icmp_from_bob(kind: u8, quoted: Option<([u8; 4], [u8; 4])>) -> Vec<u8> {
+        let mut body = vec![kind, 0, 0, 0, 0, 0, 0, 0];
+        if let Some((src, dst)) = quoted {
+            body.extend_from_slice(&[0x45, 0, 0, 40, 0, 0, 0x40, 0, 64, 6, 0, 0]);
+            body.extend_from_slice(&src);
+            body.extend_from_slice(&dst);
+            body.extend_from_slice(&[0x9c, 0x40, 0, 80, 0, 0, 0, 1]);
+        }
+        let len = 20 + body.len() as u16;
+        let mut p = vec![0x45, 0, (len >> 8) as u8, len as u8, 0, 0, 0, 0, 64, 1, 0, 0, 172, 22, 1, 1, 172, 22, 0, 1];
+        p.extend_from_slice(&body);
+        p
+    }
+
+    #[tokio::test]
+    async fn icmp_from_a_peer_is_limited_to_what_it_may_send() {
+        let mut h = harness("icmp", true).await;
+        let (us, bob, github) = ([172, 22, 0, 1], [172, 22, 1, 1], [140, 82, 112, 3]);
+        let passes = |p: Vec<u8>| {
+            let (state, tun_tx) = (h.state.clone(), h.tun_tx.clone());
+            async move { deliver_inbound(&state, &tun_tx, p).await }
+        };
+        // Echo reply, and "port unreachable" for our packet to bob: delivered.
+        passes(icmp_from_bob(0, None)).await;
+        passes(icmp_from_bob(3, Some((us, bob)))).await;
+        assert!(h.tun_rx.try_recv().is_ok() && h.tun_rx.try_recv().is_ok());
+        // A redirect, and "fragmentation needed" for our connection to an
+        // Internet host: dropped.
+        passes(icmp_from_bob(5, Some((us, bob)))).await;
+        passes(icmp_from_bob(3, Some((us, github)))).await;
+        assert!(h.tun_rx.try_recv().is_err());
     }
 
     #[tokio::test]

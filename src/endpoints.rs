@@ -194,13 +194,23 @@ async fn detect_and_report(state: &Arc<CoreState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Peer endpoints usable as direct-path candidates (drops `relay:` entries
-/// and unparseable ones), IPv6 first (3.0.x `sort_candidates_ipv6_first`).
+/// Peer endpoints usable as direct-path candidates (drops `relay:` and
+/// `feature:` entries, unparseable ones and addresses no peer can have,
+/// `crate::ip::is_valid_candidate`), IPv6 first (3.0.x
+/// `sort_candidates_ipv6_first`).
 pub fn direct_candidates(endpoints: &[String]) -> Vec<SocketAddr> {
-    let mut v: Vec<SocketAddr> = endpoints.iter().filter_map(|e| e.parse().ok()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut v: Vec<SocketAddr> =
+        endpoints.iter().filter_map(|e| e.parse().ok()).filter(crate::ip::is_valid_candidate).filter(|a| seen.insert(*a)).collect();
     v.sort_by_key(|a| !a.is_ipv6());
+    // A real device has a few (public, LAN, IPv6); a peer announcing
+    // hundreds would have us probe (and punch) them all, every round.
+    v.truncate(MAX_CANDIDATES);
     v
 }
+
+/// Direct-path candidates kept per peer.
+pub const MAX_CANDIDATES: usize = 16;
 
 #[cfg(test)]
 mod tests {
@@ -234,6 +244,22 @@ mod tests {
         assert_eq!(h.current, vec!["e14"]);
         assert_eq!(h.history.len(), HISTORY_MAX);
         assert_eq!(h.to_view()["history"][0]["endpoints"][0], "e4"); // a, e0..e13 → last 10
+    }
+
+    #[test]
+    fn candidates_never_point_at_this_host_or_beyond_a_link() {
+        let eps: Vec<String> = ["127.0.0.1:21031", "[::1]:21031", "0.0.0.0:1", "[fe80::1]:21031", "224.0.0.251:5353", "192.168.1.5:21031"]
+            .map(String::from).to_vec();
+        assert_eq!(direct_candidates(&eps), vec!["192.168.1.5:21031".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn candidates_are_capped() {
+        let eps: Vec<String> = (1..=200).map(|i| format!("203.0.113.{}:21031", i)).collect();
+        assert_eq!(direct_candidates(&eps).len(), MAX_CANDIDATES);
+        // Repeats don't count twice.
+        let twice: Vec<String> = ["1.2.3.4:1", "5.6.7.8:1", "1.2.3.4:1"].map(String::from).to_vec();
+        assert_eq!(direct_candidates(&twice).len(), 2);
     }
 
     #[test]

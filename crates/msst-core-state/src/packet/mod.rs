@@ -12,6 +12,7 @@
 
 pub mod conn_track;
 pub mod fragment;
+pub mod icmp;
 pub mod parsed;
 pub mod pipeline;
 

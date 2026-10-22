@@ -203,7 +203,7 @@ async fn inbound_loop(
                             // handshake as soon as the key is here.
                             if !src_id.is_empty() && !state.net.read().await.peer_list.contains(&src_id) {
                                 hold_handshake(&state, &src_id, &pkt.payload, src, now);
-                                crate::nodes::demand(&state, crate::nodes::FetchDemand::ByDevice(src_id));
+                                crate::nodes::demand_unsolicited(&state, src_id);
                             }
                             continue;
                         }
@@ -228,8 +228,11 @@ async fn inbound_loop(
                         // P2P disabled: unanswered, so the peer's direct
                         // path to us goes back to the relay as well.
                         if state.net_settings.read().await.disable_p2p { continue; }
-                        let local_id = state.net.read().await.local_device_id.clone();
-                        if local_id.is_empty() { continue; }
+                        let local_id = {
+                            let net = state.net.read().await;
+                            if !answers_p2p_ping(&net, &msst_packet::decode_id(pkt.src_id), &msst_packet::decode_id(pkt.dst_id)) { continue; }
+                            net.local_device_id.clone()
+                        };
                         let pong = msst_packet::build_p2p_pong(&local_id, &msst_packet::decode_id(pkt.src_id), &pkt.payload);
                         let _ = udp.send_to(&pong, relay::map_send_addr(src)).await;
                     }
@@ -286,6 +289,13 @@ async fn inbound_loop(
             }
         }
     }
+}
+
+/// Whether to answer a P2P ping: only one addressed to us from a peer we
+/// know.  The pong carries our device ID, so answering anyone would tell
+/// every scanner of UDP 21031 who we are (and reflect forged pings).
+fn answers_p2p_ping(net: &crate::state::NetState, src_id: &str, dst_id: &str) -> bool {
+    !net.local_device_id.is_empty() && dst_id == net.local_device_id && net.peer_list.contains(src_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -538,10 +548,9 @@ async fn coordinator_event_loop(
             // ── Punch request (NAT traversal) ─────────────────────────────
             CoordinatorEvent::PunchRequest { peer_id, endpoints } => {
                 info!("coordinator: punch_request for {} ({} endpoints)", peer_id, endpoints.len());
-                let parsed_eps: Vec<std::net::SocketAddr> = endpoints
-                    .iter()
-                    .filter_map(|ep| ep.parse().ok())
-                    .collect();
+                // Same rules as announced endpoints: never this host, never
+                // beyond a link.
+                let parsed_eps = crate::endpoints::direct_candidates(&endpoints);
                 if parsed_eps.is_empty() {
                     warn!("coordinator: punch_request for {} with no valid endpoints", peer_id);
                     continue;
@@ -942,6 +951,7 @@ fn spawn_relay_selection(
                         net.relay_addr = Some(addr.clone());
                         net.relay_pub_key = selected.pub_key;
                         net.relay_sreg = selected.sreg;
+                        net.set_official_relays(&selected.listed);
                         changed
                     };
                     if changed {
@@ -981,6 +991,7 @@ pub(crate) async fn select_relay_now(state: &Arc<CoreState>, client: &Coordinato
         net.relay_addr = Some(addr.clone());
         net.relay_pub_key = selected.pub_key;
         net.relay_sreg = selected.sreg;
+        net.set_official_relays(&selected.listed);
         drop(net);
         state.next_generation();
     }
@@ -1094,7 +1105,7 @@ pub(crate) async fn apply_room_relay(state: &Arc<CoreState>, room_id: &str, rela
     let new = match new {
         Some(mut r) => {
             if r.addr.is_none() {
-                r.addr = crate::relay::resolve_addr(&r.address).await.map(|a| relay::unmap_addr(a).to_string());
+                r.addr = crate::room_relay::checked_resolution(&r.address, crate::relay::resolve_addr(&r.address).await);
             }
             info!("room relay: {} ({}) for {}", r.address, if r.self_hosted { "self-hosted" } else { "official" }, room_id);
             Some(r)
@@ -1179,8 +1190,9 @@ async fn relay_rtt_loop(state: Arc<CoreState>) {
             let mut net = state.net.write().await;
             net.relay_rtt.purge_stale(std::time::Instant::now());
             let mut relays: Vec<String> = net.relay_addr.iter().cloned().collect();
+            // Peers' relays, only official ones (`NetState::relay_for_peer`).
             for id in net.peer_list.device_ids() {
-                if let Some(r) = net.peer_list.get(id).and_then(|e| e.preferred_relay.clone()) {
+                if let Some(r) = net.peer_list.get(id).and_then(|e| e.preferred_relay.clone()).filter(|r| net.is_official_relay(r)) {
                     if !relays.contains(&r) {
                         relays.push(r);
                     }
@@ -1203,9 +1215,9 @@ async fn relay_rtt_loop(state: Arc<CoreState>) {
         }
         if let Some(address) = unresolved_room_relay {
             // Its name didn't resolve yet: retry (pinged from the next round).
-            if let Some(a) = crate::relay::resolve_addr(&address).await {
+            if let Some(a) = crate::room_relay::checked_resolution(&address, crate::relay::resolve_addr(&address).await) {
                 if let Some(r) = state.net.write().await.room_relay.as_mut().filter(|r| r.address == address) {
-                    r.addr = Some(relay::unmap_addr(a).to_string());
+                    r.addr = Some(a);
                 }
                 register_with_room_relay(&state).await;
             }
@@ -1632,6 +1644,7 @@ mod tests {
         );
         if let Some(r) = relay {
             net.peer_list.update_relay("device-a1b2c3d4", r);
+            net.set_official_relays(&[r.to_string()]);
         }
         drop(net);
         let pk = crate::test_support::identity_with_key([7u8; 32]).public_key_base64();
@@ -1702,6 +1715,38 @@ mod tests {
         assert_eq!(route_outbound_packet(&udp_packet(), &state).await, None);
         let mut buf = [0u8; 64];
         assert!(tokio::time::timeout(std::time::Duration::from_millis(100), relay.recv_from(&mut buf)).await.is_err());
+    }
+
+    #[test]
+    fn a_peer_can_only_name_an_official_relay() {
+        let mut net = crate::state::NetState::new();
+        net.relay_addr = Some("us1.example:21031".into());
+        net.peer_list.upsert("device-0000000b", "172.22.1.1".parse().unwrap(), "fd22:2222:2222:2222::b".parse().unwrap(),
+            None, None, None, None, None, None, false, 0);
+        // Not in the coordinator's list (e.g. the peer's own server): ignored,
+        // our relay is used — nothing is sent or pinged there.
+        net.peer_list.update_relay("device-0000000b", "evil.example:7000");
+        assert_eq!(net.relay_for_peer("device-0000000b"), None);
+        net.set_official_relays(&["us1.example:21031".into(), "cn1.example:21031".into()]);
+        assert_eq!(net.relay_for_peer("device-0000000b"), None);
+        net.peer_list.update_relay("device-0000000b", "cn1.example:21031");
+        assert_eq!(net.relay_for_peer("device-0000000b"), Some("cn1.example:21031"));
+        // A failed list fetch keeps the previous list.
+        net.set_official_relays(&[]);
+        assert_eq!(net.relay_for_peer("device-0000000b"), Some("cn1.example:21031"));
+    }
+
+    #[test]
+    fn p2p_pings_are_answered_only_from_known_peers_to_us() {
+        let mut net = crate::state::NetState::new();
+        net.local_device_id = "device-00000001".into();
+        net.peer_list.upsert("device-0000000b", "172.22.1.1".parse().unwrap(), "fd22:2222:2222:2222::b".parse().unwrap(),
+            None, None, None, None, None, None, false, 0);
+        assert!(answers_p2p_ping(&net, "device-0000000b", "device-00000001"));
+        assert!(!answers_p2p_ping(&net, "device-0000000c", "device-00000001"), "unknown sender (a scanner)");
+        assert!(!answers_p2p_ping(&net, "device-0000000b", "device-00000002"), "not for us");
+        net.local_device_id.clear();
+        assert!(!answers_p2p_ping(&net, "device-0000000b", ""));
     }
 
     // ── Room expired on the coordinator ──────────────────────────────────
@@ -2040,6 +2085,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malicious_relay_can_neither_inject_nor_impersonate() {
+        use msst_core_state::encryption::EncState;
+        let mut a = wg_core("evil-relay-a", 0x91).await;
+        let b = wg_core("evil-relay-b", 0x92).await;
+        let evil = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        know(&a, &b, evil.local_addr().unwrap()).await;
+        let a_addr = a.state.udp_socket.local_addr().unwrap();
+        let frame = |kind: u8, src: &str, dst: &str, payload: Vec<u8>| {
+            msst_packet::MsstPacket {
+                version: msst_packet::VERSION, packet_type: kind, flags: 0x01,
+                src_id: msst_packet::encode_id(src), dst_id: msst_packet::encode_id(dst), payload,
+            }
+            .encode()
+        };
+        let (a_id, b_id) = (a.id.device.id.clone(), b.id.device.id.clone());
+        // A retired sdisc delivery claiming b sent a broadcast.
+        let bcast = crate::ippkt::build_udp(b.id.virtual_ips().0.parse::<std::net::Ipv4Addr>().unwrap().into(), 19132,
+            std::net::Ipv4Addr::new(172, 22, 255, 255).into(), 19132, b"MCPE;fake");
+        evil.send_to(&frame(0x0C, &b_id, &a_id, [vec![0; 8], bcast].concat()), a_addr).await.unwrap();
+        // WireGuard messages "from b" it can't produce: a forged handshake
+        // initiation and a forged data message.
+        let mut init = vec![1u8, 0, 0, 0];
+        init.resize(148, 0x5a);
+        evil.send_to(&frame(msst_packet::TYPE_WG, &b_id, &a_id, init), a_addr).await.unwrap();
+        let mut data = vec![4u8, 0, 0, 0];
+        data.resize(96, 0x5a);
+        evil.send_to(&frame(msst_packet::TYPE_WG, &b_id, &a_id, data), a_addr).await.unwrap();
+        assert_eq!(recv_tun(&mut a).await, None);
+        assert_eq!(enc_state(&a, &b).await, Some(EncState::Unknown), "no session state from forgeries");
+        // P2P pings from an unknown device, or not for a: no pong (which
+        // would reveal a's device ID).
+        let ping = |src: &str, dst: &str| msst_packet::build_p2p_ping(src, dst, 1, current_time_ms());
+        evil.send_to(&ping("device-0badbeef", &a_id), a_addr).await.unwrap();
+        evil.send_to(&ping(&b_id, "device-00000002"), a_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), evil.recv_from(&mut buf)).await.is_err());
+        // A known peer's ping is answered.
+        evil.send_to(&ping(&b_id, &a_id), a_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_millis(500), evil.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(buf[5], msst_packet::TYPE_P2P_PONG, "{:?}", &buf[..n]);
+        // A flood of messages from made-up devices: bounded state.
+        for i in 0..500u32 {
+            let id = format!("device-{:08x}", 0x10000000 + i);
+            let mut m = vec![1u8, 0, 0, 0];
+            m.resize(148, 0);
+            evil.send_to(&frame(msst_packet::TYPE_WG, &id, &a_id, m), a_addr).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(a.state.pending_handshakes.lock().unwrap().len() <= PENDING_HANDSHAKES_MAX);
+    }
+
+    #[tokio::test]
     async fn diag_ping_through_the_relay_starts_the_session_and_measures() {
         let a = wg_core("diag-a", 0x77).await;
         let mut b = wg_core("diag-b", 0x78).await;
@@ -2080,6 +2177,9 @@ mod tests {
         know(&b, &a, relay_b).await;
         a.state.net.write().await.peer_list.update_relay(&b.id.device.id, &relay_b.to_string());
         b.state.net.write().await.peer_list.update_relay(&a.id.device.id, &relay_a.to_string());
+        for core in [&a, &b] {
+            core.state.net.write().await.set_official_relays(&[relay_a.to_string(), relay_b.to_string()]);
+        }
 
         // Establish the session: A → R_B → B, B → R_A → A.
         let ping = icmp_echo(&a.id.virtual_ips().0, &b.id.virtual_ips().0);
