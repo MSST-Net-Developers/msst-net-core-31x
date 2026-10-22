@@ -210,7 +210,7 @@ pub async fn enable(state: &Arc<CoreState>) {
         for (range, v6) in ranges() {
             delete_rule(v6, &pin_rule(&range));
             delete_rule(v6, &bypass_rule());
-            ip(v6, &["route", "flush", "table", &ROUTE_TABLE.to_string()]);
+            flush_table(v6);
         }
     }
     let on = state.net_settings.read().await.bypass_other_vpns;
@@ -274,7 +274,7 @@ pub fn teardown() {
         }
         if h.pinned[i] {
             delete_rule(v6, &pin_rule(&range));
-            ip(v6, &["route", "flush", "table", &ROUTE_TABLE.to_string()]);
+            flush_table(v6);
         }
     }
     let _ = h;
@@ -373,10 +373,37 @@ fn set_pin(v6: bool, range: &Prefix, tun: &str, want: bool, pinned: &mut bool) {
         }
     } else if !want && *pinned {
         delete_rule(v6, &pin_rule(range));
-        ip(v6, &["route", "flush", "table", &table]);
+        flush_table(v6);
         *pinned = false;
         info!("routing: {} unpinned (shared with another interface)", r);
     }
+}
+
+/// Remove every route from [`ROUTE_TABLE`].  The kernel drops a table
+/// with its last route, and flushing a missing table fails ("FIB table does
+/// not exist") — that is the normal case at start (the previous run cleaned
+/// up), so only other failures are logged.
+#[cfg(target_os = "linux")]
+fn flush_table(v6: bool) {
+    let mut cmd = std::process::Command::new("ip");
+    if v6 {
+        cmd.arg("-6");
+    }
+    match cmd.args(["route", "flush", "table", &ROUTE_TABLE.to_string()]).output() {
+        Ok(out) if out.status.success() || table_missing(&String::from_utf8_lossy(&out.stderr)) => {}
+        Ok(out) => warn!(
+            "routing: `ip {}route flush table {}` failed: {}",
+            if v6 { "-6 " } else { "" },
+            ROUTE_TABLE,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => warn!("routing: cannot run `ip`: {}", e),
+    }
+}
+
+/// Whether `ip` stderr says the routing table doesn't exist (empty).
+fn table_missing(stderr: &str) -> bool {
+    stderr.contains("FIB table does not exist")
 }
 
 /// Delete every copy of a rule (left behind by a crash, say).
@@ -537,6 +564,15 @@ mod tests {
         let mac = "   route to: 172.22.0.1\ndestination: 172.22.0.0\n       mask: 255.255.0.0\n  interface: utun4\n      flags: <UP,DONE,STATIC>\n";
         assert_eq!(parse_macos_route_get(mac), Some("utun4".into()));
         assert_eq!(parse_macos_route_get("route: writing to routing socket: not in table"), None);
+    }
+
+    #[test]
+    fn flushing_a_missing_table_is_not_an_error() {
+        // iproute2 7.x on Linux 7.x, table 2222 after a clean shutdown.
+        assert!(table_missing("Error: ipv4: FIB table does not exist.\nFlush terminated\n"));
+        assert!(table_missing("Error: ipv6: FIB table does not exist.\nFlush terminated\n"));
+        assert!(!table_missing("RTNETLINK answers: Operation not permitted\n"));
+        assert!(!table_missing(""));
     }
 
     #[test]
