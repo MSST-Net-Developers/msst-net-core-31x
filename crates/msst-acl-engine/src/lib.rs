@@ -37,7 +37,7 @@ mod rules;
 pub use decision::{Decision, DecisionReason, MatchedRule};
 pub use match_context::{MatchContext, PrincipalRef};
 pub use rules::{
-    Action, Direction, FirewallRule, PermissionGroup, Protocol, ProtocolPort,
+    Action, Direction, FirewallRule, PermissionGroup, Protocol, ProtocolPort, Scope,
 };
 
 /// Evaluate the firewall rules for an inbound or outbound packet.

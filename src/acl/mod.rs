@@ -389,6 +389,7 @@ pub async fn clear_rules(state: &Arc<CoreState>) -> Result<Value, IpcError> {
     }
     state.next_generation();
     info!("acl: cleared {} rule(s)", rules.len());
+    crate::inbound::revoke_flows(state, "rules cleared", |o| rules.iter().any(|r| r.id == o.rule_id));
     for r in &rules {
         state.emit_ipc_event(IpcEvent::AclChanged { rule_id: r.id.clone(), action: "deleted".into() });
     }
@@ -427,6 +428,9 @@ pub async fn update_rule(state: &Arc<CoreState>, rule_id: &str, patch: Value) ->
     }
     state.next_generation();
     info!("acl: updated rule {}", rule_id);
+    if before.enabled && patch.enabled == Some(false) {
+        crate::inbound::revoke_flows(state, &format!("rule {} disabled", rule_id), |o| o.rule_id == rule_id);
+    }
     state.emit_ipc_event(IpcEvent::AclChanged { rule_id: rule_id.into(), action: "updated".into() });
     Ok(json!({ "rule": view }))
 }
@@ -454,6 +458,7 @@ pub async fn delete_rule(state: &Arc<CoreState>, rule_id: &str) -> Result<Value,
     }
     state.next_generation();
     info!("acl: deleted rule {}", rule_id);
+    crate::inbound::revoke_flows(state, &format!("rule {} deleted", rule_id), |o| o.rule_id == rule_id);
     state.emit_ipc_event(IpcEvent::AclChanged { rule_id: rule_id.into(), action: "deleted".into() });
     Ok(json!({ "ok": true }))
 }

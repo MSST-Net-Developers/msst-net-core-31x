@@ -15,7 +15,7 @@ pub mod fragment;
 pub mod parsed;
 pub mod pipeline;
 
-pub use conn_track::{ConnKey, ConnectionTracker};
+pub use conn_track::{ConnKey, ConnectionTracker, FlowOrigin};
 pub use fragment::{FragKey, FragmentTracker, LaterFragment};
 pub use parsed::{ParsedPacket, TransportProtocol};
 pub use pipeline::{PipelineVerdict, PingPolicy, StaticPingPolicy, process_inbound};

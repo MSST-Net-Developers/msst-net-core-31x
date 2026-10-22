@@ -63,9 +63,14 @@ async fn ensure_not_in_room(state: &CoreState) -> Result<(), IpcError> {
 }
 
 /// Complete the pending join (called by the runtime on `room_state`/`error`).
-pub fn notify_room_waiter(state: &CoreState, result: Result<Value, JoinRefused>) {
-    if let Some(tx) = state.room_waiter.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        let _ = tx.send(result);
+/// Returns whether a join was waiting.
+pub fn notify_room_waiter(state: &CoreState, result: Result<Value, JoinRefused>) -> bool {
+    match state.room_waiter.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(tx) => {
+            let _ = tx.send(result);
+            true
+        }
+        None => false,
     }
 }
 
@@ -263,26 +268,56 @@ pub async fn leave_room(state: &Arc<CoreState>, room_id: String) -> Result<Value
     if let Err(e) = client.send_discovery_leave(&room_id).await {
         warn!("rooms: discovery_leave for {} failed: {}", room_id, e);
     }
-    let had_room_relay = {
+    forget_room(state, &room_id).await;
+    info!("rooms: left {}", room_id);
+    Ok(json!({ "ok": true }))
+}
+
+/// Drop a room from local state (we left it, or the coordinator no longer
+/// has it) and report the new room state.  Returns whether we were in it.
+async fn forget_room(state: &Arc<CoreState>, room_id: &str) -> bool {
+    let (was_in, had_room_relay, none_left) = {
         let mut net = state.net.write().await;
-        net.joined_rooms.remove(&room_id);
-        net.room_password_verifiers.remove(&room_id);
+        let was_in = net.joined_rooms.remove(room_id).is_some();
+        net.room_password_verifiers.remove(room_id);
         if net.joined_rooms.is_empty() {
             net.room_peers.clear();
         }
-        net.room_relay.take_if(|r| r.room_id == room_id).is_some()
+        let had_room_relay = net.room_relay.take_if(|r| r.room_id == room_id).is_some();
+        (was_in, had_room_relay, net.joined_rooms.is_empty())
     };
     if had_room_relay {
         // Stop announcing `room-relay:`.
         crate::endpoints::spawn_detect_and_report(state.clone());
     }
-    if state.net.read().await.joined_rooms.is_empty() {
+    if none_left {
         crate::peer_cache::on_rooms_left(state).await;
     }
-    info!("rooms: left {}", room_id);
+    crate::inbound::revoke_room_flows(state).await;
     emit_room_state(state).await;
-    Ok(json!({ "ok": true }))
+    was_in
 }
+
+/// The coordinator answered `room not found` outside a join: a room we are
+/// in has expired there (e.g. no member kept it alive while this device
+/// was asleep), so our `room_keepalive` or re-join after a reconnect was
+/// refused.  The error names no room; a device is in one room at a time,
+/// so every joined room is dropped.  Returns the rooms dropped.
+pub async fn on_rooms_gone(state: &Arc<CoreState>) -> Vec<String> {
+    let rooms: Vec<String> = state.net.read().await.joined_rooms.keys().cloned().collect();
+    let mut gone = Vec::new();
+    for room_id in rooms {
+        if forget_room(state, &room_id).await {
+            warn!("rooms: {} no longer exists on the coordinator (expired); left it", room_id);
+            gone.push(room_id);
+        }
+    }
+    gone
+}
+
+/// The coordinator's message for a room it doesn't have (`hub.go`; it
+/// sends no code).
+pub const ROOM_NOT_FOUND_MESSAGE: &str = "room not found";
 
 /// Emit `RoomStateChanged` with the same content as `GetSystemState`'s room
 /// view (room left → `room_id: null`, no peers but ourselves).

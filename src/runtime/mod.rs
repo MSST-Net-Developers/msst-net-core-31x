@@ -464,6 +464,7 @@ async fn coordinator_event_loop(
                 // Current co-members of this room.
                 let ids: Vec<String> = peers.iter().map(|p| p.device_id.clone()).collect();
                 state.net.write().await.room_peers = ids.iter().cloned().collect();
+                crate::inbound::revoke_room_flows(state).await;
                 crate::peer_cache::on_room_members(state, &ids).await;
 
                 // Peer list, scheduler, WireGuard.
@@ -506,6 +507,7 @@ async fn coordinator_event_loop(
                 let mut net = state.net.write().await;
                 net.room_peers.remove(&device_id);
                 drop(net);
+                crate::inbound::revoke_room_flows(state).await;
                 // Kept for the room grace period, then evicted by housekeeping.
                 crate::peer_cache::on_member_left(state, &device_id).await;
                 crate::rooms::emit_room_state(state).await;
@@ -576,8 +578,12 @@ async fn coordinator_event_loop(
             // ── Coordinator error ─────────────────────────────────────────
             CoordinatorEvent::Error { message, code } => {
                 warn!("coordinator error: {}", message);
+                let room_gone = code.is_none() && message == crate::rooms::ROOM_NOT_FOUND_MESSAGE;
                 // Fail a pending join fast (e.g. wrong room password).
-                crate::rooms::notify_room_waiter(state, Err(crate::rooms::JoinRefused { code, message }));
+                let was_join = crate::rooms::notify_room_waiter(state, Err(crate::rooms::JoinRefused { code, message }));
+                if room_gone && !was_join {
+                    crate::rooms::on_rooms_gone(state).await;
+                }
             }
         }
     }
@@ -1596,6 +1602,69 @@ mod tests {
         assert_eq!(route_outbound_packet(&udp_packet(), &state).await, None);
         let mut buf = [0u8; 64];
         assert!(tokio::time::timeout(std::time::Duration::from_millis(100), relay.recv_from(&mut buf)).await.is_err());
+    }
+
+    // ── Room expired on the coordinator ──────────────────────────────────
+
+    /// Feed `events` to the coordinator event handler until they are used up.
+    async fn handle_events(state: &Arc<CoreState>, events: Vec<CoordinatorEvent>) {
+        let (ev_tx, _) = mpsc::channel(1);
+        let client = Arc::new(CoordinatorClient::new(crate::coordinator::CoordinatorConfig { coord_url: "http://127.0.0.1:9".into() }, ev_tx));
+        let (tx, mut rx) = mpsc::channel(events.len().max(1));
+        for e in events {
+            tx.send(e).await.unwrap();
+        }
+        drop(tx);
+        coordinator_event_loop(client, &mut rx, state, None).await;
+    }
+
+    fn room_not_found() -> CoordinatorEvent {
+        CoordinatorEvent::Error { message: "room not found".into(), code: None }
+    }
+
+    fn left_room_events(rx: &mut crate::state::EventReceiver) -> usize {
+        let mut n = 0;
+        while let Ok(e) = rx.try_recv() {
+            if let msst_ipc_protocol::IpcEvent::RoomStateChanged { room_id, .. } = e {
+                assert_eq!(room_id, None);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn a_room_the_coordinator_no_longer_has_is_left() {
+        let (state, mut ipc) = crate::test_support::core_state("room-gone").await;
+        {
+            let mut net = state.net.write().await;
+            net.joined_rooms.insert("space-1".into(), "Room".into());
+            net.room_password_verifiers.insert("space-1".into(), "v".into());
+            net.room_peers.insert("device-0000000b".into());
+        }
+        // A join waiting for its answer takes the error (it was about that
+        // join); other errors don't touch the room.
+        let (wtx, wrx) = tokio::sync::oneshot::channel();
+        *state.room_waiter.lock().unwrap() = Some(wtx);
+        handle_events(&state, vec![
+            room_not_found(),
+            CoordinatorEvent::Error { message: "密码错误".into(), code: Some("room_password_wrong".into()) },
+        ]).await;
+        assert!(wrx.await.unwrap().is_err());
+        assert!(state.net.read().await.joined_rooms.contains_key("space-1"));
+        assert_eq!(left_room_events(&mut ipc), 0);
+
+        // Our keepalive or re-join was refused: the room expired.
+        handle_events(&state, vec![room_not_found()]).await;
+        {
+            let net = state.net.read().await;
+            assert!(net.joined_rooms.is_empty() && net.room_peers.is_empty() && net.room_password_verifiers.is_empty());
+        }
+        // The Controller is told, as after LeaveRoom.
+        assert_eq!(left_room_events(&mut ipc), 1);
+        // Not in a room any more: a late repeat changes nothing.
+        handle_events(&state, vec![room_not_found()]).await;
+        assert_eq!(left_room_events(&mut ipc), 0);
     }
 
     // ── Data-plane encryption: two Cores through a forwarding relay ──────

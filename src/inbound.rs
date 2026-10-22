@@ -7,11 +7,11 @@
 //! way into the TUN is verified discovery broadcasts (`crate::discovery`).
 
 use crate::state::CoreState;
-use msst_acl_engine::{Action, Direction, FirewallRule, PermissionGroup, Protocol, ProtocolPort};
+use msst_acl_engine::{Action, Direction, FirewallRule, PermissionGroup, Protocol, ProtocolPort, Scope};
 use msst_core_state::firewall::access_log::{AccessDecision, AccessLogEntry, AccessReason};
 use msst_core_state::firewall::auth::AuthKey;
 use msst_core_state::packet::parsed::{ParsedPacket, TransportProtocol};
-use msst_core_state::packet::{self, LaterFragment, PipelineVerdict, StaticPingPolicy};
+use msst_core_state::packet::{self, FlowOrigin, LaterFragment, PipelineVerdict, StaticPingPolicy};
 use msst_ipc_protocol::{AuthDecision, IpcError, IpcEvent};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -128,6 +128,11 @@ pub async fn deliver_inbound(state: &Arc<CoreState>, tun_tx: &mpsc::Sender<Vec<u
             state.contacts.lock().unwrap_or_else(|e| e.into_inner()).update_communication(&src_device_id, now);
             crate::diagnostics::traffic(state, &src_device_id).rx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::peer_cache::on_communication(state, &src_device_id).await;
+            if let Some(m) = &decision.matched_rule {
+                // Remember what let the flow in, so revoking it ends the flow.
+                let origin = FlowOrigin { device_id: src_device_id.clone(), rule_id: m.rule_id.clone(), room_scope: m.scope == Scope::Space };
+                record_admitted(state, &parsed, origin, now);
+            }
             if let (Some(proto), Some(m)) = (proto_of(&parsed), decision.matched_rule) {
                 log_access(state, &src_device_id, proto, parsed.dst_port, AccessDecision::Allow,
                     AccessReason::MatchedRule { rule_id: m.rule_id.clone(), comment: m.comment }, Some(m.rule_id)).await;
@@ -380,12 +385,50 @@ pub async fn resolve_auth(state: &Arc<CoreState>, request_id: &str, decision: Au
 
     if action == Action::Allow && !outcome.queued_packets.is_empty() {
         if let Some(tun_tx) = state.tun_tx.get() {
+            let origin = FlowOrigin { device_id: key.src_device_id.clone(), rule_id: rule.id.clone(), room_scope: false };
             for p in outcome.queued_packets {
+                if let Some(parsed) = crate::runtime::parse_ip_packet(&p) {
+                    record_admitted(state, &parsed, origin.clone(), now);
+                }
                 let _ = tun_tx.send(p).await;
             }
         }
     }
     Ok(json!({ "ok": true, "rule": view }))
+}
+
+/// Record that a rule let a peer-initiated TCP/UDP flow in
+/// (`ConnectionTracker::record_inbound_allowed`).
+fn record_admitted(state: &CoreState, parsed: &ParsedPacket, origin: FlowOrigin, now: i64) {
+    if parsed.is_later_fragment() || !matches!(parsed.proto, TransportProtocol::Tcp | TransportProtocol::Udp) {
+        return;
+    }
+    state.conn_track.lock().unwrap_or_else(|e| e.into_inner()).record_inbound_allowed(
+        parsed.src_ip, parsed.src_port, parsed.dst_ip, parsed.dst_port, parsed.proto.number(), origin, now,
+    );
+}
+
+/// A permission was revoked: end the peer-initiated flows it admitted, so
+/// their next packets are evaluated by the ACL again (an established flow
+/// otherwise keeps passing as related traffic once we replied).
+pub fn revoke_flows(state: &CoreState, why: &str, matches: impl FnMut(&FlowOrigin) -> bool) {
+    let n = state.conn_track.lock().unwrap_or_else(|e| e.into_inner()).revoke(matches);
+    if n > 0 {
+        info!("inbound: {}: ended {} connection(s) it had admitted", why, n);
+    }
+}
+
+/// End the flows from devices no longer in a room with us (we left, or
+/// they did) that only the room let in: admitted by a room rule, or
+/// involving a guest (`packet::pipeline::guest_access_blocked`).
+pub async fn revoke_room_flows(state: &CoreState) {
+    let net = state.net.read().await;
+    let still_allowed = |o: &FlowOrigin| {
+        let src_auth = net.peer_list.get(&o.device_id).is_some_and(|e| e.is_authenticated);
+        net.room_peers.contains(&o.device_id)
+            || (!o.room_scope && !packet::pipeline::guest_access_blocked(net.local_authenticated, src_auth, false))
+    };
+    revoke_flows(state, "room membership changed", |o| !still_allowed(o));
 }
 
 /// Expire unanswered requests (called every second by the scheduler tick).
@@ -1004,6 +1047,95 @@ mod tests {
             protocol_ports: vec![ProtocolPort::single(Protocol::Udp, 25565)],
             action: Action::Allow, direction: Direction::Inbound, expires_at: None, enabled: true, comment: None,
         }
+    }
+
+    // ── Revoking a permission ends the connections it admitted ───────────
+
+    /// Our reply to `udp_v4`: 172.22.0.1:25565 → 172.22.1.1:5000, recorded
+    /// as the outbound path does.
+    fn reply(h: &Harness) {
+        h.state.conn_track.lock().unwrap().record_outbound(
+            "172.22.0.1".parse().unwrap(), 25565, "172.22.1.1".parse().unwrap(), 5000, 17, crate::runtime::current_unix(),
+        );
+    }
+
+    /// The peer's next packet on the flow reaches the TUN.
+    async fn passes(h: &mut Harness) -> bool {
+        while h.tun_rx.try_recv().is_ok() {}
+        deliver_inbound(&h.state, &h.tun_tx, udp_v4(b"x")).await;
+        h.tun_rx.try_recv().is_ok()
+    }
+
+    /// The flow was admitted by `rule` and we replied: it is related now.
+    async fn established(h: &mut Harness, rule: FirewallRule) {
+        h.state.net.write().await.acl_rules.push(rule);
+        assert!(passes(h).await);
+        reply(h);
+        assert!(passes(h).await);
+    }
+
+    #[tokio::test]
+    async fn deleting_or_disabling_the_rule_ends_its_connections() {
+        let mut h = harness("revoke-delete", false).await;
+        established(&mut h, allow_udp_25565()).await;
+        crate::acl::delete_rule(&h.state, "mc").await.unwrap();
+        assert!(!passes(&mut h).await);
+        // Our replies don't make it related again.
+        reply(&h);
+        assert!(!passes(&mut h).await);
+
+        // Another rule still allows it: it keeps working.
+        let mut h = harness("revoke-other", false).await;
+        established(&mut h, allow_udp_25565()).await;
+        h.state.net.write().await.acl_rules.push(FirewallRule { id: "mc2".into(), ..allow_udp_25565() });
+        crate::acl::delete_rule(&h.state, "mc").await.unwrap();
+        assert!(passes(&mut h).await);
+        reply(&h);
+        assert!(passes(&mut h).await);
+
+        let mut h = harness("revoke-disable", false).await;
+        established(&mut h, allow_udp_25565()).await;
+        crate::acl::update_rule(&h.state, "mc", json!({"comment": "x"})).await.unwrap();
+        assert!(passes(&mut h).await, "other edits revoke nothing");
+        crate::acl::update_rule(&h.state, "mc", json!({"enabled": false})).await.unwrap();
+        assert!(!passes(&mut h).await);
+    }
+
+    #[tokio::test]
+    async fn an_expired_rule_keeps_its_connections() {
+        let mut h = harness("revoke-expire", false).await;
+        let now = crate::runtime::current_unix();
+        established(&mut h, FirewallRule { expires_at: Some(now + 60), ..allow_udp_25565() }).await;
+        crate::acl::expire_rules(&h.state, now + 61).await;
+        assert!(h.state.net.read().await.acl_rules.is_empty());
+        assert!(passes(&mut h).await);
+    }
+
+    #[tokio::test]
+    async fn leaving_the_room_ends_what_only_the_room_allowed() {
+        let mut h = harness("revoke-room", true).await;
+        established(&mut h, FirewallRule { permission_group: PermissionGroup::Space, ..allow_udp_25565() }).await;
+        // The peer leaves (member_left): the room rule no longer covers it.
+        h.state.net.write().await.room_peers.remove("device-0000000b");
+        revoke_room_flows(&h.state).await;
+        assert!(!passes(&mut h).await);
+
+        // A device rule between two authenticated devices doesn't depend
+        // on the room.
+        let mut h = harness("revoke-room-dev", true).await;
+        established(&mut h, allow_udp_25565()).await;
+        h.state.net.write().await.room_peers.clear();
+        revoke_room_flows(&h.state).await;
+        assert!(passes(&mut h).await);
+
+        // A guest peer: only the shared room let it in.
+        let mut h = harness("revoke-room-guest", true).await;
+        h.state.net.write().await.peer_list.upsert("device-0000000b", "172.22.1.1".parse().unwrap(), "fd22:2222:2222:2222::b".parse().unwrap(),
+            None, None, None, None, None, None, false, 0);
+        established(&mut h, allow_udp_25565()).await;
+        h.state.net.write().await.room_peers.clear();
+        revoke_room_flows(&h.state).await;
+        assert!(!passes(&mut h).await);
     }
 
     #[tokio::test]
