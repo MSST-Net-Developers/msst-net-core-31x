@@ -22,6 +22,17 @@ relay.
 
 3.0.x clients are not supported.  No compatibility mode is needed.
 
+> **Core 3.1.6: secure discovery (sdisc, `0x0A`/`0x0B`/`0x0C`, client UDP
+> 21032) is no longer used.**  Game discovery now goes to each room member
+> inside its WireGuard session (`0x0D` like any data), because with sdisc
+> the original sender was only the relay's claim
+> (`docs/SECURITY_3.1.6.md`).  A 3.1.6 Core never sends `0x0A`/`0x0B` and
+> ignores `0x0C`; relays keep serving them for older clients until those
+> are gone, then may retire them.  A relay's `pub_key` is still needed for
+> authenticated registration (`0x0E`), and room relays no longer need
+> `sdisc1` in `features` (only `sreg1`).  Sections on sdisc below describe
+> 3.1.0–3.1.5.
+
 ## Packet format
 
 Every packet is an MSST frame:

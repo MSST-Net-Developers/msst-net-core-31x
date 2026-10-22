@@ -2,7 +2,7 @@
 
 2026-10-22 · Core 3.1.6 · 中转：msstnetRelay31x `aab6541` · Coordinator：msstnetCoordinator31x `0f4388c`
 
-本文记录 3.1.5 审查后在 3.1.6 中修复的问题、sdisc 发送者认证的信任边界，以及广播投递与转发行为的实测结果。
+本文记录 3.1.5 审查后在 3.1.6 中修复的问题、sdisc 发送者认证的信任边界以及为此改用 WireGuard 的设计，还有广播投递与转发行为的实测结果。
 
 ## 1. 修复一览
 
@@ -10,11 +10,12 @@
 |---|---|---|---|
 | S1 | 对端包只校验源地址、不校验目的地址；ACL 只按协议和端口匹配。开启 IP 转发时，对端可以经本机访问本机所连的其他网络（局域网、其他对端），用的是 ACL 对它开放的端口和 ICMP。 | WireGuard 解密后的包必须发往本机虚拟 IPv4/IPv6（`inbound::from_peer_to_us`），否则丢弃。 | `d70c8e7` |
 | S2 | 游戏发现（`0x0C`）注入 TUN 前只看目的地址是否为广播或组播，协议、端口、源地址都不检查；中转也只检查 IPv4 版本号。房间成员或房间中转可以绕过 ACL 注入任意 IPv4 包，伪造源地址，还能利用其他网段的 `x.x.x.255`（在更大的网段里是单播地址，会被转发）。 | 只接受普通 IPv4/UDP（无选项、无分片、长度一致），目的地址限于 `172.22.255.255` / `255.255.255.255`（端口不限）以及 `224.0.2.60:4445`、`224.0.0.251:5353`；发送者必须是本房间成员；按发送者的虚拟地址重建数据包后再注入。发送端套用同一规则。 | `8e802cc` |
-| S3 | 接收端只做去重，不限速：恶意房间中转可以绕过中转侧的限速直接灌包。 | 去重之后先按发送者限速（10 个/秒），再全局限速（100 个/秒）。先按发送者限速，是为了让单个狂发者被拒的包不消耗全局额度。丢弃计入 `GetRelays` 的 `rate_limited`。 | `8e802cc`，本版 |
+| S3 | 接收端只做去重，不限速：恶意房间中转可以绕过中转侧的限速直接灌包。 | 先按发送者限速（10 个/秒），再全局限速（100 个/秒）。先按发送者限速，是为了让单个狂发者被拒的包不消耗全局额度。改走 WireGuard（S5）后保留不变，丢弃计入 `GetRelays.discovery.drop.rate_limited`。 | `8e802cc`，本版 |
 | S4 | Linux 上若 `net.ipv4.conf.<TUN>.bc_forwarding=1`，注入的 `172.22.255.255` 不在本机投递，而是被内核从 TUN 原样发回（见第 3 节），本机收不到局域网发现，发回的包还会被当作本机广播再发回房间，形成回环。 | Core 创建 TUN 后把该接口的 `bc_forwarding` 置 0（由入接口的值决定，`all` 为 1 时同样有效）；发送端不再发送源地址在 MSST-Net 网段内、但不是本机的发现包（任何平台上被系统弹回的别人的包都不会再发回房间）。 | 本版 |
+| S5 | sdisc 的发送者只由中转声明（第 2 节）：恶意中转（例如建房人运营的房间中转）可以冒充任意房间成员发送发现包。 | 采用方案一：发现包经 WireGuard 逐成员发送，发送者端到端认证；sdisc 完全退役（不再发送、不再接受，关闭 UDP 21032），不支持新协议的成员不降级到中转，而是不发送、不接收，并在房间视图中标为 `unsupported`。接收端的成员资格检查、广播规则、按发送者重建和双层限速保留不变。 | 本版 |
 | — | 物理网卡广播捕获的回环：成员伪造“源地址 = 本机局域网 IP、目的地址 = 255.255.255.255”的包，注入后会被本机的原始套接字当作本机广播再发回房间。 | S2 的重建使注入包的源地址总是发送者的虚拟地址，捕获时被忽略（测试 `injected_broadcasts_are_not_captured_again`）。 | `8e802cc` |
 
-## 2. sdisc 的发送者认证：由中转声明，不是端到端
+## 2. sdisc 的发送者认证：由中转声明，不是端到端（已由 S5 解决）
 
 密钥派生（`src/sdisc.rs`，规范见中转仓库 `SECURE_DISCOVERY.md`）：
 
@@ -32,26 +33,34 @@ k_c2r ‖ k_r2c = HKDF-SHA256(shared, "msst-sdisc-v1", device_id ‖ device_pk �
 - 官方中转：密钥由 Coordinator 经 HTTPS 下发并固定（`GET /relays` 的 `pub_key`），中转本身被攻破时成立。
 - 房间中转：建房人在连接串 `msst-relay://host:port#<key>` 中指定，可以是任何人自建的服务器。**恶意建房人运营的中转就是这种情况**，门槛最低。
 
-### 恶意中转在 3.1.6 下仍能做到
+以下两小节描述的是 S1–S4 修复后、S5 之前的状态，作为改用 WireGuard 的依据保留。
+
+### 恶意中转在 S5 之前仍能做到
 
 - 以**任意当前房间成员**的名义向任意成员投递发现包（Core 检查发送者是否为房间成员，但成员 ID 是中转声明的）。
 - 内容是任意 UDP 载荷，发往 MSST-Net 广播地址的任意端口，或两个组播组的固定端口。例如以成员 A 的名义伪造一个“A 开的 Minecraft 局域网世界”，玩家点进去后连接的是 A 的地址和伪造的端口，仍要经过 A 的入站 ACL。
 - 选择性丢弃或只投给部分成员（拒绝服务）。这在任何转发方案下都无法避免。
 
-### 3.1.6 下已经做不到
+### S1–S4 之后已经做不到
 
 - 单播、非 UDP、IP 选项、分片。
 - 伪造房间成员以外的源地址，或伪造某个成员的任意源地址（注入前一律按声明的发送者的虚拟地址重建）。
 - 让包被本机转发到其他网络（只允许 MSST-Net 广播地址、受限广播和两个组播组，见第 3 节）。
 - 超过每个发送者 10 个/秒、合计 100 个/秒。
 
-### 进一步修复的选项（协议变更，待决定）
+### 采用的方案：发现包经 WireGuard 逐成员发送（S5）
 
-1. **发现包改走 WireGuard（推荐）。** 发送端把发现包作为隧道内数据，逐个发给房间成员，不再经中转扇出。发送者由 WireGuard 端到端认证，内容也加密了，不需要新的密钥类型，也不依赖中转的 `pub_key`。代价：每个广播发 N 份（N 为成员数，发现包小且约每秒一次）；要先与每个成员建立会话；接收端的目的地址检查（S1）需要对这类包放行 MSST-Net 广播地址；新旧客户端混用期间需要兼容方案。
-2. **逐接收者 MAC。** 发送者用 `X25519(sender_sk, recipient_pk)` 为每个接收者计算标签，中转原样转发。包长随人数增加（16 字节 × N），房间人数不设上限，需要分片或分组。
-3. **签名。** 每台设备增加 Ed25519 密钥，由 Coordinator 分发。改动最大。
+候选方案有三个：经 WireGuard 逐成员发送；逐接收者 MAC（包长随人数增长，16 字节 × N）；每台设备增加 Ed25519 签名密钥（需要 Coordinator 分发，改动最大）。最终选择第一种，具体设计如下：
 
-在采用其中之一之前，第 1 节的限制使恶意中转的伪造能力停留在“以成员名义发送局域网广播”。
+- **消息格式**（`src/discovery.rs` 的 `Message`）：一个发往接收者虚拟 IPv4 的 IPv4 包，协议号 253，载荷为 `"MSDM" ‖ 版本 1 ‖ 0 ‖ 目的地址(4) ‖ 源端口(2) ‖ 目的端口(2) ‖ UDP 载荷`。它和普通数据一样经 WireGuard 加密，走该成员当前的路径（直连或中转），中转只转发密文。由于发往本机地址，它照常通过“对端包必须发给本机”（S1）的检查，不需要开例外。中转路径探测也用协议号 253（魔数 `MSRP`），两者靠魔数区分。
+- **发送者认证**：由 WireGuard 会话保证。接收方只按会话对应的设备认定发送者，并且只认它自己的虚拟地址（S1）。
+- **能力声明**：Core 在端点列表中上报 `feature:wgdisc1`。它不是地址，Coordinator 原样下发，旧客户端会忽略。只有实际运行游戏发现的 Core 才声明；内嵌的 Android Core 没有游戏发现（与 3.0.x 一致），所以不声明。
+- **拒绝静默降级**：成员公布的端点里没有该标记时（Core 3.1.5 及以前），不给它发、也收不到它的（它只会发 sdisc，而 sdisc 已退役），房间视图中该成员的 `discovery` 显示为 `"unsupported"`，`GetRelays.discovery.tx_skipped_unsupported` 计数。任何情况下都不经中转转发发现包。
+- **发现权限**（独立于入站 ACL）：发送方必须是本房间成员；载荷按发送者的虚拟地址重建，并且必须符合广播规则（UDP；MSST-Net 广播或受限广播的任意端口，或两个发现组播组的固定端口；UDP 载荷不超过 1200 字节）；接收端每个发送者 10 个/秒、合计 100 个/秒。
+- **代价**：每个广播发 N 份（N 为支持该协议的成员数）。第一次发送时会触发与各成员的 WireGuard 握手，消息在握手期间排队。
+- **sdisc 退役**：不再向中转注册（`0x0A`）、不再发送（`0x0B`）、不再接受投递（`0x0C`），UDP 21032 不再监听。中转仍可为旧客户端提供 sdisc，客户端只是不再使用。
+
+测试：`discovery::tests`（格式往返、与探测包互不混淆、重建与规则、双层限速、能力判定），`runtime::tests::discovery_goes_to_each_member_end_to_end`（两个 Core 经模拟中转：投递、只有 WireGuard 帧经过中转、非成员被丢弃），`runtime::tests::no_discovery_to_a_member_without_support`（不支持的成员什么也收不到，中转上也没有任何包）。
 
 ## 3. 广播投递与转发的实测
 
@@ -122,17 +131,20 @@ tun-out msst-not-bcast to 172.22.1.255
 
 ## 4. 测试结果（3.1.6，提交前）
 
-- `cargo test --workspace`：全部通过（msst-net-core 262、msst-core-state 232、msst-acl-engine 47、msst-ipc-protocol 22、IPC 契约向量 2、文档测试 1）。
+- `cargo test --workspace`：全部通过（msst-net-core 248（删除了 sdisc 的测试）、msst-core-state 232、msst-acl-engine 47、msst-ipc-protocol 22、IPC 契约向量 2、文档测试 1）。
 - `cargo clippy --workspace --all-targets`：与 3.1.5 相比没有新增告警。
 - 新增测试：
   - S1：`runtime::tests::peers_talk_wireguard_through_a_relay` 中发往 `192.168.1.10` 的包不进入 TUN（去掉检查后该断言失败，已验证）。
-  - S2：`discovery::tests` 中的 `discovery_is_udp_broadcast_or_known_multicast`、`injected_packets_come_from_the_room_member_itself`、`injected_broadcasts_are_not_captured_again`。
-  - S3：`each_sender_is_rate_limited_on_receive`、`all_senders_together_are_rate_limited_on_receive`。
+  - S2：`discovery::tests` 中的 `discovery_is_udp_broadcast_or_known_multicast`、`message_round_trip`（含按发送者地址重建）、`injected_broadcasts_are_not_captured_again`。
+  - S3：`receive_limits_per_sender_then_in_total`、`outbound_dedup_and_rate_limit`。
   - S4：`another_members_packet_is_never_sent_again`，以及第 3 节的命名空间实测。
+  - S5：见第 2 节末尾。
+  - IPC 契约向量更新：房间视图的成员新增 `discovery` 字段（没有其他变化）。
 
 ## 5. 遗留问题
 
-- 恶意中转可以冒充房间成员发送局域网广播（第 2 节），彻底解决需要选定进一步修复的方案。
-- 中转侧尚未校验内层包（只检查 IPv4 版本号），建议与 Core 采用同样的规则，在源头丢弃。
-- 服务端 C3（`device_key_proof` 改为 `required`）、R3（中转 `register_auth` 改为 `required`）仍待上线，见 `SERVER_FOLLOWUPS_3.1.md`。
+- 与 Core 3.1.5 及以前、以及内嵌 Android Core 的成员之间没有游戏发现（会显示为 `unsupported`）。这是“拒绝静默降级”的直接结果。
+- 中转侧：sdisc 可在旧客户端退出后退役；Coordinator 创建房间时对房间中转 `sdisc1` 的要求可以取消（见 `SERVER_FOLLOWUPS_3.1.md`）。
+- 服务端 C3（`device_key_proof` 改为 `required`）、R3（中转 `register_auth` 改为 `required`）仍待上线。
+- Windows、macOS、Android 上放行的广播是否会被转发或回发，尚待真机验证（第 3 节）。
 - 3.1.5 审查中的低危项（身份文件权限、P2P pong 泄露设备 ID、对端公布的直连地址未过滤、网页端登录限速）尚未处理。
