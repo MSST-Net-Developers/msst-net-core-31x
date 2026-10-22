@@ -254,12 +254,19 @@ jobs:
     name: Sync the Release to Gitee
     needs: [release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: trustedinster/sync-release-gitee@v1.3
+      - uses: actions/checkout@v4
         with:
-          gitee_owner: Abjust
-          gitee_repo: msst-net-core-31x
-          gitee_token: ${{ secrets.GITEE_TOKEN }}
-          github_owner: MSST-Net-Developers
-          github_repo: msst-net-core-31x
-          gitee_upload_retry_times: 3
+          sparse-checkout: .github/scripts
+      # Only this tag's release: created on Gitee if missing, its missing
+      # files uploaded; other releases are left alone.
+      - run: .github/scripts/sync-gitee-release.sh
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GITEE_OWNER: Abjust
+          GITEE_REPO: msst-net-core-31x
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RETRIES: 3
