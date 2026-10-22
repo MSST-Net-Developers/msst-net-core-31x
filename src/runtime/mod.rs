@@ -232,6 +232,9 @@ async fn inbound_loop(
                         // Echo the payload back as a pong so the sender can
                         // measure the direct path's RTT.
                         if pkt.payload.len() < msst_packet::PING_PAYLOAD_LEN { continue; }
+                        // P2P disabled: unanswered, so the peer's direct
+                        // path to us goes back to the relay as well.
+                        if state.net_settings.read().await.disable_p2p { continue; }
                         let local_id = state.net.read().await.local_device_id.clone();
                         if local_id.is_empty() { continue; }
                         let pong = msst_packet::build_p2p_pong(&local_id, &msst_packet::decode_id(pkt.src_id), &pkt.payload);
@@ -525,10 +528,7 @@ async fn coordinator_event_loop(
                     }
                     if !endpoints.is_empty() {
                         net.set_peer_on_room_relay(&device_id, crate::room_relay::reports_room_relay(&endpoints));
-                    }
-                    let candidates = crate::endpoints::direct_candidates(&endpoints);
-                    if !candidates.is_empty() {
-                        net.peer_endpoints.insert(device_id.clone(), candidates);
+                        net.set_peer_candidates(&device_id, crate::endpoints::direct_candidates(&endpoints));
                     }
                 } else if referenced {
                     // A node we care about is online: fetch it even if a

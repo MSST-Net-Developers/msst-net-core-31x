@@ -95,6 +95,17 @@ impl NetState {
         }
     }
 
+    /// Replace a peer's direct-path candidates with those of its latest
+    /// endpoint list.  None (it announces relays only, e.g. P2P disabled)
+    /// drops the old ones, so they are no longer probed.
+    pub fn set_peer_candidates(&mut self, device_id: &str, candidates: Vec<std::net::SocketAddr>) {
+        if candidates.is_empty() {
+            self.peer_endpoints.remove(device_id);
+        } else {
+            self.peer_endpoints.insert(device_id.to_string(), candidates);
+        }
+    }
+
     pub fn new() -> Self {
         NetState {
             peer_list: PeerList::new(),

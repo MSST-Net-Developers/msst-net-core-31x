@@ -224,6 +224,11 @@ impl P2PScheduler {
             }
         }
 
+        // P2P disabled: no hole punching either.
+        if self.disable_p2p {
+            return actions;
+        }
+
         // Hole-punching packets.  Not tracked as probes: the first packets
         // through a NAT are commonly dropped, and that must not count as
         // probe failures — the regular probe pings follow on the next tick.
@@ -266,7 +271,8 @@ impl P2PScheduler {
 
         if let Some(pp) = self.paths.get_mut(peer_id) {
             let before = pp.mode.clone();
-            probe::process_pong(pp, src, seq, rtt_ms, relay_rtt_ms, now_unix, self.lock_path);
+            // With P2P disabled a late pong must not upgrade the path.
+            probe::process_pong(pp, src, seq, rtt_ms, relay_rtt_ms, now_unix, self.lock_path || self.disable_p2p);
             actions.extend(mode_change(peer_id, &before, pp));
         }
 
@@ -459,6 +465,33 @@ mod tests {
         let actions = s.tick(1001, 1_001_000, &peer_eps(), &HashSet::new());
         assert!(matches!(s.path_mode("device-11223344"), Some(PeerPathMode::Relay)));
         assert!(actions.iter().any(|a| matches!(a, SchedulerAction::PathModeChanged { new_mode, .. } if new_mode == "relay")));
+    }
+
+    #[test]
+    fn tick_disable_p2p_drops_a_direct_path_even_when_locked() {
+        for lock in [false, true] {
+            let mut s = make_scheduler();
+            s.ensure_peer("device-11223344");
+            let ep = v4(1, 2, 3, 4, 21031);
+            s.paths.get_mut("device-11223344").unwrap().set_direct(ep, 0);
+            s.set_lock_path(lock);
+            s.set_disable_p2p(true);
+            let actions = s.tick(1000, 1_000_000, &peer_eps(), &HashSet::new());
+            assert!(matches!(s.path_mode("device-11223344"), Some(PeerPathMode::Relay)));
+            assert!(actions.iter().any(|a| matches!(a, SchedulerAction::PathModeChanged { old_mode, new_mode, .. }
+                if old_mode == "direct" && new_mode == "relay")));
+            // No keepalive or probe pings go out any more.
+            assert!(!actions.iter().any(|a| matches!(a, SchedulerAction::UdpSend { .. })));
+            assert_eq!(s.direct_endpoint("device-11223344"), None);
+        }
+    }
+
+    #[test]
+    fn punch_request_disabled_p2p_sends_nothing() {
+        let mut s = make_scheduler();
+        s.set_disable_p2p(true);
+        let actions = s.handle_punch_request("device-11223344", &[v4(1, 2, 3, 4, 21031)], 1000, 1_000_000);
+        assert!(actions.is_empty());
     }
 
     #[test]

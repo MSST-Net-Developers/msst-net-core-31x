@@ -160,10 +160,7 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         }
         if !p.endpoints.is_empty() {
             net.set_peer_on_room_relay(p.device_id, crate::room_relay::reports_room_relay(p.endpoints));
-        }
-        let candidates = crate::endpoints::direct_candidates(p.endpoints);
-        if !candidates.is_empty() {
-            net.peer_endpoints.insert(p.device_id.to_string(), candidates);
+            net.set_peer_candidates(p.device_id, crate::endpoints::direct_candidates(p.endpoints));
         }
         // Changed in anything but its last-seen time?
         let after = net.peer_list.get(p.device_id).cloned();

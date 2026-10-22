@@ -25,7 +25,8 @@ pub type Pings = Vec<(SocketAddr, Vec<u8>)>;
 pub struct PathPolicy {
     /// Direct-path keepalive interval (seconds).
     pub keepalive_secs: i64,
-    /// Never start probing; abandon an ongoing probe; no background probes.
+    /// Never start probing; abandon an ongoing probe; drop a direct path.
+    /// Takes precedence over `lock_path`.
     pub disable_p2p: bool,
     /// Freeze the path: no upgrade, no downgrade, no switch (a direct path
     /// keeps its keepalive bookkeeping).
@@ -158,6 +159,11 @@ fn tick_pings(
         }
 
         PeerPathMode::Direct { endpoint } => {
+            // P2P was disabled: the direct path goes too, even when locked.
+            if policy.disable_p2p {
+                pp.set_relay(now_unix);
+                return pkts;
+            }
             // Expire timed-out keepalive pings for the active endpoint.
             let expired_active: Vec<u32> = pp.pending_pings.iter()
                 .filter(|(_, (addr, sent_ms))| {
@@ -198,21 +204,19 @@ fn tick_pings(
 
             // Background probing (3.0.x): keep measuring the peer's other
             // endpoints so a better one can take over (`process_pong`).
-            if !policy.disable_p2p {
-                let others: Vec<SocketAddr> = candidates.iter().copied().filter(|&ep| ep != endpoint).collect();
-                if pp.probe_candidates != others {
-                    sync_candidates(pp, others);
-                }
-                if !pp.probe_candidates.is_empty()
-                    && now_ms.saturating_sub(pp.last_bg_probe_sent_ms) >= path::BG_PROBE_INTERVAL_MS
-                {
-                    pp.last_bg_probe_sent_ms = now_ms;
-                    let in_flight: HashSet<SocketAddr> = pp.pending_pings.values().map(|(ep, _)| *ep).collect();
-                    for candidate in pp.probe_candidates.clone() {
-                        let miss = pp.probe_miss.get(&candidate).copied().unwrap_or(0);
-                        if miss < MAX_PROBE_MISS && !in_flight.contains(&candidate) {
-                            ping(pp, &mut pkts, candidate);
-                        }
+            let others: Vec<SocketAddr> = candidates.iter().copied().filter(|&ep| ep != endpoint).collect();
+            if pp.probe_candidates != others {
+                sync_candidates(pp, others);
+            }
+            if !pp.probe_candidates.is_empty()
+                && now_ms.saturating_sub(pp.last_bg_probe_sent_ms) >= path::BG_PROBE_INTERVAL_MS
+            {
+                pp.last_bg_probe_sent_ms = now_ms;
+                let in_flight: HashSet<SocketAddr> = pp.pending_pings.values().map(|(ep, _)| *ep).collect();
+                for candidate in pp.probe_candidates.clone() {
+                    let miss = pp.probe_miss.get(&candidate).copied().unwrap_or(0);
+                    if miss < MAX_PROBE_MISS && !in_flight.contains(&candidate) {
+                        ping(pp, &mut pkts, candidate);
                     }
                 }
             }

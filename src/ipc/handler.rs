@@ -235,20 +235,26 @@ async fn handle_get_node(state: &Arc<CoreState>, device_id: &str) -> IpcResponse
 /// relay selection (coordinator reconnect).
 async fn set_net_settings(state: &Arc<CoreState>, patch: serde_json::Value) -> Result<serde_json::Value, IpcError> {
     let err = |code: &str, m: String| IpcError { code: code.into(), message: m };
-    let view = {
+    let (view, p2p_toggled) = {
         let mut s = state.net_settings.write().await;
         let mut next = s.clone();
         next.apply_patch(&patch).map_err(|e| err("invalid_settings", e))?;
         next.save(&state.data_dir).map_err(|e| err("persist_failed", format!("failed to save settings: {}", e)))?;
+        let p2p_toggled = next.disable_p2p != s.disable_p2p;
         *s = next;
         info!(
             "IPC: network settings updated: disable_p2p={} lock_path={} preferred_relay={:?} mtu_override={:?} keepalive_secs={:?} linux_dns_mode={:?} bypass_other_vpns={} block_other_vpns_over_msst={}",
             s.disable_p2p, s.lock_path, s.preferred_relay, s.mtu_override, s.keepalive_secs, s.linux_dns_mode, s.bypass_other_vpns,
             s.block_other_vpns_over_msst
         );
-        s.to_view()
+        (s.to_view(), p2p_toggled)
     };
     state.apply_net_settings().await;
+    // Peers learn about it from our endpoints: with P2P disabled only the
+    // relays are announced, so they stop probing us (and start again).
+    if p2p_toggled && state.net.read().await.relay_addr.is_some() {
+        crate::endpoints::spawn_detect_and_report(state.clone());
+    }
     state.next_generation();
     state.emit_ipc_event(msst_ipc_protocol::IpcEvent::SettingsChanged { scope: "net".into(), settings: view.clone() });
     Ok(view)
