@@ -22,11 +22,15 @@
 //!   socket's NAT mapping.
 //! - **Inbound**: UDP 21032 accepts only `0x0C` from one of those relays
 //!   that passes the tag, recipient and counter checks and whose original
-//!   sender the relay authenticated (flag bit 0).  The payload must be a
-//!   discovery packet; it is then injected into the TUN without ACL
-//!   evaluation, so this path can't be used to inject unicast traffic past
-//!   the firewall.  A packet that arrives through several relays is
-//!   injected once.
+//!   sender the relay authenticated (flag bit 0) and is in our room.  The
+//!   payload must be a discovery datagram ([`discovery_datagram`]: UDP to
+//!   MSST-Net's broadcast address on any port — games pick their own — or
+//!   to one of [`DISCOVERY_MULTICAST`]); it is rebuilt with the sender's own
+//!   virtual address as its source and then injected into the TUN without
+//!   ACL evaluation — so this path carries no unicast, no other protocols
+//!   and no forged sources.  A packet that arrives through several relays
+//!   is injected once, and each sender is rate-limited (10/s) like our own
+//!   outbound discovery.
 //!
 //! Every outcome is counted in [`SdiscStats`] (reported by `GetRelays`).
 //!
@@ -49,7 +53,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 pub const DISCOVERY_PORT: u16 = 21032;
-const DISCOVERY_MULTICAST: &[Ipv4Addr] = &[Ipv4Addr::new(224, 0, 2, 60), Ipv4Addr::new(224, 0, 0, 251)];
+/// Multicast groups carried, each with its protocol's UDP port: Minecraft
+/// Java Edition LAN worlds and mDNS.
+const DISCOVERY_MULTICAST: &[(Ipv4Addr, u16)] = &[(Ipv4Addr::new(224, 0, 2, 60), 4445), (Ipv4Addr::new(224, 0, 0, 251), 5353)];
 /// Registration loop tick (secure registration needs the 1 s early retry).
 const REGISTER_TICK: Duration = Duration::from_secs(1);
 /// Minimum interval between warnings about dropped secure packets.
@@ -70,9 +76,55 @@ const RATE_LIMIT: usize = 10;
 /// Broadcast address in MSST-Net space.
 const MSST_BROADCAST: Ipv4Addr = Ipv4Addr::new(172, 22, 255, 255);
 
+/// A discovery datagram ([`discovery_datagram`]).
+#[derive(Debug, PartialEq, Eq)]
+struct DiscoveryDatagram<'a> {
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &'a [u8],
+}
+
+/// `pkt` as a discovery datagram: a plain IPv4/UDP packet (no options, not
+/// fragmented, consistent lengths) to MSST-Net's broadcast address
+/// (172.22.255.255, or 255.255.255.255) on any port, or to one of
+/// [`DISCOVERY_MULTICAST`] on its port.  Subnet broadcasts of other networks
+/// are never carried: in this host's networks they may be unicast
+/// addresses.
+fn discovery_datagram(pkt: &[u8]) -> Option<DiscoveryDatagram<'_>> {
+    if pkt.len() < 28 || pkt[0] != 0x45 || pkt[9] != 17 {
+        return None;
+    }
+    let total = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+    let fragment = u16::from_be_bytes([pkt[6], pkt[7]]) & 0x3fff; // MF + offset
+    let udp_len = u16::from_be_bytes([pkt[24], pkt[25]]) as usize;
+    if total < 28 || total > pkt.len() || fragment != 0 || udp_len < 8 || 20 + udp_len > total {
+        return None;
+    }
+    let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    let dst_port = u16::from_be_bytes([pkt[22], pkt[23]]);
+    if dst != MSST_BROADCAST && dst != Ipv4Addr::BROADCAST && !DISCOVERY_MULTICAST.contains(&(dst, dst_port)) {
+        return None;
+    }
+    Some(DiscoveryDatagram { dst, src_port: u16::from_be_bytes([pkt[20], pkt[21]]), dst_port, payload: &pkt[28..20 + udp_len] })
+}
+
+/// The packet to inject for a verified delivery from `sender` (wire ID):
+/// rebuilt from `sender`'s own virtual IPv4 address.  `None` unless the
+/// sender is a member of our room we know the address of.
+fn rebuild_from_sender(net: &crate::state::NetState, sender: u64, pkt: &[u8]) -> Option<Vec<u8>> {
+    let d = discovery_datagram(pkt)?;
+    let device_id = format!("device-{:08x}", sender);
+    if !net.room_peers.contains(&device_id) {
+        return None;
+    }
+    let src = net.peer_list.get(&device_id)?.ipv4;
+    src.is_ipv4().then(|| ippkt::build_udp(src, d.src_port, IpAddr::V4(d.dst), d.dst_port, d.payload))
+}
+
 /// Whether an IPv4 destination is handled by the discovery proxy.
 pub fn is_discovery_target(dst: Ipv4Addr) -> bool {
-    dst == Ipv4Addr::BROADCAST || dst.octets()[3] == 255 || DISCOVERY_MULTICAST.contains(&dst)
+    dst == Ipv4Addr::BROADCAST || dst.octets()[3] == 255 || DISCOVERY_MULTICAST.iter().any(|&(a, _)| a == dst)
 }
 
 /// Whether `data` is an IPv4 packet to a discovery target.
@@ -128,6 +180,8 @@ pub struct SdiscStats {
     pub drop_unverified_sender: AtomicU64,
     /// Verified, but the same packet already arrived through another relay.
     pub drop_duplicate: AtomicU64,
+    /// Verified, but its sender exceeded the per-sender rate limit.
+    pub drop_rate_limited: AtomicU64,
     /// Relays discovery currently goes to (`IP:port`).
     relays: Mutex<Vec<String>>,
 }
@@ -166,6 +220,7 @@ impl SdiscStats {
                 "not_discovery": g(&self.drop_not_discovery),
                 "unverified_sender": g(&self.drop_unverified_sender),
                 "duplicate": g(&self.drop_duplicate),
+                "rate_limited": g(&self.drop_rate_limited),
             },
         })
     }
@@ -200,6 +255,9 @@ struct SecureSession {
     /// Recently delivered packets (sender, payload), so a packet that
     /// arrives through several relays is delivered once.
     rx_seen: HashMap<[u8; 16], Instant>,
+    /// Per-sender rate limit on what is injected (the relay limits senders
+    /// too, but a room relay is run by whoever created the room).
+    rx_rate: RateLimit<u64>,
     last_drop_warn: Option<Instant>,
 }
 
@@ -247,7 +305,8 @@ impl SecureSession {
     /// not a discovery packet, from a sender the relay could not
     /// authenticate, or already delivered — or no relay is bound.  Every
     /// drop is counted here.
-    fn accept(&mut self, device_id: &str, src: SocketAddr, stats: &SdiscStats, pkt: &[u8], now_ms: u64, now: Instant) -> Result<Vec<u8>, Option<DropReason>> {
+    /// A verified delivery: its sender (wire ID) and IPv4 packet.
+    fn accept(&mut self, device_id: &str, src: SocketAddr, stats: &SdiscStats, pkt: &[u8], now_ms: u64, now: Instant) -> Result<(u64, Vec<u8>), Option<DropReason>> {
         let mut order: Vec<(bool, [u8; 32])> =
             self.bound.iter().filter(|(_, b)| b.device_id == device_id).map(|(k, b)| (b.addr != Some(src), *k)).collect();
         if order.is_empty() {
@@ -274,14 +333,14 @@ impl SecureSession {
         Err(Some(reason))
     }
 
-    fn deliver(&mut self, d: sdisc::Delivery<'_>, stats: &SdiscStats, now: Instant) -> Result<Vec<u8>, Option<DropReason>> {
+    fn deliver(&mut self, d: sdisc::Delivery<'_>, stats: &SdiscStats, now: Instant) -> Result<(u64, Vec<u8>), Option<DropReason>> {
         if !d.sender_verified {
             // The relay forwarded a sender it could not authenticate.
             stats.drop_unverified_sender.fetch_add(1, Ordering::Relaxed);
             debug!("discovery: dropped 0x0C from unverified sender {:016x}", d.sender);
             return Err(None);
         }
-        if !is_ipv4_discovery_packet(d.ipv4) {
+        if discovery_datagram(d.ipv4).is_none() {
             stats.drop_not_discovery.fetch_add(1, Ordering::Relaxed);
             return Err(None);
         }
@@ -295,8 +354,12 @@ impl SecureSession {
             stats.drop_duplicate.fetch_add(1, Ordering::Relaxed);
             return Err(None);
         }
-        stats.rx_accepted.fetch_add(1, Ordering::Relaxed);
-        Ok(d.ipv4.to_vec())
+        // After de-duplication: copies via other relays cost nothing.
+        if self.rx_rate.exceeded(&d.sender, now) {
+            stats.drop_rate_limited.fetch_add(1, Ordering::Relaxed);
+            return Err(None);
+        }
+        Ok((d.sender, d.ipv4.to_vec()))
     }
 }
 
@@ -333,10 +396,10 @@ async fn rx_loop(sock: Arc<UdpSocket>, tun_tx: mpsc::Sender<Vec<u8>>, state: Arc
             }
         };
         let device_id = state.net.read().await.local_device_id.clone();
-        let pkt = {
+        let (sender, ip) = {
             let mut s = secure.lock().unwrap();
             match s.accept(&device_id, unmap_addr(src), &state.sdisc_stats, &buf[..len], unix_ms(), Instant::now()) {
-                Ok(ip) => ip,
+                Ok(v) => v,
                 Err(None) => continue,
                 Err(Some(r)) => {
                     if r == DropReason::Stale && s.should_warn(Instant::now()) {
@@ -348,6 +411,13 @@ async fn rx_loop(sock: Arc<UdpSocket>, tun_tx: mpsc::Sender<Vec<u8>>, state: Arc
                 }
             }
         };
+        // Only a room member's own announcements, from its own address.
+        let Some(pkt) = rebuild_from_sender(&*state.net.read().await, sender, &ip) else {
+            state.sdisc_stats.drop_unverified_sender.fetch_add(1, Ordering::Relaxed);
+            debug!("discovery: dropped 0x0C from {:016x}: not a member of our room", sender);
+            continue;
+        };
+        state.sdisc_stats.rx_accepted.fetch_add(1, Ordering::Relaxed);
         if tun_tx.send(pkt).await.is_err() {
             break;
         }
@@ -358,7 +428,37 @@ async fn rx_loop(sock: Arc<UdpSocket>, tun_tx: mpsc::Sender<Vec<u8>>, state: Arc
 #[derive(Default)]
 struct TxState {
     dedup: HashMap<[u8; 16], Instant>,
-    rate: HashMap<String, VecDeque<Instant>>,
+    rate: RateLimit<String>,
+}
+
+/// At most [`RATE_LIMIT`] packets per [`RATE_WINDOW`] per key (sender).
+struct RateLimit<K> {
+    sent: HashMap<K, VecDeque<Instant>>,
+}
+
+impl<K> Default for RateLimit<K> {
+    fn default() -> Self {
+        RateLimit { sent: HashMap::new() }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> RateLimit<K> {
+    /// Whether a packet from `key` now exceeds the limit (if not, it counts).
+    fn exceeded(&mut self, key: &K, now: Instant) -> bool {
+        // Forget idle senders, so the map stays as small as the room.
+        self.sent.retain(|_, q| {
+            while q.front().is_some_and(|&t| now.duration_since(t) >= RATE_WINDOW) {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+        let q = self.sent.entry(key.clone()).or_default();
+        if q.len() >= RATE_LIMIT {
+            return true;
+        }
+        q.push_back(now);
+        false
+    }
 }
 
 impl TxState {
@@ -373,15 +473,7 @@ impl TxState {
     }
 
     fn is_rate_limited(&mut self, device_id: &str, now: Instant) -> bool {
-        let q = self.rate.entry(device_id.to_string()).or_default();
-        while q.front().is_some_and(|&t| now.duration_since(t) >= RATE_WINDOW) {
-            q.pop_front();
-        }
-        if q.len() >= RATE_LIMIT {
-            return true;
-        }
-        q.push_back(now);
-        false
+        self.rate.exceeded(&device_id.to_string(), now)
     }
 }
 
@@ -393,6 +485,9 @@ async fn tx_loop(mut rx: mpsc::Receiver<Vec<u8>>, sock: Arc<UdpSocket>, state: A
         if needs_msst_rewrite(&pkt) {
             let Some(vip) = vpn_ipv4(&state).await else { continue };
             rewrite_for_msst_broadcast(&mut pkt, vip);
+        }
+        if discovery_datagram(&pkt).is_none() {
+            continue;
         }
         let now = Instant::now();
         if st.is_duplicate(&route.device_id, &pkt, now) || st.is_rate_limited(&route.device_id, now) {
@@ -637,13 +732,22 @@ async fn physical_bcast_loop(disc_tx: mpsc::Sender<Vec<u8>>) {
         };
         // SAFETY: recv_from initialized buf[..len].
         let pkt: Vec<u8> = buf[..len].iter().map(|b| unsafe { b.assume_init() }).collect();
-        if !needs_msst_rewrite(&pkt) || !local_ips.contains(&Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])) {
+        if !is_own_physical_broadcast(&pkt, &local_ips) {
             continue;
         }
         if disc_tx.send(pkt).await.is_err() {
             break;
         }
     }
+}
+
+/// A broadcast this machine sent on a physical LAN (`physical_bcast_loop`).
+/// The raw socket also sees broadcasts injected into the TUN; they are
+/// never ours (rebuilt from the room member's address,
+/// `rebuild_from_sender`), so a room member's broadcast can't be forwarded
+/// back to the room.
+fn is_own_physical_broadcast(pkt: &[u8], local_ips: &std::collections::HashSet<Ipv4Addr>) -> bool {
+    needs_msst_rewrite(pkt) && local_ips.contains(&Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]))
 }
 
 /// IPv4/UDP subnet broadcast outside MSST-Net space (needs rewriting).
@@ -765,7 +869,7 @@ mod tests {
         let mc = udp_to(Ipv4Addr::new(224, 0, 2, 60));
 
         let p1 = deliver(keys, 7, sdisc::FLAG_SENDER_VERIFIED, now_ms << 16, &mc);
-        assert_eq!(s.accept(DEV, src, &stats, &p1, now_ms, t).unwrap(), mc);
+        assert_eq!(s.accept(DEV, src, &stats, &p1, now_ms, t).unwrap(), (7, mc.clone()));
         // Replayed → dropped; replay state unchanged by it.
         assert_eq!(s.accept(DEV, src, &stats, &p1, now_ms, t), Err(Some(DropReason::Replay)));
         // Original sender not authenticated by the relay: dropped, counted.
@@ -784,12 +888,103 @@ mod tests {
         assert_eq!(s.accept("device-00000001", src, &stats, &p1, now_ms, t), Err(None));
 
         let snap = stats.snapshot();
-        assert_eq!(snap["rx_accepted"], 1);
+        assert_eq!(snap["rx_accepted"], 0, "counted when injected (rebuild_from_sender)");
         assert_eq!(snap["drop"]["unverified_sender"], 1);
         assert_eq!(snap["drop"]["replay"], 1);
         assert_eq!(snap["drop"]["not_discovery"], 1);
         assert_eq!(snap["drop"]["not_deliver"], 1);
         assert_eq!(snap["drop"]["bad_tag"], 1);
+    }
+
+    #[test]
+    fn discovery_is_udp_broadcast_or_known_multicast() {
+        let to = |dst: [u8; 4], port: u16| ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(172, 22, 0, 9)), 50000, IpAddr::V4(dst.into()), port, b"x");
+        // Broadcasts on any port (games choose their own), the multicast
+        // groups on their protocol's port.
+        for (dst, port) in [([224, 0, 2, 60], 4445), ([172, 22, 255, 255], 19132), ([255, 255, 255, 255], 19133),
+                            ([172, 22, 255, 255], 47624), ([224, 0, 0, 251], 5353)] {
+            let p = to(dst, port);
+            let d = discovery_datagram(&p).unwrap_or_else(|| panic!("{:?}:{}", dst, port));
+            assert_eq!((d.dst, d.src_port, d.dst_port, d.payload), (Ipv4Addr::from(dst), 50000, port, &b"x"[..]));
+        }
+        // Multicast on another port or group, other networks' broadcast
+        // addresses (unicast elsewhere), unicast.
+        for (dst, port) in [([224, 0, 2, 60], 5353), ([224, 0, 0, 1], 4445), ([192, 168, 1, 255], 19132),
+                            ([172, 22, 1, 255], 19132), ([172, 22, 0, 1], 19132)] {
+            assert!(discovery_datagram(&to(dst, port)).is_none(), "{:?}:{}", dst, port);
+        }
+        let ok = to([224, 0, 2, 60], 4445);
+        let mut tcp = ok.clone();
+        tcp[9] = 6;
+        let mut fragment = ok.clone();
+        fragment[6] = 0x20; // MF
+        let mut options = ok.clone();
+        options[0] = 0x46;
+        let mut long_udp = ok.clone();
+        long_udp[25] += 1;
+        for bad in [tcp, fragment, options, long_udp, ok[..27].to_vec()] {
+            assert!(discovery_datagram(&bad).is_none());
+        }
+    }
+
+    #[test]
+    fn injected_packets_come_from_the_room_member_itself() {
+        let mut net = crate::state::NetState::new();
+        net.peer_list.upsert("device-00000007", "172.22.0.7".parse().unwrap(), "fd22:2222:2222:2222::7".parse().unwrap(),
+            None, None, None, None, None, None, false, 0);
+        // Claims another source (spoofing another member or a LAN host).
+        let p = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4445, IpAddr::V4(Ipv4Addr::new(224, 0, 2, 60)), 4445, b"[MOTD]x[/MOTD]");
+        assert_eq!(rebuild_from_sender(&net, 7, &p), None, "not in our room");
+        net.room_peers.insert("device-00000007".into());
+        let out = rebuild_from_sender(&net, 7, &p).unwrap();
+        let u = ippkt::udp_parts(&out).unwrap();
+        assert_eq!((u.src, u.src_port, u.dst_port, u.payload), ("172.22.0.7".parse().unwrap(), 4445, 4445, &b"[MOTD]x[/MOTD]"[..]));
+        assert!(ippkt::checksums_valid(&out));
+        // Unknown sender, or a non-discovery packet: nothing.
+        assert_eq!(rebuild_from_sender(&net, 8, &p), None);
+        let unicast = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(172, 22, 0, 7)), 1, IpAddr::V4(Ipv4Addr::new(172, 22, 0, 1)), 22, b"x");
+        assert_eq!(rebuild_from_sender(&net, 7, &unicast), None);
+    }
+
+    #[test]
+    fn injected_broadcasts_are_not_captured_again() {
+        // This machine: LAN 192.168.1.5, MSST-Net 172.22.0.1.
+        let local: std::collections::HashSet<Ipv4Addr> = [Ipv4Addr::new(192, 168, 1, 5), Ipv4Addr::new(172, 22, 0, 1)].into();
+        let ours = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 4000, IpAddr::V4(Ipv4Addr::BROADCAST), 4000, b"x");
+        assert!(is_own_physical_broadcast(&ours, &local));
+        // A member's broadcast claiming our LAN address, as injected: rebuilt
+        // from the member's address, so the capture ignores it (before, it
+        // went back to the room — a loop).
+        let mut net = crate::state::NetState::new();
+        net.peer_list.upsert("device-00000007", "172.22.0.7".parse().unwrap(), "fd22:2222:2222:2222::7".parse().unwrap(),
+            None, None, None, None, None, None, false, 0);
+        net.room_peers.insert("device-00000007".into());
+        let injected = rebuild_from_sender(&net, 7, &ours).unwrap();
+        assert!(!is_own_physical_broadcast(&injected, &local));
+        // MSST-Net's own broadcast address is never captured.
+        let msst = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(172, 22, 0, 1)), 4000, IpAddr::V4(MSST_BROADCAST), 4000, b"x");
+        assert!(!is_own_physical_broadcast(&msst, &local));
+    }
+
+    #[test]
+    fn each_sender_is_rate_limited_on_receive() {
+        let (mut s, keys) = session(&[2]);
+        let stats = SdiscStats::default();
+        let now_ms = 1_760_000_000_000u64;
+        let t = Instant::now();
+        // Distinct packets (so not duplicates) from one sender.
+        let pkt = |sender: u64, c: u64| {
+            let ip = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(172, 22, 0, 7)), c as u16, IpAddr::V4(MSST_BROADCAST), 4000, b"x");
+            deliver(&keys[0], sender, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + c, &ip)
+        };
+        for c in 0..RATE_LIMIT as u64 {
+            assert!(s.accept(DEV, relay_addr(2), &stats, &pkt(7, c), now_ms, t).is_ok());
+        }
+        assert_eq!(s.accept(DEV, relay_addr(2), &stats, &pkt(7, 100), now_ms, t), Err(None));
+        assert_eq!(stats.snapshot()["drop"]["rate_limited"], 1);
+        // Another sender has its own budget; the window frees the first.
+        assert!(s.accept(DEV, relay_addr(2), &stats, &pkt(8, 101), now_ms, t).is_ok());
+        assert!(s.accept(DEV, relay_addr(2), &stats, &pkt(7, 102), now_ms, t + RATE_WINDOW).is_ok());
     }
 
     #[test]
@@ -802,17 +997,17 @@ mod tests {
         let via = |k: usize, c: u64| deliver(&keys[k], 7, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + c, &mc);
 
         // Each relay's packet verifies, whichever address it came from.
-        assert_eq!(s.accept(DEV, relay_addr(3), &stats, &via(1, 0), now_ms, t).unwrap(), mc);
+        assert_eq!(s.accept(DEV, relay_addr(3), &stats, &via(1, 0), now_ms, t).unwrap().1, mc);
         assert_eq!(s.accept(DEV, relay_addr(3), &stats, &via(0, 0), now_ms, t), Err(None), "copy via the other relay");
         assert_eq!(stats.snapshot()["drop"]["duplicate"], 1);
         // Separate replay state per relay.
         assert_eq!(s.accept(DEV, relay_addr(2), &stats, &via(0, 0), now_ms, t), Err(Some(DropReason::Replay)));
         // The game's next broadcast (after the window) gets through.
         let later = t + RX_DEDUP_TTL;
-        assert_eq!(s.accept(DEV, relay_addr(2), &stats, &via(0, 1), now_ms, later).unwrap(), mc);
+        assert_eq!(s.accept(DEV, relay_addr(2), &stats, &via(0, 1), now_ms, later).unwrap().1, mc);
         // Another sender's identical payload is not a duplicate.
         let other = deliver(&keys[0], 8, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + 2, &mc);
-        assert_eq!(s.accept(DEV, relay_addr(2), &stats, &other, now_ms, later).unwrap(), mc);
+        assert_eq!(s.accept(DEV, relay_addr(2), &stats, &other, now_ms, later).unwrap(), (8, mc));
         assert_eq!(stats.snapshot()["drop"]["bad_tag"], 0, "trying the other relay's key is not a drop");
     }
 
