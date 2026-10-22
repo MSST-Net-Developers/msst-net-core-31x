@@ -388,7 +388,7 @@ async fn housekeeping_loop(state: Arc<CoreState>) {
         state.conn_track.lock().unwrap_or_else(|e| e.into_inner()).cleanup(now);
         state.frag_track.lock().unwrap_or_else(|e| e.into_inner()).cleanup(now);
 
-        // 5. Host routing check (other VPNs / networks on the MSST ranges).
+        // 5. Host routing check (other VPNs / networks on the MSST-Net ranges).
         crate::routing::check(&state).await;
 
         debug!("housekeeping: tick complete");

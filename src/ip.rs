@@ -31,7 +31,7 @@ pub fn ipv6_available() -> bool {
         .is_ok()
 }
 
-/// Returns true for addresses in the MSST virtual address space
+/// Returns true for addresses in the MSST-Net virtual address space
 /// (172.22.0.0/16 and fd22:2222:2222:2222::/64).
 pub fn is_msst_ip(ip: &std::net::IpAddr) -> bool {
     match ip {

@@ -4,7 +4,7 @@
 //!
 //! Fetches are triggered by:
 //! - inbound data from an unknown device,
-//! - outbound traffic to an unknown MSST address,
+//! - outbound traffic to an unknown MSST-Net address,
 //! - rules naming devices/users we don't know,
 //! - (re)connecting to the coordinator (own user's devices + rule targets),
 //! - node events for rule-referenced devices.

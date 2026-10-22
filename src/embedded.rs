@@ -24,7 +24,7 @@
 //! connections without VPN".  It must be thread-safe and must not call back
 //! into Core.
 //!
-//! On Android the VpnService routes the MSST ranges and sets 172.22.0.1 as
+//! On Android the VpnService routes the MSST-Net ranges and sets 172.22.0.1 as
 //! DNS server; Core answers DNS queries arriving through the TUN.  There is
 //! no system DNS configuration and no game discovery proxy (3.0.x parity).
 

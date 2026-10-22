@@ -9,7 +9,7 @@ use std::process::Command;
 use tracing::{error, info, warn};
 use tun2::{AbstractDevice, AsyncDevice};
 
-/// Create a TUN interface with `ipv4`/16 and `ipv6`/64 and the MSST routes.
+/// Create a TUN interface with `ipv4`/16 and `ipv6`/64 and the MSST-Net routes.
 ///
 /// `name` is ignored on macOS, where the kernel assigns `utunN`.
 /// Requires root / Administrator / `CAP_NET_ADMIN`.

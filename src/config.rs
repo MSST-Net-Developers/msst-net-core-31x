@@ -21,7 +21,7 @@ use std::path::PathBuf;
 pub struct CoreConfig {
     /// Coordinator HTTP(S) base URL.
     pub coordinator_url: String,
-    /// UDP port for MSST data plane (default: 21031).
+    /// UDP port for the MSST-Net data plane (default: 21031).
     pub udp_port: u16,
     /// TUN interface name (default: "msst0").
     pub tun_name: String,

@@ -346,7 +346,7 @@ pub enum IpcEvent {
     },
 
     // ── Authentication ──────────────────────────────────────────────────────
-    /// The coordinator requires MSST access authentication.
+    /// The coordinator requires MSST-Net access authentication.
     AccessAuthRequired {
         coordinator_url: String,
     },

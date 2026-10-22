@@ -14,7 +14,7 @@
 //!
 //! - **Outbound** (only while in a room): discovery packets read from the
 //!   TUN — and, on Unix desktops, broadcasts this machine sends on its
-//!   physical LAN (rewritten into MSST space) — are de-duplicated,
+//!   physical LAN (rewritten into MSST-Net space) — are de-duplicated,
 //!   rate-limited (10/s) and sent to each of those relays as authenticated
 //!   `0x0B`.
 //! - **Registration**: `0x0A` from UDP 21032 to each of those relays (when
@@ -67,7 +67,7 @@ const RELAY_LIST_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 const RELAY_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 const RATE_LIMIT: usize = 10;
-/// Broadcast address in MSST space.
+/// Broadcast address in MSST-Net space.
 const MSST_BROADCAST: Ipv4Addr = Ipv4Addr::new(172, 22, 255, 255);
 
 /// Whether an IPv4 destination is handled by the discovery proxy.
@@ -646,7 +646,7 @@ async fn physical_bcast_loop(disc_tx: mpsc::Sender<Vec<u8>>) {
     }
 }
 
-/// IPv4/UDP subnet broadcast outside MSST space (needs rewriting).
+/// IPv4/UDP subnet broadcast outside MSST-Net space (needs rewriting).
 fn needs_msst_rewrite(pkt: &[u8]) -> bool {
     if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[9] != 17 {
         return false;
@@ -703,7 +703,7 @@ mod tests {
         let u = ippkt::udp_parts(&p).unwrap();
         assert_eq!((u.src, u.dst), (IpAddr::V4(Ipv4Addr::new(172, 22, 144, 209)), IpAddr::V4(MSST_BROADCAST)));
         assert!(ippkt::checksums_valid(&p));
-        assert!(!needs_msst_rewrite(&p), "already in MSST space");
+        assert!(!needs_msst_rewrite(&p), "already in MSST-Net space");
         assert!(!needs_msst_rewrite(&udp_to(Ipv4Addr::new(224, 0, 2, 60))));
     }
 

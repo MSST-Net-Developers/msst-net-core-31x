@@ -389,7 +389,7 @@ impl CoordinatorClient {
                     }
                     Refresh::Rejected => {}
                 }
-                warn!("coordinator: MSST access authentication required (token refresh did not resolve 401) — continuing as a guest (room mode only)");
+                warn!("coordinator: MSST-Net access authentication required (token refresh did not resolve 401) — continuing as a guest (room mode only)");
                 self.oidc_rejected.store(true, Ordering::SeqCst);
                 self.auth_changed.notify_waiters();
                 core.net.write().await.local_authenticated = false;
@@ -501,7 +501,7 @@ impl CoordinatorClient {
             false
         };
         if !refreshed {
-            info!("MSST接入认证未完成或凭据已过期，请通过MSST联合认证平台完成接入认证");
+            info!("MSST-Net接入认证未完成或凭据已过期，请通过MSST联合认证平台完成接入认证");
             self.report_auth_required(core);
         }
     }

@@ -8,7 +8,7 @@
 //!   `172.22.0.0/16` / `fd22:2222:2222:2222::/64` via the TUN, consulted by
 //!   `to <range>` rules at [`PIN_PRIORITY`] — before other VPNs' policy
 //!   rules (Tailscale's are at 5210–5270), so an exit node or a broader
-//!   subnet route (e.g. `172.16.0.0/12`) can't take MSST traffic.  Only
+//!   subnet route (e.g. `172.16.0.0/12`) can't take MSST-Net traffic.  Only
 //!   while no other interface has a route inside (or equal to) the range:
 //!   then the range is genuinely shared (e.g. a Docker network on
 //!   `172.22.0.0/16`), pinning would break that network, and it is
@@ -28,19 +28,19 @@
 //!   their own mark (`dns::DNS_UPSTREAM_MARK`) and so follow the system's
 //!   routing.
 //!
-//! - **Other VPNs kept out of MSST** (`block_other_vpns_over_msst`,
+//! - **Other VPNs kept out of MSST-Net** (`block_other_vpns_over_msst`,
 //!   default on).  Tailscale advertises every local address as a candidate
-//!   endpoint, MSST's included; between two machines on MSST it then picks
-//!   the path through MSST — WireGuard inside WireGuard, fragmented at
-//!   MSST's MTU, relayed when MSST is.  tailscaled marks its own sockets
+//!   endpoint, MSST-Net's included; between two machines on MSST-Net it
+//!   then picks the path through MSST-Net — WireGuard inside WireGuard,
+//!   fragmented at MSST-Net's MTU, relayed when MSST-Net is.  tailscaled marks its own sockets
 //!   ([`TAILSCALE_BYPASS_MARK`]), so a rule at [`BLOCK_PRIORITY`] makes
-//!   exactly those packets to the MSST ranges unreachable: Tailscale's path
-//!   probes over MSST fail and it uses its other paths.  Applications'
-//!   traffic over Tailscale or MSST is untouched.  (ZeroTier marks nothing;
+//!   exactly those packets to the MSST-Net ranges unreachable: Tailscale's
+//!   path probes over MSST-Net fail and it uses its other paths.
+//!   Applications' traffic over Tailscale or MSST-Net is untouched.  (ZeroTier marks nothing;
 //!   its `local.conf` `interfacePrefixBlacklist` does the same there.)
 //!
 //! **Route checks** (Linux, macOS), at TUN setup and every housekeeping
-//! tick: the conflicts above and where traffic to an MSST address actually
+//! tick: the conflicts above and where traffic to an MSST-Net address actually
 //! leaves.  Reported as `network_warnings` in `GetSystemState`; a change
 //! advances the generation.
 
@@ -56,13 +56,13 @@ use tracing::{info, warn};
 
 /// Policy routing table holding the TUN routes.
 pub const ROUTE_TABLE: u32 = 2222;
-/// `fwmark TAILSCALE_BYPASS_MARK to <MSST range> unreachable`: before the
+/// `fwmark TAILSCALE_BYPASS_MARK to <MSST-Net range> unreachable`: before the
 /// pin, which would otherwise route these packets into the TUN.
 pub const BLOCK_PRIORITY: u32 = 5199;
 /// The mark tailscaled puts on its own (WireGuard, disco) sockets on Linux
 /// — its rule 5210 `fwmark 0x80000/0xff0000 lookup main`.
 pub const TAILSCALE_BYPASS_MARK: &str = "0x80000/0xff0000";
-/// `to <MSST range> lookup ROUTE_TABLE`.
+/// `to <MSST-Net range> lookup ROUTE_TABLE`.
 pub const PIN_PRIORITY: u32 = 5200;
 /// `fwmark ROUTE_MARK lookup main`.
 pub const BYPASS_PRIORITY: u32 = 5201;
@@ -73,14 +73,15 @@ const _: () = assert!(BLOCK_PRIORITY < PIN_PRIORITY && PIN_PRIORITY < BYPASS_PRI
 /// bits Tailscale's rules match, `0xff0000` = `0x40000`/`0x80000`).
 pub const ROUTE_MARK: u32 = 0x4d5352;
 
-/// Something on this host that keeps MSST traffic off the MSST interface.
+/// Something on this host that keeps MSST-Net traffic off the MSST-Net
+/// interface.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct NetworkWarning {
     /// `route_conflict`: another interface has a route inside (or equal to)
-    /// an MSST range; `route_hijacked`: traffic to an MSST address leaves
+    /// an MSST-Net range; `route_hijacked`: traffic to an MSST-Net address leaves
     /// through another interface.
     pub kind: &'static str,
-    /// The MSST range concerned.
+    /// The MSST-Net range concerned.
     pub range: String,
     /// The other interface.
     pub interface: String,
@@ -204,7 +205,7 @@ struct Host {
     pinned: [bool; 2],
     /// Bypass rules installed.
     bypass: bool,
-    /// Rules keeping other VPNs out of MSST installed.
+    /// Rules keeping other VPNs out of MSST-Net installed.
     block_vpns: bool,
 }
 
@@ -296,7 +297,7 @@ pub fn set_block_other_vpns(on: bool) {
         }
     }
     h.block_vpns = on;
-    info!("routing: other VPNs (Tailscale) over MSST {}", if on { "blocked" } else { "allowed" });
+    info!("routing: other VPNs (Tailscale) over MSST-Net {}", if on { "blocked" } else { "allowed" });
 }
 
 /// Mark a new Core UDP socket while the bypass is on.

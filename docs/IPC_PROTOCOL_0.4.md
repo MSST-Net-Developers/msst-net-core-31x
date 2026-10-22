@@ -232,15 +232,16 @@ Add `"async": true` to a command request:
     Coordinator are only reachable through such a VPN.
     A non-boolean is `invalid_settings`;
   - new setting `block_other_vpns_over_msst` (boolean, default `true`,
-    applies immediately; Linux): other VPNs may not use MSST as their
-    path.  Tailscale advertises MSST's address as an endpoint and, between
-    two machines on MSST, otherwise tunnels through MSST (WireGuard inside
-    WireGuard).  Only tailscaled's own packets to the MSST ranges are
+    applies immediately; Linux): other VPNs may not use MSST-Net as their
+    path.  Tailscale advertises MSST-Net's address as an endpoint and,
+    between two machines on MSST-Net, otherwise tunnels through MSST-Net
+    (WireGuard inside WireGuard).  Only tailscaled's own packets to the
+    MSST-Net ranges are
     refused (it marks its sockets); Tailscale then uses its other paths.
-    Turn it off to let Tailscale use MSST when that path is faster.  Not
+    Turn it off to let Tailscale use MSST-Net when that path is faster.  Not
     for ZeroTier (use its `interfacePrefixBlacklist`).  A non-boolean is
     `invalid_settings`;
-  - on Linux the MSST ranges are routed to the MSST interface ahead of
+  - on Linux the MSST-Net ranges are routed to the MSST-Net interface ahead of
     other VPNs' policy rules — unless another interface has a route inside
     a range (e.g. a Docker network on `172.22.0.0/16`): then that is
     reported instead;
@@ -248,7 +249,7 @@ Add `"async": true` to a command request:
     start and every minute, a change advances `generation`): a list of
     `{kind, range, interface, route}` — `kind` `route_conflict` (another
     interface's route `route`, e.g. `172.22.0.0/16 dev br-1a2b table
-    main`, lies inside the MSST range `range`) or `route_hijacked`
+    main`, lies inside the MSST-Net range `range`) or `route_hijacked`
     (traffic to an address in `range` leaves through `interface`; `route`
     is `null`).  Empty when all is well, and always empty on Windows,
     Android and without a TUN.

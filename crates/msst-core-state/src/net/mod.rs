@@ -1,4 +1,4 @@
-//! Network transport — the MSST data plane.
+//! Network transport — the MSST-Net data plane.
 //!
 //! This module handles the wire format and path selection for peer-to-peer
 //! and relay-routed traffic.

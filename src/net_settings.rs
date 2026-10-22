@@ -53,7 +53,7 @@ pub struct NetworkSettings {
     /// immediately.  Default on; absent in older files → on.
     #[serde(default = "default_true")]
     pub bypass_other_vpns: bool,
-    /// Linux: other VPNs' own traffic (Tailscale) may not use MSST as a
+    /// Linux: other VPNs' own traffic (Tailscale) may not use MSST-Net as a
     /// path (`crate::routing`).  Applies immediately.  Default on; absent
     /// in older files → on.
     #[serde(default = "default_true")]

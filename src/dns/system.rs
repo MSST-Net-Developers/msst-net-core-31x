@@ -82,7 +82,7 @@ fn configure_linux(iface: &str, mode: LinuxDnsMode) -> bool {
 }
 
 /// Install iptables rules that redirect all locally-generated UDP port-53
-/// DNS queries to the MSST TUN virtual resolver (172.22.0.1:TUN_DNS_PORT).
+/// DNS queries to the MSST-Net TUN virtual resolver (172.22.0.1:TUN_DNS_PORT).
 ///
 /// Using TUN_DNS_PORT (21053) rather than 53 as the DNAT target avoids any
 /// conflict with system processes that may bind port 53 on the TUN interface.

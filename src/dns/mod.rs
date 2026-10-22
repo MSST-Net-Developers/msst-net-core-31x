@@ -656,7 +656,7 @@ fn system_resolvers() -> Vec<SocketAddr> {
     servers
 }
 
-/// `nameserver` lines of a resolv.conf, port 53.  Skipped: MSST's own
+/// `nameserver` lines of a resolv.conf, port 53.  Skipped: MSST-Net's own
 /// addresses (the query would come straight back), unspecified addresses
 /// and scoped IPv6 (`fe80::1%eth0`).
 fn parse_resolv_conf(text: &str) -> Vec<SocketAddr> {

@@ -153,7 +153,7 @@ pub fn detect_public_ipv6() -> Vec<std::net::Ipv6Addr> {
 
 /// Interface name prefixes of other overlay networks / VPNs, containers
 /// and VMs (Linux, macOS).  An address on such an interface is no LAN
-/// endpoint: a direct path over it would run MSST inside another tunnel,
+/// endpoint: a direct path over it would run MSST-Net inside another tunnel,
 /// or point at a host-only network peers can't reach.  `br-` is Docker's
 /// user networks — a plain `br0` LAN bridge stays; `ppp*` (PPPoE) is often
 /// the WAN link itself and stays too.
@@ -175,7 +175,7 @@ pub fn is_virtual_interface(name: &str) -> bool {
 }
 
 /// Returns `true` if the IPv4 address is in a private (LAN) range,
-/// excluding the MSST virtual range 172.22.0.0/16 (our own TUN address
+/// excluding the MSST-Net virtual range 172.22.0.0/16 (our own TUN address
 /// must never be announced as a LAN endpoint — 3.0.x `is_lan_ipv4`).
 fn is_private_ipv4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
