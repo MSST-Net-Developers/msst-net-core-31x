@@ -11,7 +11,7 @@ use msst_acl_engine::{Action, Direction, FirewallRule, PermissionGroup, Protocol
 use msst_core_state::firewall::access_log::{AccessDecision, AccessLogEntry, AccessReason};
 use msst_core_state::firewall::auth::AuthKey;
 use msst_core_state::packet::parsed::{ParsedPacket, TransportProtocol};
-use msst_core_state::packet::{self, PipelineVerdict, StaticPingPolicy};
+use msst_core_state::packet::{self, LaterFragment, PipelineVerdict, StaticPingPolicy};
 use msst_ipc_protocol::{AuthDecision, IpcError, IpcEvent};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -46,10 +46,69 @@ pub async fn from_peer_address(state: &CoreState, device_id: &str, pkt: &[u8]) -
     net.peer_list.get(device_id).is_some_and(|e| e.ipv4 == parsed.src_ip || e.ipv6 == parsed.src_ip)
 }
 
+/// The verdict of a fragmented datagram's first fragment, applied to its
+/// later fragments (`CoreState::frag_track`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FragVerdict {
+    Deliver,
+    Drop,
+    /// Waiting for an interactive decision: queue with the first fragment
+    /// (UDP), replayed together on approval.
+    QueueForAuth(AuthKey),
+}
+
+impl FragVerdict {
+    fn of(verdict: &PipelineVerdict, parsed: &ParsedPacket) -> Self {
+        match verdict {
+            PipelineVerdict::Allow { .. }
+            | PipelineVerdict::Related { .. }
+            | PipelineVerdict::IcmpAllowed { .. }
+            | PipelineVerdict::PassThrough { .. } => FragVerdict::Deliver,
+            // TCP is answered with a RST, so its first fragment isn't queued.
+            PipelineVerdict::NeedAuth { src_device_id, .. } if parsed.proto == TransportProtocol::Udp => {
+                FragVerdict::QueueForAuth(AuthKey { src_device_id: src_device_id.clone(), proto: Protocol::Udp, dst_port: parsed.dst_port })
+            }
+            _ => FragVerdict::Drop,
+        }
+    }
+}
+
+/// Apply a first fragment's verdict to one of its later fragments.
+async fn deliver_fragment(state: &CoreState, tun_tx: &mpsc::Sender<Vec<u8>>, verdict: &FragVerdict, pkt: Vec<u8>) {
+    match verdict {
+        FragVerdict::Deliver => {
+            let _ = tun_tx.send(pkt).await;
+        }
+        FragVerdict::Drop => {}
+        FragVerdict::QueueForAuth(key) => {
+            // Queued only while the request is pending (bounded queue).
+            state.firewall.lock().await.queue_packet_for_auth(key, pkt);
+        }
+    }
+}
+
 /// Run one inbound IP packet through the firewall and deliver it if allowed.
+///
+/// A fragmented datagram is evaluated on its first fragment, the only one
+/// with the transport header; the later fragments follow that verdict
+/// (`msst_core_state::packet::fragment`).
 pub async fn deliver_inbound(state: &Arc<CoreState>, tun_tx: &mpsc::Sender<Vec<u8>>, pkt: Vec<u8>) {
-    let Some(parsed) = crate::runtime::parse_ip_packet(&pkt) else { return };
+    let Some(parsed) = crate::runtime::parse_ip_packet(&pkt) else {
+        debug!("inbound: malformed or unevaluable IP packet ({} bytes), dropping", pkt.len());
+        return;
+    };
     let now = crate::runtime::current_unix();
+    let frag_key = packet::FragKey::of(&parsed);
+
+    if let (Some(key), true) = (frag_key, parsed.is_later_fragment()) {
+        let later = state.frag_track.lock().unwrap_or_else(|e| e.into_inner()).on_later(key, pkt, now);
+        match later {
+            LaterFragment::Decided(verdict, pkt) => deliver_fragment(state, tun_tx, &verdict, pkt).await,
+            LaterFragment::Held => {}
+            LaterFragment::Dropped => debug!("inbound: fragment table full, dropping a fragment from {}", parsed.src_ip),
+        }
+        return;
+    }
 
     let verdict = {
         let net = state.net.read().await;
@@ -63,6 +122,7 @@ pub async fn deliver_inbound(state: &Arc<CoreState>, tun_tx: &mpsc::Sender<Vec<u
         };
         packet::pipeline::apply_guest_policy(verdict, &parsed, &net.peer_list, &net.room_peers, net.local_authenticated)
     };
+    let frag_verdict = frag_key.map(|key| (key, FragVerdict::of(&verdict, &parsed)));
 
     match verdict {
         PipelineVerdict::Allow { src_device_id, decision } => {
@@ -97,6 +157,15 @@ pub async fn deliver_inbound(state: &Arc<CoreState>, tun_tx: &mpsc::Sender<Vec<u
         }
         PipelineVerdict::IcmpBlocked => debug!("inbound: ICMP echo request blocked (ping disabled)"),
         PipelineVerdict::UnknownSource { src_ip } => debug!("inbound: packet from unknown IP {}, dropping", src_ip),
+    }
+
+    // A first fragment: after it was handled (an auth request now exists),
+    // release the later fragments that arrived before it.
+    if let Some((key, verdict)) = frag_verdict {
+        let held = state.frag_track.lock().unwrap_or_else(|e| e.into_inner()).on_first(key, verdict.clone(), now);
+        for p in held {
+            deliver_fragment(state, tun_tx, &verdict, p).await;
+        }
     }
 }
 
@@ -740,6 +809,112 @@ mod tests {
         assert_eq!(log["entries"][0]["decision"], "silent_deny");
         assert_eq!(log["entries"][0]["reason"]["type"], "interactive_auth_timeout");
         assert_eq!(resolve_auth(&h.state, &req, AuthDecision::AllowOnce).await.unwrap_err().code, "not_found");
+    }
+
+    // ── IPv6 extension headers and fragments ─────────────────────────────
+
+    /// IPv6 fd22::b (the peer) → fd22::1 with next header `next`.
+    fn ipv6_from_peer(next: u8, rest: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0, (rest.len() >> 8) as u8, rest.len() as u8, next, 64];
+        p.extend_from_slice(&"fd22:2222:2222:2222::b".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p.extend_from_slice(&"fd22:2222:2222:2222::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p.extend_from_slice(rest);
+        p
+    }
+
+    #[tokio::test]
+    async fn ipv6_extension_headers_do_not_bypass_the_acl() {
+        let mut h = harness("ipv6-ext", true).await;
+        let tcp_syn = &syn_to(22)[20..];
+        // Destination Options, and an atomic Fragment header, in front of a
+        // SYN to a port no rule allows: evaluated like a plain SYN.
+        let mut dest_opts = vec![6, 0, 1, 4, 0, 0, 0, 0];
+        dest_opts.extend_from_slice(tcp_syn);
+        let mut atomic = vec![6, 0, 0, 0, 0, 0, 0, 1];
+        atomic.extend_from_slice(tcp_syn);
+        for pkt in [ipv6_from_peer(60, &dest_opts), ipv6_from_peer(44, &atomic)] {
+            deliver_inbound(&h.state, &h.tun_tx, pkt).await;
+            assert!(h.tun_rx.try_recv().is_err(), "not delivered past the default deny");
+        }
+        assert_eq!(created_ports(&mut h.ipc_rx), [22], "one prompt for tcp/22");
+
+        // With an allow rule it gets through.
+        h.state.net.write().await.acl_rules.push(FirewallRule {
+            id: "ssh".into(),
+            permission_group: PermissionGroup::Devices { ids: vec!["device-0000000b".into()] },
+            protocol_ports: vec![ProtocolPort::single(Protocol::Tcp, 22)],
+            action: Action::Allow, direction: Direction::Inbound, expires_at: None, enabled: true, comment: None,
+        });
+        deliver_inbound(&h.state, &h.tun_tx, ipv6_from_peer(60, &dest_opts)).await;
+        assert!(h.tun_rx.try_recv().is_ok());
+    }
+
+    /// IPv4 UDP fragments 172.22.1.1 → 172.22.0.1, id `id`: the first
+    /// (UDP header to port 25565 + 8 bytes) and the last (8 bytes at offset 2).
+    fn udp_fragments_v4(id: u8) -> (Vec<u8>, Vec<u8>) {
+        let frag = |fo: u16, body: &[u8]| {
+            let len = 20 + body.len() as u16;
+            let mut p = vec![0x45, 0, 0, len as u8, 0, id, (fo >> 8) as u8, fo as u8, 64, 17, 0, 0, 172, 22, 1, 1, 172, 22, 0, 1];
+            p.extend_from_slice(body);
+            p
+        };
+        // The later fragment's data would read as ports 22 → 22.
+        (frag(0x2000, &[0x13, 0x88, 0x63, 0xdd, 0, 24, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]), frag(2, &[0, 22, 0, 22, 9, 9, 9, 9]))
+    }
+
+    fn allow_udp_25565() -> FirewallRule {
+        FirewallRule {
+            id: "mc".into(),
+            permission_group: PermissionGroup::Devices { ids: vec!["device-0000000b".into()] },
+            protocol_ports: vec![ProtocolPort::single(Protocol::Udp, 25565)],
+            action: Action::Allow, direction: Direction::Inbound, expires_at: None, enabled: true, comment: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fragments_follow_their_first_fragment() {
+        let mut h = harness("frag-allow", true).await;
+        h.state.net.write().await.acl_rules.push(allow_udp_25565());
+        let (first, last) = udp_fragments_v4(1);
+        deliver_inbound(&h.state, &h.tun_tx, first.clone()).await;
+        deliver_inbound(&h.state, &h.tun_tx, last.clone()).await;
+        assert_eq!(h.tun_rx.try_recv().unwrap(), first);
+        assert_eq!(h.tun_rx.try_recv().unwrap(), last);
+
+        // Out of order: the later fragment waits for its first.
+        let (first, last) = udp_fragments_v4(2);
+        deliver_inbound(&h.state, &h.tun_tx, last.clone()).await;
+        assert!(h.tun_rx.try_recv().is_err());
+        deliver_inbound(&h.state, &h.tun_tx, first.clone()).await;
+        assert_eq!(h.tun_rx.try_recv().unwrap(), first);
+        assert_eq!(h.tun_rx.try_recv().unwrap(), last);
+        assert_eq!(created_ports(&mut h.ipc_rx), Vec::<u16>::new(), "no prompts for the fragments' data");
+    }
+
+    #[tokio::test]
+    async fn fragments_of_a_denied_datagram_are_dropped() {
+        let mut h = harness("frag-deny", true).await;
+        h.state.net.write().await.acl_rules.push(FirewallRule { action: Action::Deny, ..allow_udp_25565() });
+        let (first, last) = udp_fragments_v4(1);
+        deliver_inbound(&h.state, &h.tun_tx, last.clone()).await;
+        deliver_inbound(&h.state, &h.tun_tx, first).await;
+        deliver_inbound(&h.state, &h.tun_tx, last).await;
+        assert!(h.tun_rx.try_recv().is_err());
+        assert_eq!(h.state.frag_track.lock().unwrap().held_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn fragments_wait_for_the_auth_decision_together() {
+        let mut h = harness("frag-auth", true).await;
+        let (first, last) = udp_fragments_v4(1);
+        deliver_inbound(&h.state, &h.tun_tx, first.clone()).await;
+        deliver_inbound(&h.state, &h.tun_tx, last.clone()).await;
+        assert!(h.tun_rx.try_recv().is_err());
+        let req = auth_request_id(&mut h.ipc_rx).expect("a prompt for udp/25565");
+        assert!(auth_request_id(&mut h.ipc_rx).is_none());
+        resolve_auth(&h.state, &req, AuthDecision::AllowOnce).await.unwrap();
+        assert_eq!(h.tun_rx.try_recv().unwrap(), first);
+        assert_eq!(h.tun_rx.try_recv().unwrap(), last);
     }
 
     #[tokio::test]

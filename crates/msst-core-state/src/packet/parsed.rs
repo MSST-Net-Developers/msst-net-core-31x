@@ -45,4 +45,29 @@ pub struct ParsedPacket {
     pub dst_port: u16,
     /// Whether this is an ICMP echo request (ping).
     pub is_icmp_echo_request: bool,
+    /// Set when the packet is one fragment of a larger datagram (IPv4
+    /// MF/offset, IPv6 Fragment header).  `None` for whole packets,
+    /// including IPv6 atomic fragments (offset 0, no more fragments).
+    pub fragment: Option<Fragment>,
+}
+
+impl ParsedPacket {
+    /// A fragment other than the first: it carries no transport header, so
+    /// `src_port`/`dst_port` are 0 and `proto` alone can't be evaluated.
+    /// It follows the verdict of its first fragment (see
+    /// [`crate::packet::fragment`]).
+    pub fn is_later_fragment(&self) -> bool {
+        self.fragment.is_some_and(|f| f.offset != 0)
+    }
+}
+
+/// Fragmentation fields of a fragmented packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fragment {
+    /// Identification (16 bits for IPv4, 32 bits for IPv6).
+    pub id: u32,
+    /// Fragment offset in 8-byte units; 0 for the first fragment.
+    pub offset: u16,
+    /// More fragments follow.
+    pub more: bool,
 }

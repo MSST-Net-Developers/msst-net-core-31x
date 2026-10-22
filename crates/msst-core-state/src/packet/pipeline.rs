@@ -276,6 +276,7 @@ mod tests {
             src_port,
             dst_port,
             is_icmp_echo_request: false,
+            fragment: None,
         }
     }
 
@@ -287,6 +288,7 @@ mod tests {
             src_port,
             dst_port,
             is_icmp_echo_request: false,
+            fragment: None,
         }
     }
 
@@ -298,6 +300,7 @@ mod tests {
             src_port: 0,
             dst_port: 0,
             is_icmp_echo_request: true,
+            fragment: None,
         }
     }
 
@@ -580,6 +583,7 @@ mod tests {
             src_port: 0,
             dst_port: 0,
             is_icmp_echo_request: false,
+            fragment: None,
         };
         let v = process_inbound(&pkt, &pl, &[], &ct, LOCAL_USER, &empty_room(), &ping(false), NOW);
         assert!(matches!(v, PipelineVerdict::PassThrough { .. }));

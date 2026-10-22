@@ -377,8 +377,9 @@ async fn housekeeping_loop(state: Arc<CoreState>) {
         state.contacts.lock().unwrap_or_else(|e| e.into_inner()).prune(now);
         state.save_contacts();
 
-        // 4. Connection-tracking expiry.
+        // 4. Connection-tracking and fragment-verdict expiry.
         state.conn_track.lock().unwrap_or_else(|e| e.into_inner()).cleanup(now);
+        state.frag_track.lock().unwrap_or_else(|e| e.into_inner()).cleanup(now);
 
         debug!("housekeeping: tick complete");
     }
@@ -634,7 +635,9 @@ async fn route_packet(pkt: &[u8], state: &Arc<CoreState>, track: bool) -> Option
     let now = current_unix();
 
     // Record the flow so replies pass the inbound firewall ("related" path).
-    if track && matches!(parsed.proto, packet::parsed::TransportProtocol::Tcp | packet::parsed::TransportProtocol::Udp) {
+    // Later fragments have no ports; their datagram's flow is recorded from
+    // its first fragment.
+    if track && !parsed.is_later_fragment() && matches!(parsed.proto, packet::parsed::TransportProtocol::Tcp | packet::parsed::TransportProtocol::Udp) {
         state.conn_track.lock().unwrap_or_else(|e| e.into_inner()).record_outbound(
             parsed.src_ip, parsed.src_port,
             parsed.dst_ip, parsed.dst_port,
@@ -1180,6 +1183,14 @@ async fn execute_scheduler_action(
 // IP packet parsing (shared by inbound loop)
 // ---------------------------------------------------------------------------
 
+/// Parse the IP header (and, for IPv6, the extension header chain) and the
+/// transport ports.
+///
+/// Fails closed: `None` (the caller drops the packet) for anything the
+/// firewall could not evaluate correctly — a truncated header or header
+/// chain, a first fragment without the complete TCP/UDP header (RFC 7112),
+/// a TCP fragment at offset 1 (RFC 1858), more than one IPv6 Fragment
+/// header, or an over-long IPv6 extension header chain.
 pub(crate) fn parse_ip_packet(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
     if data.is_empty() { return None; }
     let version = data[0] >> 4;
@@ -1193,52 +1204,108 @@ pub(crate) fn parse_ip_packet(data: &[u8]) -> Option<packet::parsed::ParsedPacke
 fn parse_ipv4(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
     if data.len() < 20 { return None; }
     let ihl = (data[0] & 0x0F) as usize * 4;
-    if data.len() < ihl { return None; }
-    let proto_num = data[9];
+    if ihl < 20 || data.len() < ihl { return None; }
     let src_ip = std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15]);
     let dst_ip = std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]);
-    let (proto, src_port, dst_port, is_echo) = match proto_num {
-        6 if data.len() >= ihl + 4 => (
-            packet::parsed::TransportProtocol::Tcp,
-            u16::from_be_bytes([data[ihl], data[ihl + 1]]),
-            u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]),
-            false,
-        ),
-        17 if data.len() >= ihl + 4 => (
-            packet::parsed::TransportProtocol::Udp,
-            u16::from_be_bytes([data[ihl], data[ihl + 1]]),
-            u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]),
-            false,
-        ),
-        1 => (packet::parsed::TransportProtocol::Icmp, 0, 0, data.len() > ihl && data[ihl] == 8),
-        n => (packet::parsed::TransportProtocol::Other(n), 0, 0, false),
-    };
+    let flags_offset = u16::from_be_bytes([data[6], data[7]]);
+    let (offset, more) = (flags_offset & 0x1FFF, flags_offset & 0x2000 != 0);
+    let fragment = (offset != 0 || more).then(|| packet::parsed::Fragment {
+        id: u16::from_be_bytes([data[4], data[5]]) as u32,
+        offset,
+        more,
+    });
+    let (proto, src_port, dst_port, is_echo) = parse_transport(data[9], &data[ihl..], fragment, 1, 8)?;
     Some(packet::parsed::ParsedPacket {
         src_ip: std::net::IpAddr::V4(src_ip), dst_ip: std::net::IpAddr::V4(dst_ip),
-        proto, src_port, dst_port, is_icmp_echo_request: is_echo,
+        proto, src_port, dst_port, is_icmp_echo_request: is_echo, fragment,
     })
 }
 
+/// Extension headers walked before giving up (RFC 8200 recommends a
+/// bounded chain; real traffic uses one or two).
+const MAX_IPV6_EXT_HEADERS: usize = 8;
+
 fn parse_ipv6(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
     if data.len() < 40 { return None; }
-    let next_header = data[6];
     let src_ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&data[8..24]).ok()?);
     let dst_ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&data[24..40]).ok()?);
-    let (proto, src_port, dst_port, is_echo) = match next_header {
-        6 if data.len() >= 44 => (
-            packet::parsed::TransportProtocol::Tcp,
-            u16::from_be_bytes([data[40], data[41]]), u16::from_be_bytes([data[42], data[43]]), false,
-        ),
-        17 if data.len() >= 44 => (
-            packet::parsed::TransportProtocol::Udp,
-            u16::from_be_bytes([data[40], data[41]]), u16::from_be_bytes([data[42], data[43]]), false,
-        ),
-        58 => (packet::parsed::TransportProtocol::Icmp, 0, 0, data.len() > 40 && data[40] == 128),
-        n => (packet::parsed::TransportProtocol::Other(n), 0, 0, false),
-    };
+
+    // Walk the extension headers to the upper-layer header.  Without this,
+    // e.g. a TCP SYN behind a Destination Options or (atomic) Fragment
+    // header would look like "other protocol" and bypass the ACL.
+    let (mut next, mut off, mut fragment) = (data[6], 40usize, None);
+    let mut seen_fragment_header = false;
+    for walked in 0.. {
+        let len = match next {
+            // Hop-by-Hop, Routing, Destination Options: (len + 1) * 8.
+            0 | 43 | 60 => (*data.get(off + 1)? as usize + 1) * 8,
+            // Authentication Header: (len + 2) * 4.
+            51 => (*data.get(off + 1)? as usize + 2) * 4,
+            44 => {
+                if seen_fragment_header { return None; }
+                seen_fragment_header = true;
+                8
+            }
+            _ => break,
+        };
+        if walked == MAX_IPV6_EXT_HEADERS { return None; }
+        let h = data.get(off..off + len)?;
+        let mut later_fragment = false;
+        if next == 44 {
+            let fo = u16::from_be_bytes([h[2], h[3]]);
+            let (offset, more) = (fo >> 3, fo & 1 != 0);
+            // An atomic fragment (offset 0, no more) is a whole packet (RFC 6946).
+            if offset != 0 || more {
+                fragment = Some(packet::parsed::Fragment {
+                    id: u32::from_be_bytes([h[4], h[5], h[6], h[7]]),
+                    offset,
+                    more,
+                });
+            }
+            later_fragment = offset != 0;
+        }
+        next = h[0];
+        off += len;
+        // A later fragment carries no further headers, only data.
+        if later_fragment { break; }
+    }
+    let (proto, src_port, dst_port, is_echo) = parse_transport(next, data.get(off..)?, fragment, 58, 128)?;
     Some(packet::parsed::ParsedPacket {
         src_ip: std::net::IpAddr::V6(src_ip), dst_ip: std::net::IpAddr::V6(dst_ip),
-        proto, src_port, dst_port, is_icmp_echo_request: is_echo,
+        proto, src_port, dst_port, is_icmp_echo_request: is_echo, fragment,
+    })
+}
+
+/// Transport fields from the upper-layer header `l4` (protocol `proto`).
+/// `icmp`/`echo_request` are the ICMP protocol number and echo-request type
+/// of the IP family.  Later fragments have no transport header: ports 0.
+fn parse_transport(
+    proto: u8,
+    l4: &[u8],
+    fragment: Option<packet::parsed::Fragment>,
+    icmp: u8,
+    echo_request: u8,
+) -> Option<(packet::parsed::TransportProtocol, u16, u16, bool)> {
+    use packet::parsed::TransportProtocol;
+    let transport = match proto {
+        6 => TransportProtocol::Tcp,
+        17 => TransportProtocol::Udp,
+        p if p == icmp => TransportProtocol::Icmp,
+        n => TransportProtocol::Other(n),
+    };
+    if let Some(f) = fragment.filter(|f| f.offset != 0) {
+        // Offset 1 would overwrite the TCP flags of the first fragment.
+        if transport == TransportProtocol::Tcp && f.offset == 1 { return None; }
+        return Some((transport, 0, 0, false));
+    }
+    let ports = |min: usize| -> Option<(u16, u16)> {
+        (l4.len() >= min).then(|| (u16::from_be_bytes([l4[0], l4[1]]), u16::from_be_bytes([l4[2], l4[3]])))
+    };
+    Some(match transport {
+        TransportProtocol::Tcp => { let (s, d) = ports(20)?; (transport, s, d, false) }
+        TransportProtocol::Udp => { let (s, d) = ports(8)?; (transport, s, d, false) }
+        TransportProtocol::Icmp => (transport, 0, 0, l4.first() == Some(&echo_request)),
+        TransportProtocol::Other(_) => (transport, 0, 0, false),
     })
 }
 
@@ -1288,6 +1355,134 @@ mod tests {
     fn parse_too_short() {
         assert!(parse_ip_packet(&[]).is_none());
         assert!(parse_ip_packet(&[0x45]).is_none());
+    }
+
+    /// IPv4 172.22.1.1 → 172.22.0.1, protocol `proto`, id 7, fragment
+    /// `offset` (8-byte units) / `more`.
+    fn ipv4(proto: u8, offset: u16, more: bool, body: &[u8]) -> Vec<u8> {
+        let fo = offset | if more { 0x2000 } else { 0 };
+        let len = (20 + body.len()) as u16;
+        let mut p = vec![0x45, 0, (len >> 8) as u8, len as u8, 0, 7, (fo >> 8) as u8, fo as u8, 64, proto, 0, 0,
+                         172, 22, 1, 1, 172, 22, 0, 1];
+        p.extend_from_slice(body);
+        p
+    }
+
+    /// IPv6 ::b → ::1 with next header `next` and the given header chain + payload.
+    fn ipv6(next: u8, rest: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0, (rest.len() >> 8) as u8, rest.len() as u8, next, 64];
+        p.extend_from_slice(&"fd22:2222:2222:2222::b".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p.extend_from_slice(&"fd22:2222:2222:2222::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p.extend_from_slice(rest);
+        p
+    }
+
+    /// A 20-byte TCP SYN header 40000 → `port`.
+    fn tcp_syn(port: u16) -> Vec<u8> {
+        let mut t = vec![0x9c, 0x40, (port >> 8) as u8, port as u8, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0];
+        t.truncate(20);
+        t
+    }
+
+    /// An IPv6 Fragment header: next `next`, `offset` (8-byte units), `more`, id 9.
+    fn frag_hdr(next: u8, offset: u16, more: bool) -> Vec<u8> {
+        let fo = (offset << 3) | more as u16;
+        vec![next, 0, (fo >> 8) as u8, fo as u8, 0, 0, 0, 9]
+    }
+
+    #[test]
+    fn ipv6_extension_headers_are_walked_to_the_transport_header() {
+        use packet::parsed::TransportProtocol::*;
+        // Destination Options (8 bytes, PadN) then TCP.
+        let mut chain = vec![6, 0, 1, 4, 0, 0, 0, 0];
+        chain.extend(tcp_syn(22));
+        let p = parse_ip_packet(&ipv6(60, &chain)).unwrap();
+        assert_eq!((p.proto, p.src_port, p.dst_port, p.fragment), (Tcp, 40000, 22, None));
+
+        // Hop-by-Hop, Routing (16 bytes), AH (len 1 → 12 bytes), then TCP.
+        let mut chain = vec![43, 0, 1, 4, 0, 0, 0, 0];
+        chain.extend([51, 1].iter().chain(&[0u8; 14]));
+        chain.extend([6, 1].iter().chain(&[0u8; 10]));
+        chain.extend(tcp_syn(25565));
+        let p = parse_ip_packet(&ipv6(0, &chain)).unwrap();
+        assert_eq!((p.proto, p.dst_port), (Tcp, 25565));
+
+        // An atomic fragment is a whole packet.
+        let mut chain = frag_hdr(6, 0, false);
+        chain.extend(tcp_syn(22));
+        let p = parse_ip_packet(&ipv6(44, &chain)).unwrap();
+        assert_eq!((p.proto, p.dst_port, p.fragment), (Tcp, 22, None));
+
+        // ICMPv6 echo request behind Hop-by-Hop.
+        let mut chain = vec![58, 0, 1, 4, 0, 0, 0, 0];
+        chain.extend([128, 0, 0, 0]);
+        let p = parse_ip_packet(&ipv6(0, &chain)).unwrap();
+        assert!(p.proto == Icmp && p.is_icmp_echo_request);
+    }
+
+    #[test]
+    fn ipv6_fragments() {
+        use packet::parsed::{Fragment, TransportProtocol::*};
+        let mut first = frag_hdr(17, 0, true);
+        first.extend([0x13, 0x88, 0x63, 0xdd, 0, 40, 0, 0]);
+        let p = parse_ip_packet(&ipv6(44, &first)).unwrap();
+        assert_eq!((p.proto, p.dst_port, p.fragment), (Udp, 25565, Some(Fragment { id: 9, offset: 0, more: true })));
+        assert!(!p.is_later_fragment());
+
+        // A later fragment: data only (here bytes that look like ports).
+        let mut later = frag_hdr(17, 1, false);
+        later.extend([0, 22, 0, 22, 0, 0, 0, 0]);
+        let p = parse_ip_packet(&ipv6(44, &later)).unwrap();
+        assert_eq!((p.proto, p.src_port, p.dst_port), (Udp, 0, 0));
+        assert!(p.is_later_fragment());
+    }
+
+    #[test]
+    fn unevaluable_ipv6_packets_are_rejected() {
+        let mut syn = tcp_syn(22);
+        // Two Fragment headers.
+        let mut chain = frag_hdr(44, 0, false);
+        chain.extend(frag_hdr(6, 0, false));
+        chain.extend(&syn);
+        assert!(parse_ip_packet(&ipv6(44, &chain)).is_none());
+        // An extension header chain longer than the limit.
+        let n = MAX_IPV6_EXT_HEADERS + 1;
+        let mut chain: Vec<u8> = (0..n).flat_map(|i| [if i + 1 == n { 6 } else { 60 }, 0, 1, 4, 0, 0, 0, 0]).collect();
+        chain.extend(&syn);
+        assert!(parse_ip_packet(&ipv6(60, &chain)).is_none());
+        chain.drain(..8);
+        assert!(parse_ip_packet(&ipv6(60, &chain)).is_some(), "exactly the limit is fine");
+        // Truncated extension header; truncated TCP header (first fragment).
+        assert!(parse_ip_packet(&ipv6(60, &[6, 1, 0, 0])).is_none());
+        let mut chain = frag_hdr(6, 0, true);
+        syn.truncate(12);
+        chain.extend(&syn);
+        assert!(parse_ip_packet(&ipv6(44, &chain)).is_none());
+    }
+
+    #[test]
+    fn ipv4_fragments() {
+        use packet::parsed::{Fragment, TransportProtocol::*};
+        let p = parse_ip_packet(&ipv4(17, 0, true, &[0x13, 0x88, 0x63, 0xdd, 0, 40, 0, 0])).unwrap();
+        assert_eq!((p.dst_port, p.fragment), (25565, Some(Fragment { id: 7, offset: 0, more: true })));
+        // Later fragments carry data, not ports.
+        let p = parse_ip_packet(&ipv4(17, 1, true, &[0, 22, 0, 22, 0, 0, 0, 0])).unwrap();
+        assert!(p.is_later_fragment());
+        assert_eq!((p.proto, p.src_port, p.dst_port), (Udp, 0, 0));
+        let p = parse_ip_packet(&ipv4(6, 3, false, &[0; 8])).unwrap();
+        assert_eq!((p.proto, p.dst_port), (Tcp, 0));
+        // RFC 1858: TCP at offset 1, or a first fragment cutting the header.
+        assert!(parse_ip_packet(&ipv4(6, 1, false, &[0; 8])).is_none());
+        assert!(parse_ip_packet(&ipv4(6, 0, true, &tcp_syn(22)[..8])).is_none());
+        assert!(parse_ip_packet(&ipv4(17, 0, false, &[0x13, 0x88, 0x63, 0xdd])).is_none());
+        // A whole packet (DF set) is not a fragment.
+        let mut df = ipv4(6, 0, false, &tcp_syn(22));
+        df[6] = 0x40;
+        assert_eq!(parse_ip_packet(&df).unwrap().fragment, None);
+        // IHL below the minimum header.
+        let mut bad = ipv4(6, 0, false, &tcp_syn(22));
+        bad[0] = 0x44;
+        assert!(parse_ip_packet(&bad).is_none());
     }
 
     // ── Outbound routing (end-to-end over loopback UDP) ──────────────────

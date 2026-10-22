@@ -6,7 +6,7 @@
 
 use msst_core_state::encryption::EncryptionEngine;
 use msst_core_state::firewall::Firewall;
-use msst_core_state::packet::ConnectionTracker;
+use msst_core_state::packet::{ConnectionTracker, FragmentTracker};
 use msst_core_state::peer_list::PeerList;
 use msst_core_state::peer_mgmt::PeerManager;
 use msst_core_state::scheduler::P2PScheduler;
@@ -132,6 +132,7 @@ impl NetState {
 /// - `encryption` — WireGuard sessions
 /// - `scheduler` — P2P path management and routing
 /// - `conn_track` — connection tracking (hot-path, std::sync)
+/// - `frag_track` — verdicts of fragmented datagrams (hot-path, std::sync)
 /// - `generation` — mutation counter
 pub struct CoreState {
     /// Network-facing state (peers, ACL, rooms).
@@ -147,6 +148,9 @@ pub struct CoreState {
     /// Connection tracker — hot path, guarded by a `std::sync::Mutex`.
     /// Never hold the guard across an `.await`.
     pub conn_track: std::sync::Mutex<ConnectionTracker>,
+    /// Inbound fragment verdicts (`crate::inbound`) — hot path, guarded by
+    /// a `std::sync::Mutex`.  Never hold the guard across an `.await`.
+    pub frag_track: std::sync::Mutex<FragmentTracker<crate::inbound::FragVerdict>>,
     /// Relay-selection epoch.  Bumped each time a selection starts; a
     /// selection whose epoch is no longer current must not apply its result
     /// (an older, slower selection must not overwrite a newer one).
@@ -237,6 +241,7 @@ impl CoreState {
             encryption: tokio::sync::Mutex::new(EncryptionEngine::new()),
             scheduler: tokio::sync::Mutex::new(P2PScheduler::new(String::new())),
             conn_track: std::sync::Mutex::new(ConnectionTracker::new()),
+            frag_track: std::sync::Mutex::new(FragmentTracker::new()),
             relay_epoch: std::sync::atomic::AtomicU64::new(0),
             generation: Generation::new(),
             events: EventBus::new(),
