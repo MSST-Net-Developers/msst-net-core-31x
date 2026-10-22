@@ -291,7 +291,7 @@ async fn ipc_bind_failure_fails_startup() {
     let sock = dir.join("x".repeat(150));
     let mut config = crate::config::CoreConfig::default();
     config.udp_port = 0;
-    let r = crate::core::Core::start(crate::core::CoreOptions { config, data_dir: dir.clone(), ipc_socket: sock, metrics: false }).await;
+    let r = crate::core::Core::start(crate::core::CoreOptions { config, data_dir: dir.clone(), ipc_socket: sock, metrics: false, host_routing: false }).await;
     assert!(r.is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }

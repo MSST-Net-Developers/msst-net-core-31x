@@ -77,6 +77,7 @@ impl EmbeddedCore {
             data_dir: data_dir.to_path_buf(),
             ipc_socket: ipc_socket.to_path_buf(),
             metrics: false,
+            host_routing: false,
         }))?;
         let (ipv4, ipv6) = runtime.block_on(core.virtual_ips());
         // Must be created inside the runtime (it spawns nothing, but keeps
@@ -154,7 +155,7 @@ mod tests {
         config.coordinator_url = "http://127.0.0.1:9".into();
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let core = runtime
-            .block_on(Core::start(CoreOptions { config, data_dir: dir.clone(), ipc_socket: sock, metrics: false }))
+            .block_on(Core::start(CoreOptions { config, data_dir: dir.clone(), ipc_socket: sock, metrics: false, host_routing: false }))
             .unwrap();
         let (ipv4, ipv6) = runtime.block_on(core.virtual_ips());
         runtime.block_on(async { core.enable_tun_dns() });

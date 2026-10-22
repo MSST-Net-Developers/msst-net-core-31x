@@ -212,10 +212,12 @@ Add `"async": true` to a command request:
   address.  Core caches a lookup for 60 s.
 - **Other VPNs on the same host** (desktop Core):
   - new setting `bypass_other_vpns` (`GetNetSettings` / `SetNetSettings`,
-    boolean, default `true`, applies immediately; Linux): Core's own UDP
-    traffic to peers and relays uses the main routing table instead of
-    another VPN's full tunnel (Tailscale exit node, wg-quick, Clash TUN…).
-    Turn it off when relays are only reachable through such a VPN.
+    boolean, default `true`, applies immediately; Linux): Core's own
+    traffic — UDP to peers and relays, and the Coordinator connections
+    (WebSocket and HTTP) — uses the main routing table instead of another
+    VPN's full tunnel (Tailscale exit node, wg-quick, Clash TUN…).  Other
+    programs' traffic is not affected.  Turn it off when relays or the
+    Coordinator are only reachable through such a VPN.
     A non-boolean is `invalid_settings`;
   - on Linux the MSST ranges are routed to the MSST interface ahead of
     other VPNs' policy rules — unless another interface has a route inside

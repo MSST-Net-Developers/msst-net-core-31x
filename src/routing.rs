@@ -19,8 +19,14 @@
 //!   a `fwmark` rule at [`BYPASS_PRIORITY`] sends them through the main
 //!   table — the physical network — instead of another VPN's full tunnel.
 //!   Without a matching route in `main` the lookup falls through to the
-//!   next rules as before.  DNS upstream sockets keep their own mark
-//!   (`dns::DNS_UPSTREAM_MARK`) and so follow the system's routing.
+//!   next rules as before.  The Coordinator connections (WebSocket and
+//!   HTTP, both control plane) are marked the same way: TCP sockets from
+//!   `netsock::connect_tcp`, HTTP through the local SOCKS5 proxy whose
+//!   upstream connections are marked (`netsock::http_client`; reqwest
+//!   can't mark its own sockets).  Only Core's own sockets are affected,
+//!   and with the setting off nothing is marked.  DNS upstream sockets keep
+//!   their own mark (`dns::DNS_UPSTREAM_MARK`) and so follow the system's
+//!   routing.
 //!
 //! **Route checks** (Linux, macOS), at TUN setup and every housekeeping
 //! tick: the conflicts above and where traffic to an MSST address actually
@@ -209,6 +215,14 @@ pub async fn enable(state: &Arc<CoreState>) {
     }
     let on = state.net_settings.read().await.bypass_other_vpns;
     set_bypass(state, on);
+    if let Err(e) = crate::netsock::start_routed_proxy().await {
+        warn!("routing: no local proxy for Coordinator HTTP ({}); it follows the system routing", e);
+    }
+}
+
+/// Whether Core's own sockets are being marked (bypass on and managed).
+pub fn bypass_active() -> bool {
+    MARK_SOCKETS.load(Ordering::Acquire)
 }
 
 /// The TUN is up: check (and pin) its routes now.

@@ -32,6 +32,10 @@ pub struct CoreOptions {
     pub ipc_socket: PathBuf,
     /// Serve Prometheus metrics on `config.metrics_port`.
     pub metrics: bool,
+    /// Desktop daemon: manage the host's routing (`crate::routing`) — from
+    /// before the first packet or Coordinator connection.  Never for
+    /// embedded Core or tests.
+    pub host_routing: bool,
 }
 
 pub struct Core {
@@ -49,7 +53,7 @@ impl Core {
     /// every background task (coordinator, relay, scheduler, IPC, …).
     /// No TUN yet — see [`Core::attach_tun`].
     pub async fn start(opts: CoreOptions) -> Result<Core> {
-        let CoreOptions { mut config, data_dir, ipc_socket, metrics } = opts;
+        let CoreOptions { mut config, data_dir, ipc_socket, metrics, host_routing } = opts;
         info!("data directory: {:?}", data_dir);
 
         let udp = Arc::new(crate::make_udp_socket(config.udp_port)?);
@@ -74,6 +78,9 @@ impl Core {
         state.apply_identity(&identity).await;
         *state.net_settings.write().await = settings;
         state.apply_net_settings().await;
+        if host_routing {
+            crate::routing::enable(&state).await;
+        }
         acl::load(&state).await;
         peer_cache::restore(&state).await;
         match contacts::ContactList::load(&data_dir) {

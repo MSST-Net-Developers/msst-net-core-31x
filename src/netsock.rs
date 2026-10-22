@@ -30,6 +30,9 @@ pub type Protector = Arc<dyn Fn(i32) -> bool + Send + Sync>;
 
 static PROTECTOR: OnceLock<Protector> = OnceLock::new();
 static SOCKS: OnceLock<SocksProxy> = OnceLock::new();
+/// Desktop: the proxy Coordinator HTTP goes through while
+/// `crate::routing` bypasses other VPNs (see [`http_client`]).
+static ROUTED: OnceLock<SocksProxy> = OnceLock::new();
 
 /// Install the process-wide protector (embedded Core, once).
 pub fn install_protector(p: Protector) {
@@ -100,6 +103,8 @@ async fn connect_tcp_with(protector: Option<&Protector>, addrs: &[SocketAddr]) -
     for &addr in addrs {
         let sock = if addr.is_ipv6() { tokio::net::TcpSocket::new_v6()? } else { tokio::net::TcpSocket::new_v4()? };
         apply(protector, raw_fd(&sock))?;
+        // Before connect(): the route is chosen then.
+        crate::routing::mark_new_socket(&sock);
         match sock.connect(addr).await {
             Ok(s) => return Ok(s),
             Err(e) => last = e,
@@ -119,16 +124,30 @@ pub async fn connect_host(host: &str, port: u16) -> std::io::Result<TcpStream> {
 // ---------------------------------------------------------------------------
 
 /// The HTTP client Core uses for the coordinator.  With a protector, it is
-/// routed through the authenticated local SOCKS5 proxy.
+/// routed through the authenticated local SOCKS5 proxy.  On the desktop,
+/// while `crate::routing` bypasses other VPNs, through the routed proxy
+/// (its upstream sockets carry the routing mark) — decided per request, so
+/// the setting applies to new connections without a new client.
 pub fn http_client() -> reqwest::Client {
+    let routed: RoutedProxy = Arc::new(|| {
+        crate::routing::bypass_active().then(|| ROUTED.get().map(SocksProxy::url)).flatten()
+    });
+    http_client_with(SOCKS.get().map(SocksProxy::url), routed)
+}
+
+/// Where HTTP goes now: a proxy URL, or `None` for a direct connection.
+type RoutedProxy = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+fn http_client_with(protected: Option<String>, routed: RoutedProxy) -> reqwest::Client {
     let mut b = reqwest::Client::builder();
-    if let Some(p) = SOCKS.get() {
-        match reqwest::Proxy::all(p.url()) {
+    if let Some(url) = protected {
+        match reqwest::Proxy::all(url) {
             Ok(proxy) => b = b.proxy(proxy),
             Err(e) => warn!("netsock: invalid proxy url: {}", e),
         }
     } else {
-        b = b.no_proxy(); // never follow HTTP(S)_PROXY env into a VPN loop
+        // Never follow HTTP(S)_PROXY env into a VPN loop.
+        b = b.no_proxy().proxy(reqwest::Proxy::custom(move |_| routed()));
     }
     b.build().unwrap_or_else(|e| {
         warn!("netsock: HTTP client build failed ({}), using defaults", e);
@@ -149,12 +168,26 @@ pub async fn start_protected_proxy() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Start the routed proxy (desktop, `crate::routing::enable`).  Upstream
+/// connections go through [`connect_tcp_with`], which marks them.
+pub async fn start_routed_proxy() -> std::io::Result<()> {
+    if ROUTED.get().is_some() {
+        return Ok(());
+    }
+    let proxy = SocksProxy::start(None).await?;
+    debug!("netsock: routed SOCKS5 proxy on {}", proxy.addr);
+    let _ = ROUTED.set(proxy);
+    Ok(())
+}
+
 /// A minimal SOCKS5 server (RFC 1928 CONNECT + RFC 1929 user/password) on
 /// loopback, connecting upstream through [`connect_tcp_with`].
 pub struct SocksProxy {
     pub addr: SocketAddr,
     user: String,
     pass: String,
+    /// Sessions accepted so far.
+    pub sessions: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SocksProxy {
@@ -164,8 +197,11 @@ impl SocksProxy {
         let token = || format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
         let (user, pass) = (token(), token());
         let (u, pw) = (user.clone(), pass.clone());
+        let sessions = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = sessions.clone();
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (u, pw, prot) = (u.clone(), pw.clone(), protector.clone());
                 tokio::spawn(async move {
                     if let Err(e) = socks_session(client, &u, &pw, prot.as_ref()).await {
@@ -174,7 +210,7 @@ impl SocksProxy {
                 });
             }
         });
-        Ok(SocksProxy { addr, user, pass })
+        Ok(SocksProxy { addr, user, pass, sessions })
     }
 
     /// `socks5h://user:pass@127.0.0.1:port` (proxy-side DNS).
@@ -288,6 +324,38 @@ mod tests {
         let deny: Protector = Arc::new(|_| false);
         assert!(udp_socket_with(Some(&deny), "127.0.0.1:0".parse().unwrap()).is_err());
         assert!(connect_tcp_with(Some(&deny), &[l.local_addr().unwrap()]).await.is_err());
+    }
+
+    /// Desktop: Coordinator HTTP uses the routed proxy exactly while the
+    /// bypass is on, switching per request.
+    #[tokio::test]
+    async fn http_follows_the_routing_bypass_per_request() {
+        let proxy = SocksProxy::start(None).await.unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = server.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    let _ = s.read(&mut b).await;
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok").await;
+                });
+            }
+        });
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, url) = (on.clone(), proxy.url());
+        let client = http_client_with(None, Arc::new(move || flag.load(std::sync::atomic::Ordering::SeqCst).then(|| url.clone())));
+        let get = || client.get(format!("http://127.0.0.1:{}/", port)).send();
+        let sessions = || proxy.sessions.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(get().await.unwrap().text().await.unwrap(), "ok");
+        assert_eq!(sessions(), 0, "bypass off: direct, as before");
+        on.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get().await.unwrap().text().await.unwrap(), "ok");
+        assert_eq!(sessions(), 1, "bypass on: through the routed proxy");
+        on.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get().await.unwrap().text().await.unwrap(), "ok");
+        assert_eq!(sessions(), 1);
     }
 
     /// HTTP through the proxy: authenticated, upstream connection protected.

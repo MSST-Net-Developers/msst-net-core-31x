@@ -62,8 +62,7 @@ impl FragVerdict {
         match verdict {
             PipelineVerdict::Allow { .. }
             | PipelineVerdict::Related { .. }
-            | PipelineVerdict::IcmpAllowed { .. }
-            | PipelineVerdict::PassThrough { .. } => FragVerdict::Deliver,
+            | PipelineVerdict::IcmpAllowed { .. } => FragVerdict::Deliver,
             // TCP is answered with a RST, so its first fragment isn't queued.
             PipelineVerdict::NeedAuth { src_device_id, .. } if parsed.proto == TransportProtocol::Udp => {
                 FragVerdict::QueueForAuth(AuthKey { src_device_id: src_device_id.clone(), proto: Protocol::Udp, dst_port: parsed.dst_port })
@@ -135,8 +134,15 @@ pub async fn deliver_inbound(state: &Arc<CoreState>, tun_tx: &mpsc::Sender<Vec<u
             }
             let _ = tun_tx.send(pkt).await;
         }
-        PipelineVerdict::Related { .. } | PipelineVerdict::IcmpAllowed { .. } | PipelineVerdict::PassThrough { .. } => {
+        PipelineVerdict::Related { .. } | PipelineVerdict::IcmpAllowed { .. } => {
             let _ = tun_tx.send(pkt).await;
+        }
+        PipelineVerdict::ProtocolBlocked { src_device_id, proto } => {
+            if let Some(src) = &src_device_id {
+                crate::diagnostics::traffic(state, src).drop.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            debug!("inbound: IP protocol {} from {} blocked (no ACL for it; default deny)", proto,
+                src_device_id.as_deref().unwrap_or("unknown source"));
         }
         PipelineVerdict::Deny { src_device_id, decision } => {
             crate::diagnostics::traffic(state, &src_device_id).drop.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -459,60 +465,86 @@ fn csum_fold(mut sum: u32) -> u16 {
     !(sum as u16)
 }
 
-/// Build a TCP RST|ACK answering an inbound TCP segment: addresses and
-/// ports swapped, `ack = seq + 1` (3.0.x `build_tcp_rst`).
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_ACK: u8 = 0x10;
+
+/// Build the TCP reset answering an inbound TCP segment (RFC 793 3.4):
+/// addresses and ports swapped; `seq = SEG.ACK` if the segment has ACK,
+/// else `ack = SEG.SEQ + SEG.LEN` with RST|ACK.  The TCP header is located
+/// through the IPv6 extension header chain (the reply itself has none).
+///
+/// `None` — no reset — unless the complete TCP header (data offset
+/// included) was found: not for later fragments, malformed header chains,
+/// a segment that is itself a RST, or a fragmented segment without ACK
+/// (its length is unknown).
 pub fn build_tcp_rst(pkt: &[u8]) -> Option<Vec<u8>> {
-    let (src, dst, tcp, v6) = match pkt.first()? >> 4 {
-        4 => {
-            let ihl = (pkt[0] & 0x0f) as usize * 4;
-            if pkt.len() < ihl + 20 || pkt[9] != 6 {
-                return None;
-            }
-            (&pkt[12..16], &pkt[16..20], &pkt[ihl..], false)
+    let (parsed, off) = crate::runtime::parse_ip_packet_at(pkt)?;
+    if parsed.proto != TransportProtocol::Tcp || parsed.is_later_fragment() {
+        return None;
+    }
+    let tcp = pkt.get(off..off + 20)?;
+    let header_len = (tcp[12] >> 4) as usize * 4;
+    if header_len < 20 || pkt.len() < off + header_len {
+        return None;
+    }
+    let flags = tcp[13];
+    if flags & TCP_RST != 0 {
+        return None;
+    }
+    let (seq, ack) = if flags & TCP_ACK != 0 {
+        (u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]), None)
+    } else {
+        if parsed.fragment.is_some() {
+            return None;
         }
-        6 => {
-            if pkt.len() < 60 || pkt[6] != 6 {
-                return None;
-            }
-            (&pkt[8..24], &pkt[24..40], &pkt[40..], true)
-        }
-        _ => return None,
+        let seg_len = (pkt.len() - off - header_len) as u32 + (flags & TCP_SYN != 0) as u32 + (flags & TCP_FIN != 0) as u32;
+        (0, Some(u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]).wrapping_add(seg_len)))
     };
-    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let (src, dst) = (ip_octets(&parsed.src_ip), ip_octets(&parsed.dst_ip));
 
     let mut t = [0u8; 20];
     t[0..2].copy_from_slice(&tcp[2..4]); // our port = their dst port
     t[2..4].copy_from_slice(&tcp[0..2]);
-    t[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes());
+    t[4..8].copy_from_slice(&seq.to_be_bytes());
+    t[8..12].copy_from_slice(&ack.unwrap_or(0).to_be_bytes());
     t[12] = 5 << 4; // data offset
-    t[13] = 0x14; // RST | ACK
+    t[13] = TCP_RST | if ack.is_some() { TCP_ACK } else { 0 };
 
     // Pseudo-header: src = their dst, dst = their src.
-    let mut sum = csum_add(0, dst);
-    sum = csum_add(sum, src);
+    let mut sum = csum_add(0, &dst);
+    sum = csum_add(sum, &src);
     sum += 6 + 20;
     let tcp_csum = csum_fold(csum_add(sum, &t));
     t[16..18].copy_from_slice(&tcp_csum.to_be_bytes());
 
     let mut out = Vec::with_capacity(60);
-    if v6 {
+    if parsed.src_ip.is_ipv6() {
         out.extend_from_slice(&[0x60, 0, 0, 0, 0, 20, 6, 64]);
-        out.extend_from_slice(dst);
-        out.extend_from_slice(src);
+        out.extend_from_slice(&dst);
+        out.extend_from_slice(&src);
     } else {
         let mut h = [0u8; 20];
         h[0] = 0x45;
         h[2..4].copy_from_slice(&40u16.to_be_bytes());
         h[8] = 64; // TTL
         h[9] = 6;
-        h[12..16].copy_from_slice(dst);
-        h[16..20].copy_from_slice(src);
+        h[12..16].copy_from_slice(&dst);
+        h[16..20].copy_from_slice(&src);
         let c = csum_fold(csum_add(0, &h));
         h[10..12].copy_from_slice(&c.to_be_bytes());
         out.extend_from_slice(&h);
     }
     out.extend_from_slice(&t);
     Some(out)
+}
+
+fn ip_octets(ip: &std::net::IpAddr) -> Vec<u8> {
+    match ip {
+        std::net::IpAddr::V4(a) => a.octets().to_vec(),
+        std::net::IpAddr::V6(a) => a.octets().to_vec(),
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +596,91 @@ mod tests {
         let tcp = &rst[40..];
         assert_eq!(u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]), 0); // seq wraps
         assert!(verify_tcp(&rst[8..24], &rst[24..40], tcp));
+    }
+
+    /// IPv6 fd22::b → fd22::1, next header `next`, then `rest`.
+    fn v6(next: u8, rest: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0, 0, rest.len() as u8, next, 64];
+        p.extend_from_slice(&"fd22:2222:2222:2222::b".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p.extend_from_slice(&"fd22:2222:2222:2222::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        p.extend_from_slice(rest);
+        p
+    }
+
+    /// TCP header 40000 → 22, seq 1000, ack 5000, `flags`, data offset `doff` words.
+    fn tcp_hdr(flags: u8, doff: u8) -> Vec<u8> {
+        let mut t = vec![0x9c, 0x40, 0, 22, 0, 0, 0x03, 0xe8, 0, 0, 0x13, 0x88, doff << 4, flags, 0xff, 0xff, 0, 0, 0, 0];
+        t.resize(doff.max(5) as usize * 4, 1); // options
+        t
+    }
+
+    fn rst_fields(rst: &[u8]) -> (u32, u32, u8) {
+        let tcp = &rst[rst.len() - 20..];
+        (u32::from_be_bytes(tcp[4..8].try_into().unwrap()), u32::from_be_bytes(tcp[8..12].try_into().unwrap()), tcp[13])
+    }
+
+    #[test]
+    fn rst_through_ipv6_extension_headers() {
+        // Destination Options (8) + Hop-by-Hop is first in real chains; here
+        // HBH → DestOpts → TCP SYN with a 4-byte option.
+        let mut chain = vec![60, 0, 1, 4, 0, 0, 0, 0, 6, 0, 1, 4, 0, 0, 0, 0];
+        chain.extend(tcp_hdr(TCP_SYN, 6));
+        let rst = build_tcp_rst(&v6(0, &chain)).expect("RST");
+        assert_eq!(rst.len(), 60, "plain IPv6 header, no extension headers");
+        assert_eq!(&rst[8..24], &"fd22:2222:2222:2222::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        let tcp = &rst[40..];
+        assert_eq!((u16::from_be_bytes([tcp[0], tcp[1]]), u16::from_be_bytes([tcp[2], tcp[3]])), (22, 40000));
+        assert_eq!(rst_fields(&rst), (0, 1001, TCP_RST | TCP_ACK));
+        assert!(verify_tcp(&rst[8..24], &rst[24..40], tcp));
+        // Atomic fragment.
+        let mut chain = vec![6, 0, 0, 0, 0, 0, 0, 9];
+        chain.extend(tcp_hdr(TCP_SYN, 5));
+        assert!(build_tcp_rst(&v6(44, &chain)).is_some());
+    }
+
+    #[test]
+    fn rst_sequence_numbers_follow_rfc_793() {
+        // ACK set: seq = SEG.ACK, RST only.
+        let mut p = syn_v4();
+        p[33] = TCP_ACK | 0x08; // ACK|PSH
+        p[28..32].copy_from_slice(&5000u32.to_be_bytes());
+        p.extend_from_slice(b"data");
+        assert_eq!(rst_fields(&build_tcp_rst(&p).unwrap()), (5000, 0, TCP_RST));
+        // No ACK: ack = SEG.SEQ + payload + SYN + FIN.
+        let mut p = syn_v4();
+        p[33] = TCP_SYN | TCP_FIN;
+        p.extend_from_slice(b"abc");
+        assert_eq!(rst_fields(&build_tcp_rst(&p).unwrap()), (0, 1000 + 3 + 2, TCP_RST | TCP_ACK));
+    }
+
+    #[test]
+    fn no_rst_without_a_reliable_tcp_header() {
+        // A RST is never answered.
+        let mut chain = vec![6, 0, 1, 4, 0, 0, 0, 0];
+        chain.extend(tcp_hdr(TCP_RST, 5));
+        assert!(build_tcp_rst(&v6(60, &chain)).is_none());
+        // Data offset beyond the packet, or below 5 words.
+        let mut t = tcp_hdr(TCP_SYN, 8);
+        t.truncate(24);
+        assert!(build_tcp_rst(&v6(6, &t)).is_none());
+        assert!(build_tcp_rst(&v6(6, &tcp_hdr(TCP_SYN, 4))).is_none());
+        // Later fragments carry no TCP header.
+        let mut later = vec![6, 0, 0, 0x10, 0, 0, 0, 9]; // offset 2
+        later.extend(tcp_hdr(TCP_SYN, 5));
+        assert!(build_tcp_rst(&v6(44, &later)).is_none());
+        let mut v4_later = syn_v4();
+        v4_later[6..8].copy_from_slice(&3u16.to_be_bytes());
+        assert!(build_tcp_rst(&v4_later).is_none());
+        // A fragmented SYN: its length (hence the ack) is unknown.
+        let mut first = vec![6, 0, 0, 1, 0, 0, 0, 9]; // offset 0, more
+        first.extend(tcp_hdr(TCP_SYN, 5));
+        assert!(build_tcp_rst(&v6(44, &first)).is_none());
+        // ... but a fragmented segment with ACK has a definite reset.
+        let mut first = vec![6, 0, 0, 1, 0, 0, 0, 9];
+        first.extend(tcp_hdr(TCP_ACK, 5));
+        assert_eq!(rst_fields(&build_tcp_rst(&v6(44, &first)).unwrap()), (5000, 0, TCP_RST));
+        // Malformed chain (truncated Destination Options).
+        assert!(build_tcp_rst(&v6(60, &[6, 3, 0, 0, 0, 0, 0, 0])).is_none());
     }
 
     #[test]
@@ -708,23 +825,41 @@ mod tests {
         deliver_inbound(&h.state, &h.tun_tx, syn.clone()).await;
         assert!(auth_request_id(&mut h.ipc_rx).is_some());
 
-        // The RST went to the peer via its relay, encrypted: a handshake
-        // initiation first, the RST waiting in the session queue.
+        let rst = rst_received_by_peer(&h).await;
+        assert_eq!(rst[20 + 13], 0x14);
+
+        // Retrying the SYN must not be admitted via connection tracking.
+        deliver_inbound(&h.state, &h.tun_tx, syn).await;
+        assert!(h.tun_rx.try_recv().is_err());
+    }
+
+    /// The RST Core sent to the peer: via its relay, encrypted — a
+    /// handshake initiation first, the RST waiting in the session queue.
+    /// Plays the peer: answers the handshake and decrypts what follows.
+    async fn rst_received_by_peer(h: &Harness) -> Vec<u8> {
         let mut buf = [0u8; 256];
         let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(1), h.relay.recv_from(&mut buf)).await.unwrap().unwrap();
         let init = msst_core_state::net::msst_packet::MsstPacket::decode(&buf[..n]).unwrap();
         assert_eq!(init.packet_type, msst_core_state::net::msst_packet::TYPE_WG);
-        // Play the peer: answer the handshake and decrypt what follows.
         let mut bob = msst_core_state::encryption::EncryptionEngine::new();
         bob.set_local_keypair(BOB_SECRET);
         bob.add_peer("device-00000001", &h.state.encryption.lock().await.local_public_key_b64().unwrap()).unwrap();
         let resp = bob.inbound("device-00000001", &init.payload, 0).reply.remove(0);
         let flushed = h.state.encryption.lock().await.inbound("device-0000000b", &resp, 0).reply;
-        let rst = flushed.iter().find_map(|m| bob.inbound("device-00000001", m, 0).packet).expect("RST");
-        assert_eq!(rst[20 + 13], 0x14);
+        flushed.iter().find_map(|m| bob.inbound("device-00000001", m, 0).packet).expect("RST")
+    }
 
-        // Retrying the SYN must not be admitted via connection tracking.
-        deliver_inbound(&h.state, &h.tun_tx, syn).await;
+    #[tokio::test]
+    async fn ipv6_syn_behind_extension_headers_gets_rst_on_auth() {
+        let mut h = harness("tcp6-ext", true).await;
+        let mut chain = vec![6, 0, 1, 4, 0, 0, 0, 0];
+        chain.extend_from_slice(&syn_to(22)[20..]);
+        deliver_inbound(&h.state, &h.tun_tx, ipv6_from_peer(60, &chain)).await;
+        assert_eq!(created_ports(&mut h.ipc_rx), [22]);
+        let rst = rst_received_by_peer(&h).await;
+        assert_eq!(rst[0] >> 4, 6);
+        assert_eq!(&rst[24..40], &"fd22:2222:2222:2222::b".parse::<std::net::Ipv6Addr>().unwrap().octets(), "to the peer");
+        assert_eq!(rst_fields(&rst), (0, 1001, TCP_RST | TCP_ACK));
         assert!(h.tun_rx.try_recv().is_err());
     }
 
@@ -915,6 +1050,36 @@ mod tests {
         resolve_auth(&h.state, &req, AuthDecision::AllowOnce).await.unwrap();
         assert_eq!(h.tun_rx.try_recv().unwrap(), first);
         assert_eq!(h.tun_rx.try_recv().unwrap(), last);
+    }
+
+    #[tokio::test]
+    async fn other_ip_protocols_are_not_delivered() {
+        let mut h = harness("other-proto", true).await;
+        // Even a rule allowing all TCP and UDP from the peer doesn't admit them.
+        h.state.net.write().await.acl_rules.push(FirewallRule {
+            id: "all".into(),
+            permission_group: PermissionGroup::Devices { ids: vec!["device-0000000b".into()] },
+            protocol_ports: vec![ProtocolPort::wildcard(Protocol::Tcp), ProtocolPort::wildcard(Protocol::Udp)],
+            action: Action::Allow, direction: Direction::Inbound, expires_at: None, enabled: true, comment: None,
+        });
+        let ip4 = |proto: u8, fo: u16| {
+            let mut p = vec![0x45, 0, 0, 32, 0, 3, (fo >> 8) as u8, fo as u8, 64, proto, 0, 0, 172, 22, 1, 1, 172, 22, 0, 1];
+            p.extend_from_slice(&[0; 12]);
+            p
+        };
+        for pkt in [ip4(47, 0), ip4(50, 0), ip4(132, 0), ip4(47, 0x2000), ip4(47, 2), ipv6_from_peer(59, &[]), ipv6_from_peer(47, &[0; 8])] {
+            deliver_inbound(&h.state, &h.tun_tx, pkt.clone()).await;
+            assert!(h.tun_rx.try_recv().is_err(), "{:?}", pkt);
+        }
+        assert_eq!(created_ports(&mut h.ipc_rx), Vec::<u16>::new(), "no prompts");
+        assert!(crate::diagnostics::traffic(&h.state, "device-0000000b").drop.load(std::sync::atomic::Ordering::Relaxed) >= 6);
+        // ICMP and allowed UDP still get through.
+        let mut ping = vec![0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0, 0, 172, 22, 1, 1, 172, 22, 0, 1];
+        ping.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // echo reply
+        deliver_inbound(&h.state, &h.tun_tx, ping).await;
+        assert!(h.tun_rx.try_recv().is_ok());
+        deliver_inbound(&h.state, &h.tun_tx, udp_v4(b"x")).await;
+        assert!(h.tun_rx.try_recv().is_ok());
     }
 
     #[tokio::test]

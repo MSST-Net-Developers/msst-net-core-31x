@@ -1195,6 +1195,12 @@ async fn execute_scheduler_action(
 /// a TCP fragment at offset 1 (RFC 1858), more than one IPv6 Fragment
 /// header, or an over-long IPv6 extension header chain.
 pub(crate) fn parse_ip_packet(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
+    parse_ip_packet_at(data).map(|(p, _)| p)
+}
+
+/// [`parse_ip_packet`], plus the offset of the upper-layer header (after
+/// the IPv4 header / the IPv6 extension header chain).
+pub(crate) fn parse_ip_packet_at(data: &[u8]) -> Option<(packet::parsed::ParsedPacket, usize)> {
     if data.is_empty() { return None; }
     let version = data[0] >> 4;
     match version {
@@ -1204,7 +1210,7 @@ pub(crate) fn parse_ip_packet(data: &[u8]) -> Option<packet::parsed::ParsedPacke
     }
 }
 
-fn parse_ipv4(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
+fn parse_ipv4(data: &[u8]) -> Option<(packet::parsed::ParsedPacket, usize)> {
     if data.len() < 20 { return None; }
     let ihl = (data[0] & 0x0F) as usize * 4;
     if ihl < 20 || data.len() < ihl { return None; }
@@ -1218,17 +1224,17 @@ fn parse_ipv4(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
         more,
     });
     let (proto, src_port, dst_port, is_echo) = parse_transport(data[9], &data[ihl..], fragment, 1, 8)?;
-    Some(packet::parsed::ParsedPacket {
+    Some((packet::parsed::ParsedPacket {
         src_ip: std::net::IpAddr::V4(src_ip), dst_ip: std::net::IpAddr::V4(dst_ip),
         proto, src_port, dst_port, is_icmp_echo_request: is_echo, fragment,
-    })
+    }, ihl))
 }
 
 /// Extension headers walked before giving up (RFC 8200 recommends a
 /// bounded chain; real traffic uses one or two).
 const MAX_IPV6_EXT_HEADERS: usize = 8;
 
-fn parse_ipv6(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
+fn parse_ipv6(data: &[u8]) -> Option<(packet::parsed::ParsedPacket, usize)> {
     if data.len() < 40 { return None; }
     let src_ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&data[8..24]).ok()?);
     let dst_ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&data[24..40]).ok()?);
@@ -1273,10 +1279,10 @@ fn parse_ipv6(data: &[u8]) -> Option<packet::parsed::ParsedPacket> {
         if later_fragment { break; }
     }
     let (proto, src_port, dst_port, is_echo) = parse_transport(next, data.get(off..)?, fragment, 58, 128)?;
-    Some(packet::parsed::ParsedPacket {
+    Some((packet::parsed::ParsedPacket {
         src_ip: std::net::IpAddr::V6(src_ip), dst_ip: std::net::IpAddr::V6(dst_ip),
         proto, src_port, dst_port, is_icmp_echo_request: is_echo, fragment,
-    })
+    }, off))
 }
 
 /// Transport fields from the upper-layer header `l4` (protocol `proto`).

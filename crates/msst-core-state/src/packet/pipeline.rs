@@ -56,9 +56,13 @@ pub enum PipelineVerdict {
     },
     /// ICMP echo request — blocked by ping policy.
     IcmpBlocked,
-    /// Non-TCP/UDP/ICMP packet — pass through (no ACL applies).
-    PassThrough {
+    /// Neither TCP, UDP nor ICMP (e.g. GRE, ESP, SCTP): dropped.  ACL
+    /// rules match protocol + port, so no rule can admit these; default
+    /// deny applies (until the ACL can express port-less protocols).
+    ProtocolBlocked {
         src_device_id: Option<String>,
+        /// IP protocol number.
+        proto: u8,
     },
     /// Dropped by the guest restriction: an unauthenticated party (us or
     /// the sender) may only exchange new traffic with peers it currently
@@ -84,8 +88,8 @@ pub fn guest_access_blocked(local_authenticated: bool, src_authenticated: bool, 
 ///
 /// Applies to everything that was ACL-evaluated (Allow / Deny / NeedAuth)
 /// and to ICMP echo requests from known peers.  Related (established)
-/// traffic, unknown sources and non-TCP/UDP pass-through are unaffected,
-/// exactly as in 3.0.x.
+/// traffic and unknown sources are unaffected, exactly as in 3.0.x
+/// (other protocols are blocked anyway).
 pub fn apply_guest_policy(
     verdict: PipelineVerdict,
     packet: &ParsedPacket,
@@ -166,14 +170,15 @@ pub fn process_inbound(
         return PipelineVerdict::IcmpAllowed { src_device_id };
     }
 
-    // ── 2. Non-TCP/UDP → pass through ─────────────────────────────────────
+    // ── 2. Non-TCP/UDP → blocked (default deny) ───────────────────────────
+    // 3.0.x passed these through unchecked, bypassing the ACL.
     let acl_proto = match packet.proto {
         TransportProtocol::Tcp => Protocol::Tcp,
         TransportProtocol::Udp => Protocol::Udp,
         _ => {
             let src_device_id = peer_list.lookup_device_id_by_ip(&packet.src_ip)
                 .map(|s| s.to_string());
-            return PipelineVerdict::PassThrough { src_device_id };
+            return PipelineVerdict::ProtocolBlocked { src_device_id, proto: packet.proto.number() };
         }
     };
 
@@ -570,23 +575,28 @@ mod tests {
         assert!(matches!(v, PipelineVerdict::Allow { .. }));
     }
 
-    // ── Non-TCP/UDP pass through ──────────────────────────────────────────
+    // ── Non-TCP/UDP: default deny ─────────────────────────────────────────
 
     #[test]
-    fn non_tcp_udp_pass_through() {
+    fn non_tcp_udp_is_blocked_even_with_allow_all_rules() {
         let pl = make_peer_list();
         let ct = ConnectionTracker::new();
-        let pkt = ParsedPacket {
-            src_ip: v4(172, 22, 1, 1),
-            dst_ip: v4(172, 22, 1, 100),
-            proto: TransportProtocol::Other(47), // GRE
-            src_port: 0,
-            dst_port: 0,
-            is_icmp_echo_request: false,
-            fragment: None,
-        };
-        let v = process_inbound(&pkt, &pl, &[], &ct, LOCAL_USER, &empty_room(), &ping(false), NOW);
-        assert!(matches!(v, PipelineVerdict::PassThrough { .. }));
+        let mut rules = allow_all_tcp();
+        rules[0].protocol_ports.push(acl::ProtocolPort::wildcard(Protocol::Udp));
+        let room: HashSet<String> = [DEVICE_A.to_string()].into();
+        // GRE, ESP, AH (IPv4), SCTP, IPv6-in-IPv4, No Next Header.
+        for proto in [47u8, 50, 51, 132, 41, 59] {
+            let pkt = ParsedPacket { proto: TransportProtocol::Other(proto), ..tcp_packet(v4(172, 22, 1, 1), v4(172, 22, 1, 100), 0, 0) };
+            let v = process_inbound(&pkt, &pl, &rules, &ct, LOCAL_USER, &room, &ping(true), NOW);
+            assert!(matches!(&v, PipelineVerdict::ProtocolBlocked { src_device_id: Some(d), proto: p } if d == DEVICE_A && *p == proto), "{:?}", v);
+        }
+        // Unknown sources too.
+        let pkt = ParsedPacket { proto: TransportProtocol::Other(47), ..tcp_packet(v4(172, 22, 9, 9), v4(172, 22, 1, 100), 0, 0) };
+        let v = process_inbound(&pkt, &pl, &rules, &ct, LOCAL_USER, &room, &ping(true), NOW);
+        assert!(matches!(v, PipelineVerdict::ProtocolBlocked { src_device_id: None, proto: 47 }));
+        // ICMP keeps its own handling.
+        let v = process_inbound(&icmp_echo(v4(172, 22, 1, 1), v4(172, 22, 1, 100)), &pl, &[], &ct, LOCAL_USER, &room, &ping(true), NOW);
+        assert!(matches!(v, PipelineVerdict::IcmpAllowed { .. }));
     }
 
     // ── End-to-end: priority chain through pipeline ───────────────────────
