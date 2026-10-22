@@ -9,6 +9,8 @@
 > - 中转：继续为旧客户端提供 sdisc，待旧客户端退出后再退役；对内层包补充与客户端相同的校验（只放行 UDP，目的地址限 MSST-Net 广播、受限广播和两个发现组播组）。
 > - Coordinator：创建房间时不再要求房间中转的 `features` 含 `sdisc1`（ROOM_RELAY_SERVER_3.1.md 中的 D7 校验改为只要求 `sreg1`）。3.1.6 客户端已不检查 `sdisc1`。
 > - 客户端在端点列表中上报 `feature:wgdisc1`（不是地址），请保持 `/device/endpoint` 对端点内容不做格式校验、原样下发。
+> - 3.1.6 客户端不再发送 `discovery_join` / `discovery_leave`。
+> - 3.1.6 客户端只使用官方中转列表（`GET /relays`）里的对端中转，房间中转必须是公网单播地址；建议 Coordinator 在登记自建中转时也拒绝非公网地址，并限制每台设备上报的端点数量（客户端每个对端最多使用 16 个直连候选）。
 
 ## 一览
 

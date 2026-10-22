@@ -129,9 +129,39 @@ tun-out msst-not-bcast to 172.22.1.255
 
 在这些平台上，S1、S2 和发送端过滤（不发送他人的包）不依赖操作系统行为，同样生效；尚未确认的只有“放行的广播在本机是否会被转发或回发”。即使回发，发送端过滤也会阻止它回到房间。
 
+## 3a. 恶意中转与恶意对端：第二轮核查
+
+威胁模型：
+- **恶意中转**：官方中转被攻破，或建房人运营的房间中转。它知道本机的地址，能向 UDP 21031 发送任意数据包，也能丢弃、延迟、重放经过它的数据。
+- **恶意对端**：房间成员，或同一 Coordinator 下认识本机的设备。它能发送任意 WireGuard 内层数据，能通过 Coordinator 公布任意端点。
+
+Coordinator 仍是信任根（下发公钥、中转列表、房间状态），但它下发的、本来就由对端自己决定的内容（端点、`relay:`）以及对端地址不再被当作可信输入直接使用。
+
+| 编号 | 问题 | 修复 | 测试 |
+|---|---|---|---|
+| T1 | 对端的虚拟地址来自 Coordinator，只检查能否解析成 IP。地址不在 MSST-Net 网段时，对端发来的包会被当作来自那个地址（可冒充 `8.8.8.8` 之类访问本机服务）；和其他设备或本机重复时，可接管别人的流量。 | `nodes::peer_addresses_ok`：IPv4、IPv6 必须在 MSST-Net 网段，不能是本机地址，也不能是其他已知设备的地址，否则忽略该对端。 | `nodes::tests::peers_get_only_their_own_msst_net_addresses` |
+| T2 | 对端公布的直连候选（以及 Coordinator 的打洞请求）可以是环回、未指定、组播、广播、链路本地地址，数量也不限：本机会照着去探测和打洞，包括本机自己的服务。 | `ip::is_valid_candidate` 过滤这些地址，去重，每个对端最多 16 个候选；打洞请求套用同一规则。 | `ip::tests::candidate_addresses`、`endpoints::tests::candidates_never_point_at_this_host_or_beyond_a_link`、`candidates_are_capped` |
+| T3 | 对端发来的 ICMP 不经 ACL：除回显请求外全部放行，包括重定向，以及引用本机其他连接的差错报文（例如对本机到某个网站的 TCP 连接伪造“需要分片”或“不可达”）。 | `packet::icmp`：只放行回显应答、回显请求（仍受 ping 开关控制），以及引用“本机发给该对端的包”的差错报文；ICMPv6 同理，邻居发现、MLD 等一律丢弃。 | `packet::icmp::tests`、`inbound::tests::icmp_from_a_peer_is_limited_to_what_it_may_send` |
+| T4 | 对端公布的 `relay:` 会被本机每 5 秒 ping 一次、做 DNS 解析，并作为发往该对端数据的目标：恶意对端可以让所有认识它的设备持续向任意主机发包，也能让开了“禁用 P2P”的用户把公网 IP 暴露给它指定的服务器。 | 只认 Coordinator 官方列表里的中转（`NetState::official_relays`，每次选择中转时更新，拉取失败则沿用上一次的列表）；其余忽略，改用本机自己的中转，也不再 ping。房间中转另行校验（T5）。首选中转从设计上就只支持官方中转（主要用于大内网模式），3.1.5 及以前对列表之外的首选中转“不带密钥照用”的行为与设计不符，一并改为：选择中转时忽略并自动选择，`SetNetSettings` 在列表已知时直接拒绝（`invalid_settings`）；按地址匹配到的官方中转改用其列表名称，保证其他设备能认出它。 | `runtime::tests::a_peer_can_only_name_an_official_relay`、`relay::tests::only_an_official_relay_can_be_preferred`、`ipc::handler::tests::only_an_official_relay_can_be_preferred` |
+| T5 | 房间中转地址由建房人指定，没有任何校验：可以让所有成员向他们自己局域网或本机的任意地址注册、ping、发数据。 | `room_relay::acceptable_addr`：房间中转必须是公网单播地址（拒绝环回、私有、CGNAT、链路本地、唯一本地、组播、文档、保留地址以及 MSST-Net 网段），数字地址在解析 `room_state` 时检查，域名在每次解析后检查。 | `ip::tests::public_unicast_addresses`、`room_relay` 的 `from_room_state` 测试 |
+| T6 | 任何人（包括恶意中转）向 21031 发一个 P2P ping，本机都会回 pong，pong 里带着本机设备 ID，可用于识别本机；伪造的 ping 也会被反射。 | 只应答发给本机设备 ID、且来自已知对端的 ping。 | `runtime::tests::p2p_pings_are_answered_only_from_known_peers_to_us` |
+| T7 | 每个带陌生 `src_id` 的 WireGuard 帧都会触发一次向 Coordinator 的查询，没有频率上限；查不到的设备会进入负缓存，过期条目从不清理。伪造帧可以让本机持续查询 Coordinator（并被限流），负缓存还会无限增长。 | 这类“未经请求”的查询每秒最多 5 次；负缓存超过 1024 条时清理过期条目。 | `nodes::tests::unsolicited_fetches_are_rate_limited`、`negative_results_of_forged_ids_dont_pile_up` |
+| T8 | sdisc 退役后，加入房间和重连时仍向 Coordinator 发送 `discovery_join` / `discovery_leave`。 | 不再发送。 | `rooms`、`coordinator` 的重连测试（只剩 `register`、`join`） |
+
+综合测试 `runtime::tests::a_malicious_relay_can_neither_inject_nor_impersonate`：模拟中转向本机发送伪造的 sdisc 投递、冒充已知对端的 WireGuard 握手和数据、来自未知设备或发给别人的 P2P ping、500 个虚构设备的握手；结果是没有任何东西进入 TUN，加密会话状态不变，没有 pong 泄露设备 ID，握手暂存表不超过上限，只有已知对端的 ping 得到应答。
+
+核查后确认没有问题的部分：
+- 伪造的 WireGuard 消息（握手、数据）在认证失败时不改变任何会话状态；握手洪泛由 boringtun 的 cookie 机制限速。
+- STUN 响应按随机事务 ID 匹配，中转 RTT 应答按来源地址匹配，伪造的只能影响发包方自己。
+- 中转路径探测、游戏发现消息都在 WireGuard 会话内，只能由该对端自己产生；游戏发现另有成员资格检查和限速。
+- DNS 只在 `*.msst.net` 域内应答，对端主机名不能劫持外部域名。
+- TLS：没有关闭证书校验的配置。
+
+仍然依赖 Coordinator 的部分：对端公钥、官方中转列表及其公钥、房间状态和成员关系。Coordinator 被攻破时这些都会受影响；服务端的 C3、R3 上线后，设备 ID 抢注和中转注册冒充这两条路径会被堵上。
+
 ## 4. 测试结果（3.1.6，提交前）
 
-- `cargo test --workspace`：全部通过（msst-net-core 248（删除了 sdisc 的测试）、msst-core-state 232、msst-acl-engine 47、msst-ipc-protocol 22、IPC 契约向量 2、文档测试 1）。
+- `cargo test --workspace`：全部通过（msst-net-core 260、msst-core-state 236、msst-acl-engine 47、msst-ipc-protocol 22、IPC 契约向量 2、文档测试 1）。
 - `cargo clippy --workspace --all-targets`：与 3.1.5 相比没有新增告警。
 - 新增测试：
   - S1：`runtime::tests::peers_talk_wireguard_through_a_relay` 中发往 `192.168.1.10` 的包不进入 TUN（去掉检查后该断言失败，已验证）。
