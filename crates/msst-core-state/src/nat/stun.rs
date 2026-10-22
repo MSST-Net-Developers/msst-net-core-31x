@@ -119,11 +119,13 @@ pub fn parse_response(data: &[u8]) -> Option<SocketAddr> {
 /// Detect LAN IPv4 addresses from local network interfaces.
 ///
 /// Returns addresses that are in private ranges (10.x, 172.16-31.x, 192.168.x).
-/// These enable direct P2P between peers on the same LAN.
+/// These enable direct P2P between peers on the same LAN.  Interfaces of
+/// other overlay networks, containers and VMs are skipped (see
+/// [`is_virtual_interface`]).
 pub fn detect_lan_ipv4() -> Vec<Ipv4Addr> {
     let mut lan_ips = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
-        for iface in ifaces {
+        for iface in ifaces.into_iter().filter(|i| !is_virtual_interface(&i.name)) {
             if let IpAddr::V4(ip) = iface.addr.ip() {
                 if is_private_ipv4(ip) && !ip.is_loopback() {
                     lan_ips.push(ip);
@@ -138,7 +140,7 @@ pub fn detect_lan_ipv4() -> Vec<Ipv4Addr> {
 pub fn detect_public_ipv6() -> Vec<std::net::Ipv6Addr> {
     let mut public_v6 = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
-        for iface in ifaces {
+        for iface in ifaces.into_iter().filter(|i| !is_virtual_interface(&i.name)) {
             if let IpAddr::V6(ip) = iface.addr.ip() {
                 if ip.is_global_unicast() && !ip.is_loopback() {
                     public_v6.push(ip);
@@ -147,6 +149,29 @@ pub fn detect_public_ipv6() -> Vec<std::net::Ipv6Addr> {
         }
     }
     public_v6
+}
+
+/// Interface name prefixes of other overlay networks / VPNs, containers
+/// and VMs (Linux, macOS).  An address on such an interface is no LAN
+/// endpoint: a direct path over it would run MSST inside another tunnel,
+/// or point at a host-only network peers can't reach.  `br-` is Docker's
+/// user networks — a plain `br0` LAN bridge stays; `ppp*` (PPPoE) is often
+/// the WAN link itself and stays too.
+const VIRTUAL_IFACE_PREFIXES: [&str; 21] = [
+    "zt", "tailscale", "wg", "tun", "tap", "utun", "ipsec", "msst",
+    "docker", "br-", "veth", "cni", "flannel", "cali", "kube", "podman",
+    "lxcbr", "lxdbr", "virbr", "vmnet", "vboxnet",
+];
+/// Substrings of Windows adapter names (friendly names) of the same kinds.
+const VIRTUAL_IFACE_WINDOWS: [&str; 7] =
+    ["zerotier", "tailscale", "wireguard", "vethernet", "vmware", "virtualbox", "openvpn"];
+
+/// Whether `name` is an interface of another overlay network / VPN, a
+/// container or a VM (case-insensitive).  A false positive only costs a
+/// LAN shortcut: peers still connect via the public endpoint or a relay.
+pub fn is_virtual_interface(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    VIRTUAL_IFACE_PREFIXES.iter().any(|p| n.starts_with(p)) || VIRTUAL_IFACE_WINDOWS.iter().any(|w| n.contains(w))
 }
 
 /// Returns `true` if the IPv4 address is in a private (LAN) range,
@@ -179,6 +204,18 @@ impl Ipv6Ext for std::net::Ipv6Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_interfaces_are_not_lan() {
+        for v in ["zt6q3kr6s3", "ztdhglkmrq", "tailscale0", "wg0", "tun0", "utun4", "docker0", "br-1a2b3c4d5e6f",
+                  "veth12ab", "virbr0", "vmnet8", "vboxnet0", "cni0", "msst0",
+                  "ZeroTier One [8056c2e21c000001]", "Tailscale", "vEthernet (WSL)", "VMware Network Adapter VMnet8"] {
+            assert!(is_virtual_interface(v), "{}", v);
+        }
+        for lan in ["eth0", "ppp0", "enp3s0", "wlp2s0", "br0", "bond0", "en0", "wlan0", "以太网", "Ethernet", "Wi-Fi", "WLAN"] {
+            assert!(!is_virtual_interface(lan), "{}", lan);
+        }
+    }
 
     #[test]
     fn build_and_parse_binding_request() {
