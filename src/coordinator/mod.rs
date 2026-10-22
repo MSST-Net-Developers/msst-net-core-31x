@@ -61,6 +61,26 @@ const ROOM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN_SECS: u64 = 1;
 const BACKOFF_MAX_SECS: u64 = 30;
+/// A refresh request (the Coordinator gives MSST-IAS 15 s): a hung one must
+/// not hold `refresh_lock`, which every 401 retry waits for.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Whether a failed `POST /auth/token/refresh` ended the login.
+///
+/// Only a refused refresh token does: `invalid_grant` (RFC 6749 §5.2), or
+/// a 4xx without an OAuth error (e.g. no refresh token).  Coordinators
+/// before the fix answer 401 for *every* MSST-IAS error, so a 4xx naming
+/// another error (`server_error`, `temporarily_unavailable`,
+/// `invalid_client`, …) is a provider failure, as are 429 (rate limited)
+/// and 5xx: the credentials stay, the refresh is retried.
+pub fn classify_refresh_failure(status: u16, oauth_error: Option<&str>) -> Refresh {
+    match (status, oauth_error) {
+        (429, _) | (500.., _) => Refresh::Unavailable,
+        (400..=499, None | Some("invalid_grant") | Some("missing refresh_token")) => Refresh::Rejected,
+        (400..=499, Some(_)) => Refresh::Unavailable,
+        _ => Refresh::Unavailable,
+    }
+}
 
 /// When the OIDC access token is refreshed ahead of its expiry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,6 +695,7 @@ impl CoordinatorClient {
             .http
             .post(&url)
             .json(&json!({ "refresh_token": refresh_token }))
+            .timeout(REFRESH_TIMEOUT)
             .send()
             .await
         {
@@ -685,8 +706,17 @@ impl CoordinatorClient {
             }
         };
         if !resp.status().is_success() {
-            warn!("token refresh failed (HTTP {})", resp.status());
-            return if resp.status().is_client_error() { Refresh::Rejected } else { Refresh::Unavailable };
+            let status = resp.status().as_u16();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            let error = body["error"].as_str().filter(|e| !e.is_empty());
+            let outcome = classify_refresh_failure(status, error);
+            warn!(
+                "token refresh failed (HTTP {}{}) — {}",
+                status,
+                error.map(|e| format!(": {}", e)).unwrap_or_default(),
+                if outcome == Refresh::Rejected { "the login has ended" } else { "will retry" }
+            );
+            return outcome;
         }
         let body: Value = match resp.json().await {
             Ok(v) => v,
@@ -1826,6 +1856,8 @@ mod token_refresh_tests {
         issued: u32,
         refreshes: u32,
         refuse_refresh: bool,
+        /// The Coordinator's answer while MSST-IAS is failing.
+        refresh_failure: Option<(u16, Value)>,
         life: i64,
     }
 
@@ -1835,6 +1867,9 @@ mod token_refresh_tests {
         }
         fn refresh(&mut self, body: &Value) -> (u16, Value) {
             self.refreshes += 1;
+            if let Some(failure) = &self.refresh_failure {
+                return failure.clone();
+            }
             if self.refuse_refresh || body["refresh_token"].as_str() != self.refresh.as_deref() {
                 return (401, json!({ "error": "invalid_grant" }));
             }
@@ -1855,6 +1890,7 @@ mod token_refresh_tests {
             issued: 0,
             refreshes: 0,
             refuse_refresh: false,
+            refresh_failure: None,
             life,
         }));
         let (ph, pw) = (p.clone(), p.clone());
@@ -1995,6 +2031,57 @@ mod token_refresh_tests {
         assert_eq!(p.lock().unwrap().refreshes, 1);
         assert!(!c.oidc_rejected());
         tasks.iter().for_each(|t| t.abort());
+    }
+
+    #[test]
+    fn only_a_refused_refresh_token_ends_the_login() {
+        use Refresh::*;
+        for (status, error, want) in [
+            (401, Some("invalid_grant"), Rejected),
+            (400, Some("missing refresh_token"), Rejected),
+            (401, None, Rejected),
+            (404, None, Rejected),
+            // Older Coordinators relay every MSST-IAS error as 401.
+            (401, Some("server_error"), Unavailable),
+            (401, Some("temporarily_unavailable"), Unavailable),
+            (401, Some("invalid_client"), Unavailable),
+            (429, Some("请求过于频繁，请稍后再试"), Unavailable),
+            (502, Some("invalid_grant"), Unavailable),
+            (502, None, Unavailable),
+            (500, None, Unavailable),
+            (503, Some("OIDC not configured"), Unavailable),
+        ] {
+            assert_eq!(classify_refresh_failure(status, error), want, "{} {:?}", status, error);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_provider_keeps_the_login() {
+        // An old Coordinator relays MSST-IAS's server_error as 401, a fixed
+        // one answers 502: neither may end the login.
+        for failure in [(401, json!({ "error": "server_error" })), (502, json!({ "error": "temporarily_unavailable" }))] {
+            let (p, coord) = platform(3600).await;
+            let (core, _ipc) = core_state("token-refresh-idp-down").await;
+            login(&core, &p).await;
+            let (c, tasks) = client(&core, &coord.url, false).await;
+            wait_until("connected", || c.credential_kind() == "oidc").await;
+
+            p.lock().unwrap().current.as_mut().unwrap().1 = 0; // expired
+            p.lock().unwrap().refresh_failure = Some(failure.clone());
+            assert!(post_endpoint(&c).await.is_err(), "can't succeed while MSST-IAS is down");
+            assert_eq!(p.lock().unwrap().refreshes, 1, "the 401 did try a refresh");
+            assert!(!c.oidc_rejected(), "{:?}: not treated as a refused login", failure);
+            assert!(!core.access_auth_required.load(Ordering::SeqCst));
+            let auth = core.identity.read().await.as_ref().unwrap().auth.clone().expect("credentials kept");
+            assert_eq!(auth.refresh_token, "rt-0");
+            assert_eq!(c.credential_kind(), "oidc");
+
+            // MSST-IAS is back: the next call refreshes and goes through.
+            p.lock().unwrap().refresh_failure = None;
+            post_endpoint(&c).await.expect("works again");
+            assert_eq!(c.bearer().as_deref(), Some("at-1"));
+            tasks.iter().for_each(|t| t.abort());
+        }
     }
 
     #[tokio::test]

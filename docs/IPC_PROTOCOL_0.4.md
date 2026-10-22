@@ -170,7 +170,11 @@ Add `"async": true` to a command request:
     API call (endpoint reports, node lookups, rooms, DNS, ACL name
     resolution) failed with `access_auth_invalid` while the WebSocket stayed
     up.  A refused refresh ends the login when the token expires (guest
-    mode and `AccessAuthRequired`, as above).
+    mode and `AccessAuthRequired`, as above).  Only MSST-IAS refusing the
+    refresh token (`invalid_grant`) counts as refused; when MSST-IAS fails
+    or can't be reached (Coordinator 502, or older Coordinators' 401 with
+    `server_error` etc.), rate limiting and 5xx, Core keeps the login and
+    retries.
 - **Interactive authorization:**
   - an unanswered request times out 60 s after it was raised
     (`AccessRequestTimeout` within about a second; it used to take up to
