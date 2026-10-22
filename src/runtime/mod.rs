@@ -199,24 +199,15 @@ async fn inbound_loop(
                         // the only way peer data is accepted.
                         let src_id = msst_packet::decode_id(pkt.src_id);
                         if !state.encryption.lock().await.has_peer(&src_id) {
-                            // No key for it yet: learn it for the retransmission.
+                            // No key for it yet: learn it, and answer its
+                            // handshake as soon as the key is here.
                             if !src_id.is_empty() && !state.net.read().await.peer_list.contains(&src_id) {
+                                hold_handshake(&state, &src_id, &pkt.payload, src, now);
                                 crate::nodes::demand(&state, crate::nodes::FetchDemand::ByDevice(src_id));
                             }
                             continue;
                         }
-                        let (res, changes) = {
-                            let mut enc = state.encryption.lock().await;
-                            (enc.inbound(&src_id, &pkt.payload, now), enc.take_changes())
-                        };
-                        state.emit_encryption_changes(changes);
-                        // Replies take the same route as data to the peer
-                        // (its direct endpoint or its relay), else go back
-                        // the way the message came.
-                        if !res.reply.is_empty() {
-                            let target = peer_target(&state, &src_id).await.unwrap_or(src);
-                            send_wg(&state, &src_id, target, &res.reply).await;
-                        }
+                        let res = wg_inbound(&state, &src_id, &pkt.payload, src, now).await;
                         if let Some(ip) = res.packet {
                             if !crate::inbound::from_peer_address(&state, &src_id, &ip).await {
                                 debug!("inbound: dropped WireGuard packet from {} with a foreign source address", src_id);
@@ -704,7 +695,7 @@ async fn route_packet(pkt: &[u8], state: &Arc<CoreState>, track: bool) -> Option
 
 /// Where frames to a peer go now: its direct endpoint, else its relay,
 /// else ours.
-async fn peer_target(state: &Arc<CoreState>, device_id: &str) -> Option<std::net::SocketAddr> {
+async fn peer_target(state: &CoreState, device_id: &str) -> Option<std::net::SocketAddr> {
     match state.scheduler.lock().await.direct_endpoint(device_id) {
         Some(ep) => Some(ep),
         None => relay_target(state, device_id).await,
@@ -713,7 +704,7 @@ async fn peer_target(state: &Arc<CoreState>, device_id: &str) -> Option<std::net
 
 /// The relay route to a peer: the room relay or its preferred relay
 /// (`NetState::relay_for_peer`), else ours.
-async fn relay_target(state: &Arc<CoreState>, device_id: &str) -> Option<std::net::SocketAddr> {
+async fn relay_target(state: &CoreState, device_id: &str) -> Option<std::net::SocketAddr> {
     let (peer_relay, own_relay) = {
         let net = state.net.read().await;
         (net.relay_for_peer(device_id).map(str::to_string), net.relay_addr.clone())
@@ -737,6 +728,65 @@ async fn send_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: &crat
     let out = state.encryption.lock().await.outbound(device_id, &probe.encode(), current_unix());
     if let Outbound::Send(msg) = out {
         send_wg(state, device_id, target, std::slice::from_ref(&msg)).await;
+    }
+}
+
+/// Process one WireGuard message from a peer and send its replies.
+/// Replies take the same route as data to the peer (its direct endpoint or
+/// its relay), else go back the way the message came (`src`).
+async fn wg_inbound(state: &CoreState, device_id: &str, msg: &[u8], src: std::net::SocketAddr, now: i64) -> msst_core_state::encryption::Inbound {
+    let (res, changes) = {
+        let mut enc = state.encryption.lock().await;
+        (enc.inbound(device_id, msg, now), enc.take_changes())
+    };
+    state.emit_encryption_changes(changes);
+    if !res.reply.is_empty() {
+        let target = peer_target(state, device_id).await.unwrap_or(src);
+        send_wg(state, device_id, target, &res.reply).await;
+    }
+    if res.packet.is_some() || !res.reply.is_empty() {
+        // An authenticated message: the peer is in use, keep it cached.
+        // (Its replies to our flows pass as related traffic, which never
+        // counted as communication, so a peer we only talk to was evicted
+        // two hours after it was fetched, keys included — and its next
+        // handshake was dropped until the key was fetched again.)
+        crate::peer_cache::on_communication(state, device_id).await;
+    }
+    res
+}
+
+/// Handshake initiations from peers without a key yet: device → (message,
+/// source, received at).
+pub type PendingHandshakes = std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, std::net::SocketAddr, i64)>>;
+/// Peers whose handshake can be held at once.
+const PENDING_HANDSHAKES_MAX: usize = 64;
+/// A held initiation is answered only this soon; later the peer has
+/// retransmitted it anyway (WireGuard `REKEY_TIMEOUT`).
+const PENDING_HANDSHAKE_TTL_SECS: i64 = 5;
+/// WireGuard handshake initiation: message type 1, 148 bytes.
+const WG_INITIATION_LEN: usize = 148;
+
+/// Hold a handshake initiation from a peer whose key is being fetched.
+/// It is authenticated only when replayed with the key, like any other.
+fn hold_handshake(state: &CoreState, device_id: &str, msg: &[u8], src: std::net::SocketAddr, now: i64) {
+    if msg.len() != WG_INITIATION_LEN || msg[0] != 1 {
+        return;
+    }
+    let mut held = state.pending_handshakes.lock().unwrap_or_else(|e| e.into_inner());
+    held.retain(|_, (_, _, at)| now - *at <= PENDING_HANDSHAKE_TTL_SECS);
+    if held.len() < PENDING_HANDSHAKES_MAX || held.contains_key(device_id) {
+        held.insert(device_id.to_string(), (msg.to_vec(), src, now));
+    }
+}
+
+/// A peer's key just arrived: answer the handshake it sent meanwhile,
+/// instead of waiting for its retransmission (5 s later).
+pub(crate) async fn replay_pending_handshake(state: &CoreState, device_id: &str) {
+    let now = current_unix();
+    let held = state.pending_handshakes.lock().unwrap_or_else(|e| e.into_inner()).remove(device_id);
+    if let Some((msg, src, at)) = held.filter(|(_, _, at)| now - *at <= PENDING_HANDSHAKE_TTL_SECS) {
+        debug!("encryption: answering {}'s handshake held while its key was fetched ({} s)", device_id, now - at);
+        wg_inbound(state, device_id, &msg, src, now).await;
     }
 }
 
@@ -807,7 +857,7 @@ async fn peer_ipv4(state: &CoreState, device_id: &str) -> Option<std::net::Ipv4A
 
 /// Send WireGuard messages to a peer as `TYPE_WG` frames.  Returns false if
 /// a send failed.
-async fn send_wg(state: &Arc<CoreState>, device_id: &str, target: std::net::SocketAddr, msgs: &[Vec<u8>]) -> bool {
+async fn send_wg(state: &CoreState, device_id: &str, target: std::net::SocketAddr, msgs: &[Vec<u8>]) -> bool {
     if msgs.is_empty() {
         return true;
     }
@@ -1849,6 +1899,47 @@ mod tests {
         // One initiation, the packets queued; nothing in plaintext.
         assert_eq!(*seen.lock().unwrap(), [msst_packet::TYPE_WG]);
         assert_eq!(enc_state(&a, &b).await, Some(EncState::Handshaking));
+    }
+
+    #[tokio::test]
+    async fn a_handshake_from_a_peer_without_key_is_answered_once_the_key_arrives() {
+        use msst_core_state::encryption::EncState;
+        let a = wg_core("held-a", 0x79).await;
+        let mut b = wg_core("held-b", 0x7a).await;
+        let (relay, seen) = relay_pair(&a, &b).await;
+        know(&a, &b, relay).await;
+        // b doesn't know a yet (e.g. it evicted a): the initiation is held
+        // while b fetches a's key.
+        let ping = icmp_echo(&a.id.virtual_ips().0, &b.id.virtual_ips().0);
+        route_outbound_packet(&ping, &a.state).await;
+        assert!(crate::test_support::eventually(|| b.state.pending_handshakes.lock().unwrap().contains_key(&a.id.device.id)).await);
+        assert_eq!(enc_state(&a, &b).await, Some(EncState::Handshaking));
+        // The key arrives: answered at once, not after a's retransmission
+        // (5 s); the queued ping follows.
+        know(&b, &a, relay).await;
+        assert_eq!(recv_tun(&mut b).await, Some(ping));
+        assert_eq!(enc_state(&a, &b).await, Some(EncState::Encrypted));
+        assert!(b.state.pending_handshakes.lock().unwrap().is_empty());
+        assert!(seen.lock().unwrap().iter().all(|t| *t == msst_packet::TYPE_WG));
+    }
+
+    #[tokio::test]
+    async fn a_peer_we_talk_to_stays_cached() {
+        let a = wg_core("comm-a", 0x7b).await;
+        let mut b = wg_core("comm-b", 0x7c).await;
+        let (relay, _) = relay_pair(&a, &b).await;
+        know(&a, &b, relay).await;
+        know(&b, &a, relay).await;
+        // a fetched b almost two hours ago.
+        let now = current_unix();
+        a.state.peers.lock().await.touch_comm(&b.id.device.id, now - 2 * 3600 + 60);
+        // a talks to b; b only answers (handshake response, no new flow of
+        // its own) — that is communication too.
+        let ping = icmp_echo(&a.id.virtual_ips().0, &b.id.virtual_ips().0);
+        route_outbound_packet(&ping, &a.state).await;
+        assert_eq!(recv_tun(&mut b).await, Some(ping));
+        let (evicted, _) = a.state.peers.lock().await.evict_expired(now + 30 * 60);
+        assert!(evicted.is_empty(), "evicted while in use: {:?}", evicted);
     }
 
     #[tokio::test]

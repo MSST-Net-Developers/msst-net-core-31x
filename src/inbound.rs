@@ -127,7 +127,6 @@ pub async fn deliver_inbound(state: &Arc<CoreState>, tun_tx: &mpsc::Sender<Vec<u
         PipelineVerdict::Allow { src_device_id, decision } => {
             state.contacts.lock().unwrap_or_else(|e| e.into_inner()).update_communication(&src_device_id, now);
             crate::diagnostics::traffic(state, &src_device_id).rx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::peer_cache::on_communication(state, &src_device_id).await;
             if let Some(m) = &decision.matched_rule {
                 // Remember what let the flow in, so revoking it ends the flow.
                 let origin = FlowOrigin { device_id: src_device_id.clone(), rule_id: m.rule_id.clone(), room_scope: m.scope == Scope::Space };

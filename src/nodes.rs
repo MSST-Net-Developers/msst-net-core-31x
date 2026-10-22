@@ -180,14 +180,18 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         dns.invalidate(h);
     }
     if !p.public_key.is_empty() {
-        let changes = {
+        let (created, changes) = {
             let mut enc = state.encryption.lock().await;
-            if let Err(e) = enc.add_peer(p.device_id, p.public_key) {
+            let created = enc.add_peer(p.device_id, p.public_key).unwrap_or_else(|e| {
                 warn!("nodes: WG add_peer failed for {}: {}", p.device_id, e);
-            }
-            enc.take_changes()
+                false
+            });
+            (created, enc.take_changes())
         };
         state.emit_encryption_changes(changes);
+        if created {
+            crate::runtime::replay_pending_handshake(state, p.device_id).await;
+        }
     }
     if let Some(e) = changed {
         state.next_generation();

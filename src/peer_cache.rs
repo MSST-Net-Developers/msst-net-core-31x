@@ -3,10 +3,12 @@
 //! A peer learned from the coordinator is kept while any reason holds:
 //! - it is in our room (then 20 min after it/we left),
 //! - an active rule names it (then 24 h after the last such rule went away),
-//! - traffic from it passed the firewall / we fetched it (2 h).
+//! - it sent us an authenticated WireGuard message / we fetched it (2 h).
+//!
 //! Housekeeping evicts peers with no reason left.  Peers in the peer list
 //! that never got a reason (e.g. learned before this module tracked them)
-//! are not evicted.
+//! are not evicted.  Our own device (in our user's node list and in room
+//! member lists) is never tracked.
 //!
 //! The cache is saved to `peer_cache.json` every 5 minutes and on shutdown,
 //! and restored at startup so known peers are reachable immediately.  (3.0.x
@@ -22,9 +24,17 @@ use tracing::{info, warn};
 
 pub const FILE: &str = "peer_cache.json";
 
+/// Our own device ID: not a peer, never cached.
+async fn local_id(state: &CoreState) -> String {
+    state.net.read().await.local_device_id.clone()
+}
+
 /// Room membership changed: `members` is the room's complete member list.
 pub async fn on_room_members(state: &CoreState, members: &[String]) {
     let now = crate::runtime::current_unix();
+    let own = local_id(state).await;
+    let members: Vec<String> = members.iter().filter(|id| **id != own).cloned().collect();
+    let members = members.as_slice();
     let previous: Vec<String> = state.room_cache_members.lock().unwrap_or_else(|e| e.into_inner()).drain().collect();
     let mut peers = state.peers.lock().await;
     for id in previous.iter().filter(|id| !members.contains(id)) {
@@ -38,6 +48,9 @@ pub async fn on_room_members(state: &CoreState, members: &[String]) {
 }
 
 pub async fn on_member_joined(state: &CoreState, device_id: &str) {
+    if device_id == local_id(state).await {
+        return;
+    }
     state.peers.lock().await.mark_room_member(device_id);
     state.room_cache_members.lock().unwrap_or_else(|e| e.into_inner()).insert(device_id.to_string());
 }
@@ -53,8 +66,11 @@ pub async fn on_rooms_left(state: &CoreState) {
     state.room_cache_members.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
-/// Traffic from `device_id` passed the firewall, or we fetched it.
+/// `device_id` sent us an authenticated WireGuard message, or we fetched it.
 pub async fn on_communication(state: &CoreState, device_id: &str) {
+    if device_id == local_id(state).await {
+        return;
+    }
     state.peers.lock().await.touch_comm(device_id, crate::runtime::current_unix());
 }
 
@@ -131,6 +147,9 @@ pub async fn restore(state: &Arc<CoreState>) {
         }
     };
     let now = crate::runtime::current_unix();
+    // Older Cores cached our own device too.
+    let own = local_id(state).await;
+    let entries: Vec<PersistedPeerCacheEntry> = entries.into_iter().filter(|e| e.device_id != own).collect();
     let mut restored = 0;
     for e in &entries {
         let Some(p) = &e.peer else { continue };
@@ -176,6 +195,19 @@ mod tests {
         evict_expired(&state).await;
         assert!(state.net.read().await.peer_list.contains("device-0000000b"), "within grace");
         let (evicted, _) = state.peers.lock().await.evict_expired(crate::runtime::current_unix() + 21 * 60);
+        assert_eq!(evicted, vec!["device-0000000b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn our_own_device_is_never_cached() {
+        let (state, _ipc) = core_state("pc-self").await;
+        let own = state.net.read().await.local_device_id.clone();
+        on_communication(&state, &own).await;
+        on_member_joined(&state, &own).await;
+        on_room_members(&state, &[own.clone(), "device-0000000b".into()]).await;
+        on_room_members(&state, &[]).await;
+        // Long after every grace period: nothing of ours to evict.
+        let (evicted, _) = state.peers.lock().await.evict_expired(crate::runtime::current_unix() + 25 * 3600);
         assert_eq!(evicted, vec!["device-0000000b".to_string()]);
     }
 

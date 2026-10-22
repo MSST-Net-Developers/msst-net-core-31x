@@ -6,7 +6,8 @@
 //! |------------------|----------------------------------|---------------------|
 //! | Room member      | `room_state` with this device    | 20 minutes          |
 //! | Rule referenced  | An ACL rule mentions this device  | 24 hours            |
-//! | Recent comm      | ACL-allowed packet exchanged     | 2 hours             |
+//! | Recent comm      | Fetched, or any authenticated    | 2 hours             |
+//! |                  | WireGuard message from it        |                     |
 //!
 //! When all reasons expire, `drain_expired()` returns the device ID for
 //! eviction.

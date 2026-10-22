@@ -228,6 +228,9 @@ pub struct CoreState {
     /// Diagnostic ping jobs.
     pub ping_jobs: crate::diagnostics::PingJobs,
     pub diag_probe_waiters: crate::diagnostics::ProbeWaiters,
+    /// Handshake initiations from peers whose key we are fetching
+    /// (`crate::runtime::replay_pending_handshake`).
+    pub pending_handshakes: crate::runtime::PendingHandshakes,
     /// Room members as last told to the peer cache.
     pub room_cache_members: std::sync::Mutex<HashSet<String>>,
     /// Devices referenced by active rules, as last told to the peer cache.
@@ -276,6 +279,7 @@ impl CoreState {
             traffic: std::sync::RwLock::new(HashMap::new()),
             ping_jobs: std::sync::Mutex::new(HashMap::new()),
             diag_probe_waiters: std::sync::Mutex::new(HashMap::new()),
+            pending_handshakes: std::sync::Mutex::new(HashMap::new()),
             room_cache_members: std::sync::Mutex::new(HashSet::new()),
             rule_ref_devices: std::sync::Mutex::new(HashSet::new()),
             dns: std::sync::OnceLock::new(),
