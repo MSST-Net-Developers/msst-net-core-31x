@@ -91,6 +91,13 @@ impl CoreRuntime {
             client_for_ws.run(state_for_ws).await;
         });
 
+        // Keep the short-lived OIDC access token fresh.
+        let client_for_refresh = client.clone();
+        let state_for_refresh = state.clone();
+        self.spawn("coordinator-token-refresh", async move {
+            client_for_refresh.refresh_loop(state_for_refresh).await;
+        });
+
         // Spawn the event handler (dispatches coordinator events to Core).
         let client_for_handler = client.clone();
         self.spawn("coordinator-events", async move {

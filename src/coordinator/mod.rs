@@ -5,8 +5,13 @@
 //! - Device registration on every (re)connect
 //! - Re-joining rooms (`join` + `discovery_join`) after a reconnect
 //! - Node heartbeat, room keepalive and WS ping, bound to the connection
-//! - Bearer-token auth: OIDC (refreshed on HTTP 401), else a guest token
-//!   (see `credentials`)
+//! - Bearer-token auth: OIDC, else a guest token (see `credentials`).  The
+//!   OIDC access token is short-lived (5 min on the MSST platform) and the
+//!   Coordinator checks it only at the WS handshake but on every HTTP API
+//!   call, so it is kept fresh: refreshed before it expires
+//!   ([`CoordinatorClient::refresh_loop`]) and, should an API call still get
+//!   a 401, refreshed and the call retried once.  One refresh at a time — a
+//!   refresh token may be single-use.
 //! - Incoming message parsing (room_state, node events, punch requests)
 //!
 //! ## Protocol contract
@@ -57,6 +62,34 @@ const ROOM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const BACKOFF_MIN_SECS: u64 = 1;
 const BACKOFF_MAX_SECS: u64 = 30;
 
+/// When the OIDC access token is refreshed ahead of its expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshPolicy {
+    /// Refresh this long before expiry: a fifth of the remaining lifetime,
+    /// within `[min_margin_secs, max_margin_secs]`.
+    pub min_margin_secs: i64,
+    pub max_margin_secs: i64,
+    /// Never refresh again sooner than this (a short-lived or, with clock
+    /// skew, apparently expired token must not make it spin).
+    pub min_interval_secs: i64,
+    /// Retry backoff after a refresh that could not be attempted.
+    pub retry_min_secs: u64,
+    pub retry_max_secs: u64,
+}
+
+impl RefreshPolicy {
+    pub const DEFAULT: RefreshPolicy =
+        RefreshPolicy { min_margin_secs: 30, max_margin_secs: 300, min_interval_secs: 15, retry_min_secs: 5, retry_max_secs: 60 };
+
+    /// Seconds from `now` until a token expiring at `expires_at` is
+    /// refreshed: at about 80 % of its remaining lifetime (5 min → after 4).
+    pub fn delay_secs(&self, now: i64, expires_at: i64) -> i64 {
+        let remaining = expires_at - now;
+        let margin = (remaining / 5).clamp(self.min_margin_secs, self.max_margin_secs);
+        (remaining - margin).max(self.min_interval_secs)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -97,6 +130,18 @@ pub struct CoordinatorClient {
     credential: std::sync::RwLock<Option<Credential>>,
     /// Drops the current connection so the next one uses new credentials.
     reconnect: Notify,
+    /// Serializes OIDC refreshes (a refresh token may be single-use).
+    refresh_lock: tokio::sync::Mutex<()>,
+    /// The access token the last refresh replaced: a request still carrying
+    /// it is retried with the new one.
+    previous_oidc: std::sync::Mutex<Option<String>>,
+    /// Signalled when the OIDC credentials change (refresh, login,
+    /// rejection); wakes [`Self::refresh_loop`].
+    auth_changed: Notify,
+    /// The Core this client serves (set by `run` / `refresh_loop`), for
+    /// refreshing on an HTTP 401.
+    core: std::sync::OnceLock<std::sync::Weak<CoreState>>,
+    pub(crate) refresh_policy: RefreshPolicy,
 }
 
 /// The current state of the Coordinator connection.
@@ -211,12 +256,26 @@ impl CoordinatorClient {
             guest: std::sync::Mutex::new(None),
             credential: std::sync::RwLock::new(None),
             reconnect: Notify::new(),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            previous_oidc: std::sync::Mutex::new(None),
+            auth_changed: Notify::new(),
+            core: std::sync::OnceLock::new(),
+            refresh_policy: RefreshPolicy::DEFAULT,
         }
+    }
+
+    fn attach(&self, core: &Arc<CoreState>) {
+        let _ = self.core.set(Arc::downgrade(core));
+    }
+
+    fn core(&self) -> Option<Arc<CoreState>> {
+        self.core.get().and_then(std::sync::Weak::upgrade)
     }
 
     // ── Credentials ────────────────────────────────────────────────────────
 
-    /// Bearer token for HTTP API calls: the current connection's credential.
+    /// Bearer token for HTTP API calls: the current connection's credential
+    /// (for OIDC, kept up to date by every refresh).
     pub fn bearer(&self) -> Option<String> {
         self.credential.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|c| c.token().to_string())
     }
@@ -233,10 +292,26 @@ impl CoordinatorClient {
 
     /// New or refreshed OIDC credentials: use them again, and if the current
     /// connection doesn't, reconnect so the Coordinator sees them.
+    /// A connection already on OIDC keeps going with the new token (the
+    /// Coordinator checks it at the handshake only; the HTTP API gets the
+    /// new one).
     pub async fn credentials_changed(&self, core: &Arc<CoreState>) {
         self.oidc_rejected.store(false, Ordering::SeqCst);
         core.net.write().await.local_authenticated = core.identity.read().await.as_ref().is_some_and(|i| i.auth.is_some());
-        if !matches!(*self.credential.read().unwrap_or_else(|e| e.into_inner()), Some(Credential::Oidc(_))) {
+        let token = core.identity.read().await.as_ref().and_then(access_token);
+        let reconnect = {
+            let mut cred = self.credential.write().unwrap_or_else(|e| e.into_inner());
+            match (&*cred, token) {
+                (Some(Credential::Oidc(_)), Some(t)) => {
+                    *cred = Some(Credential::Oidc(t));
+                    false
+                }
+                (Some(Credential::Oidc(_)), None) => false,
+                _ => true,
+            }
+        };
+        self.auth_changed.notify_waiters();
+        if reconnect {
             info!("coordinator: reconnecting with the new credentials");
             self.reconnect.notify_waiters();
         }
@@ -278,7 +353,7 @@ impl CoordinatorClient {
                     Err(_) => {}
                 }
                 info!("coordinator: HTTP 401 — attempting token refresh before re-auth prompt");
-                match self.refresh_token(core).await {
+                match self.refresh_if_current(core, Some(&token)).await {
                     Refresh::Refreshed => {
                         let token = oidc().await.unwrap_or_default();
                         match self.open_ws(ws_url, Some(&token)).await {
@@ -296,6 +371,7 @@ impl CoordinatorClient {
                 }
                 warn!("coordinator: MSST access authentication required (token refresh did not resolve 401) — continuing as a guest (room mode only)");
                 self.oidc_rejected.store(true, Ordering::SeqCst);
+                self.auth_changed.notify_waiters();
                 core.net.write().await.local_authenticated = false;
                 // The credentials are dead: register with the key-derived
                 // user ID, not the OIDC one.
@@ -343,6 +419,7 @@ impl CoordinatorClient {
     /// (1 s → 30 s, reset after a successful connection).  Spawn as a
     /// background task.
     pub async fn run(&self, core: Arc<CoreState>) {
+        self.attach(&core);
         self.startup_auth_check(&core).await;
 
         let mut backoff = BACKOFF_MIN_SECS;
@@ -561,11 +638,24 @@ impl CoordinatorClient {
     /// On success the identity is updated and persisted.  Returns `true` if a
     /// fresh access token is now available.
     pub async fn try_refresh_token(&self, core: &Arc<CoreState>) -> bool {
-        self.refresh_token(core).await == Refresh::Refreshed
+        self.refresh_if_current(core, None).await == Refresh::Refreshed
     }
 
-    /// [`try_refresh_token`](Self::try_refresh_token), telling apart a
-    /// refresh the IdP refused from one that could not be attempted.
+    /// Refresh, unless the access token is no longer `seen` (another caller
+    /// refreshed it meanwhile: use that one).  Concurrent callers wait for
+    /// one refresh instead of each spending the refresh token.  `None`:
+    /// refresh in any case.
+    async fn refresh_if_current(&self, core: &Arc<CoreState>, seen: Option<&str>) -> Refresh {
+        let _one_at_a_time = self.refresh_lock.lock().await;
+        let current = core.identity.read().await.as_ref().and_then(access_token);
+        if seen.is_some_and(|seen| current.is_some_and(|t| t != seen)) {
+            return Refresh::Refreshed;
+        }
+        self.refresh_token(core).await
+    }
+
+    /// One refresh request (`refresh_lock` held), telling apart a refresh
+    /// the IdP refused from one that could not be attempted.
     async fn refresh_token(&self, core: &Arc<CoreState>) -> Refresh {
         let refresh_token = core
             .identity
@@ -608,6 +698,7 @@ impl CoordinatorClient {
 
         let mut guard = core.identity.write().await;
         let Some(id) = guard.as_mut() else { return Refresh::Unavailable };
+        let replaced = access_token(id);
         if !apply_token_refresh(id, &body) {
             warn!("token refresh response contained no access_token");
             return Refresh::Unavailable;
@@ -621,8 +712,92 @@ impl CoordinatorClient {
             id.auth.as_ref().map(|a| a.expires_at).unwrap_or(0)
         );
         drop(guard);
+        *self.previous_oidc.lock().unwrap_or_else(|e| e.into_inner()) = replaced;
         self.credentials_changed(core).await;
         Refresh::Refreshed
+    }
+
+    /// Keep the OIDC access token fresh while Core runs: refresh it before
+    /// it expires ([`RefreshPolicy`]), so HTTP API calls never carry an
+    /// expired one.  Spawn next to [`Self::run`].
+    ///
+    /// - could not be attempted (network, 5xx): retry with backoff;
+    /// - refused: once the access token has expired, reconnect — the WS
+    ///   handshake then refuses it and the usual flow takes over (guest
+    ///   mode, `AccessAuthRequired`);
+    /// - no credentials, or refused before: wait for a login.
+    pub async fn refresh_loop(&self, core: Arc<CoreState>) {
+        self.attach(&core);
+        let policy = self.refresh_policy;
+        let mut retry = policy.retry_min_secs;
+        let mut next: Option<Duration> = None; // overrides the expiry-based wait
+        loop {
+            let changed = self.auth_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
+            let auth = core.identity.read().await.as_ref().and_then(|i| i.auth.clone());
+            let auth = auth.filter(|a| !a.access_token.is_empty() && !a.refresh_token.is_empty() && !self.oidc_rejected());
+            let Some(auth) = auth else {
+                next = None;
+                changed.await;
+                continue;
+            };
+            let wait = next.take().unwrap_or_else(|| Duration::from_secs(policy.delay_secs(unix_now(), auth.expires_at) as u64));
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = &mut changed => continue,
+            }
+
+            match self.refresh_if_current(&core, Some(&auth.access_token)).await {
+                Refresh::Refreshed => retry = policy.retry_min_secs,
+                Refresh::Unavailable => {
+                    warn!("coordinator: token refresh not possible now — retrying in {}s", retry);
+                    next = Some(Duration::from_secs(retry));
+                    retry = (retry * 2).min(policy.retry_max_secs);
+                }
+                Refresh::Rejected => {
+                    warn!("coordinator: token refresh refused — the login ends when the access token expires");
+                    let left = (auth.expires_at - unix_now()).max(0) as u64 + 1;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(left)) => self.reconnect.notify_waiters(),
+                        _ = &mut changed => continue,
+                    }
+                    // Wait for the outcome (rejection, or a new login).
+                    next = Some(Duration::from_secs(policy.retry_max_secs));
+                }
+            }
+        }
+    }
+
+    /// Whether `token` is (or was until the last refresh) our OIDC token.
+    async fn is_oidc_token(&self, core: &CoreState, token: &str) -> bool {
+        core.identity.read().await.as_ref().and_then(access_token).as_deref() == Some(token)
+            || self.previous_oidc.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(token)
+    }
+
+    /// Send `build(bearer)`.  On HTTP 401 with the OIDC token: refresh it
+    /// (one refresh for concurrent callers) and send once more with the new
+    /// one.  Otherwise, and if that is not possible, the first response.
+    async fn send_authorized(
+        &self,
+        bearer: Option<&str>,
+        build: impl Fn(Option<&str>) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        let resp = build(bearer).send().await.map_err(|e| e.to_string())?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        let (Some(used), Some(core)) = (bearer, self.core()) else { return Ok(resp) };
+        if !self.is_oidc_token(&core, used).await {
+            return Ok(resp);
+        }
+        info!("coordinator: HTTP 401 with the OIDC token — refreshing it and retrying once");
+        if self.refresh_if_current(&core, Some(used)).await != Refresh::Refreshed {
+            return Ok(resp);
+        }
+        let Some(fresh) = core.identity.read().await.as_ref().and_then(access_token) else { return Ok(resp) };
+        build(Some(&fresh)).send().await.map_err(|e| e.to_string())
     }
 
     // ── Outgoing messages ──────────────────────────────────────────────────
@@ -658,11 +833,15 @@ impl CoordinatorClient {
     /// `GET <coord_url><path>` returning JSON; `Ok(None)` on 404.
     pub async fn api_get(&self, path: &str, bearer: Option<&str>) -> Result<Option<Value>, String> {
         let url = format!("{}{}", self.config.coord_url.trim_end_matches('/'), path);
-        let mut req = self.http.get(&url).timeout(Duration::from_secs(10));
-        if let Some(t) = bearer {
-            req = req.bearer_auth(t);
-        }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .send_authorized(bearer, |b| {
+                let req = self.http.get(&url).timeout(Duration::from_secs(10));
+                match b {
+                    Some(t) => req.bearer_auth(t),
+                    None => req,
+                }
+            })
+            .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -675,11 +854,16 @@ impl CoordinatorClient {
     /// `POST <coord_url><path>` with a JSON body; errors on non-2xx.
     pub async fn api_post(&self, path: &str, body: &Value) -> Result<(), String> {
         let url = format!("{}{}", self.config.coord_url.trim_end_matches('/'), path);
-        let mut req = self.http.post(&url).json(body).timeout(Duration::from_secs(10));
-        if let Some(t) = self.bearer() {
-            req = req.bearer_auth(t);
-        }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let bearer = self.bearer();
+        let resp = self
+            .send_authorized(bearer.as_deref(), |b| {
+                let req = self.http.post(&url).json(body).timeout(Duration::from_secs(10));
+                match b {
+                    Some(t) => req.bearer_auth(t),
+                    None => req,
+                }
+            })
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -699,14 +883,18 @@ impl CoordinatorClient {
         bearer: Option<&str>,
     ) -> Result<(u16, Value), String> {
         let url = format!("{}{}", self.config.coord_url.trim_end_matches('/'), path);
-        let mut req = self.http.request(method, &url).timeout(Duration::from_secs(15));
-        if let Some(b) = body {
-            req = req.json(b);
-        }
-        if let Some(t) = bearer {
-            req = req.bearer_auth(t);
-        }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .send_authorized(bearer, |b| {
+                let mut req = self.http.request(method.clone(), &url).timeout(Duration::from_secs(15));
+                if let Some(body) = body {
+                    req = req.json(body);
+                }
+                match b {
+                    Some(t) => req.bearer_auth(t),
+                    None => req,
+                }
+            })
+            .await?;
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
@@ -1615,5 +1803,214 @@ mod tests {
         assert_eq!(coord.ws_accepted_tokens(), [None]);
         assert_eq!(client.credential_kind(), "none");
         runner.abort();
+    }
+}
+
+/// The short-lived OIDC access token (5 min on the MSST platform): kept
+/// fresh while connected, refreshed + retried on an API 401, one refresh at
+/// a time, and a refused refresh still ends in guest mode.
+#[cfg(test)]
+mod token_refresh_tests {
+    use super::*;
+    use crate::test_support::{core_state, FakeCoordinator};
+    use std::sync::Mutex;
+
+    /// A platform issuing `at-N` / single-use `rt-N` with a lifetime of
+    /// `life` seconds.  The WS and `/device/endpoint` accept only a token
+    /// that is current and unexpired.
+    struct Platform {
+        /// (access token, expires_at) currently valid.
+        current: Option<(String, i64)>,
+        /// The refresh token that is still unused.
+        refresh: Option<String>,
+        issued: u32,
+        refreshes: u32,
+        refuse_refresh: bool,
+        life: i64,
+    }
+
+    impl Platform {
+        fn valid(&self, t: Option<&str>) -> bool {
+            matches!((&self.current, t), (Some((c, exp)), Some(t)) if c == t && *exp > unix_now())
+        }
+        fn refresh(&mut self, body: &Value) -> (u16, Value) {
+            self.refreshes += 1;
+            if self.refuse_refresh || body["refresh_token"].as_str() != self.refresh.as_deref() {
+                return (401, json!({ "error": "invalid_grant" }));
+            }
+            self.issued += 1;
+            let (at, rt, exp) = (format!("at-{}", self.issued), format!("rt-{}", self.issued), unix_now() + self.life);
+            self.current = Some((at.clone(), exp));
+            self.refresh = Some(rt.clone());
+            (200, json!({ "access_token": at, "refresh_token": rt, "expires_at": exp }))
+        }
+    }
+
+    type Shared = Arc<Mutex<Platform>>;
+
+    async fn platform(life: i64) -> (Shared, FakeCoordinator) {
+        let p: Shared = Arc::new(Mutex::new(Platform {
+            current: Some(("at-0".into(), unix_now() + life)),
+            refresh: Some("rt-0".into()),
+            issued: 0,
+            refreshes: 0,
+            refuse_refresh: false,
+            life,
+        }));
+        let (ph, pw) = (p.clone(), p.clone());
+        let coord = FakeCoordinator::start_with_ws_auth(
+            move |req| {
+                let mut p = ph.lock().unwrap();
+                match req.path.as_str() {
+                    "/auth/token/refresh" => p.refresh(&req.body),
+                    "/auth/guest/token" => (200, json!({ "token": "guest", "user_id": "guest-0000000a", "expires_at": unix_now() + 86_400 })),
+                    "/device/endpoint" => {
+                        let t = req.authorization.as_deref().and_then(|a| a.strip_prefix("Bearer "));
+                        if p.valid(t) || t == Some("guest") {
+                            (200, json!({ "ok": true }))
+                        } else {
+                            (401, json!({ "code": "access_auth_invalid" }))
+                        }
+                    }
+                    _ => (404, json!({})),
+                }
+            },
+            |_| vec![],
+            move |t| {
+                let p = pw.lock().unwrap();
+                p.valid(t) || t == Some("guest")
+            },
+        )
+        .await;
+        (p, coord)
+    }
+
+    async fn login(core: &Arc<CoreState>, p: &Shared) {
+        let exp = p.lock().unwrap().current.as_ref().unwrap().1;
+        core.identity.write().await.as_mut().unwrap().auth = Some(crate::identity::AuthCredentials {
+            user_id: "user-00000001".into(),
+            access_token: "at-0".into(),
+            refresh_token: "rt-0".into(),
+            expires_at: exp,
+        });
+        core.net.write().await.local_authenticated = true;
+    }
+
+    /// Client + WS loop (+ the refresh loop when `refresh_loop`), with a
+    /// policy fit for a few-second token lifetime.
+    async fn client(core: &Arc<CoreState>, url: &str, refresh_loop: bool) -> (Arc<CoordinatorClient>, Vec<tokio::task::JoinHandle<()>>) {
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let mut c = CoordinatorClient::new(CoordinatorConfig { coord_url: url.into() }, event_tx);
+        c.refresh_policy = RefreshPolicy { min_margin_secs: 1, max_margin_secs: 1, min_interval_secs: 1, retry_min_secs: 1, retry_max_secs: 1 };
+        let c = Arc::new(c);
+        let mut tasks = vec![{
+            let (c, core) = (c.clone(), core.clone());
+            tokio::spawn(async move { c.run(core).await })
+        }];
+        if refresh_loop {
+            let (c, core) = (c.clone(), core.clone());
+            tasks.push(tokio::spawn(async move { c.refresh_loop(core).await }));
+        }
+        (c, tasks)
+    }
+
+    async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out: {}", what);
+    }
+
+    async fn post_endpoint(c: &CoordinatorClient) -> Result<(), String> {
+        c.api_post("/device/endpoint", &json!({ "deviceId": "device-00000001", "endpoints": [] })).await
+    }
+
+    #[test]
+    fn refresh_at_about_80_percent_of_the_lifetime() {
+        let p = RefreshPolicy::DEFAULT;
+        assert_eq!(p.delay_secs(1000, 1300), 240, "5 min token: after 4 min");
+        assert_eq!(p.delay_secs(1000, 4600), 3300, "1 h token: 5 min before");
+        assert_eq!(p.delay_secs(1000, 1040), 15, "never sooner than the minimum interval");
+        assert_eq!(p.delay_secs(1000, 900), 15, "expired (or clock skew): no spinning");
+    }
+
+    #[tokio::test]
+    async fn token_is_refreshed_before_it_expires_without_reconnecting() {
+        let (p, coord) = platform(3).await;
+        let (core, _ipc) = core_state("token-refresh-ahead").await;
+        login(&core, &p).await;
+        let (c, tasks) = client(&core, &coord.url, true).await;
+        wait_until("connected", || c.credential_kind() == "oidc").await;
+
+        // Well past the first token's lifetime.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(p.lock().unwrap().issued >= 2, "refreshed ahead of each expiry");
+        post_endpoint(&c).await.expect("the API accepts the current token");
+        let used = coord.http_log.lock().unwrap().iter().filter(|r| r.path == "/device/endpoint").map(|r| r.authorization.clone()).collect::<Vec<_>>();
+        assert_eq!(used.len(), 1, "no 401 + retry needed");
+        assert_eq!(used[0], Some(format!("Bearer {}", p.lock().unwrap().current.as_ref().unwrap().0)));
+        assert_eq!(coord.ws_auth_log.lock().unwrap().len(), 1, "the WS stayed up");
+        assert_eq!(c.credential_kind(), "oidc");
+        tasks.iter().for_each(|t| t.abort());
+    }
+
+    #[tokio::test]
+    async fn api_401_refreshes_and_retries_once() {
+        let (p, coord) = platform(3600).await;
+        let (core, _ipc) = core_state("token-refresh-401").await;
+        login(&core, &p).await;
+        let (c, tasks) = client(&core, &coord.url, false).await;
+        wait_until("connected", || c.credential_kind() == "oidc").await;
+
+        // The platform expires the token early (or the clock is off).
+        p.lock().unwrap().current.as_mut().unwrap().1 = 0;
+        post_endpoint(&c).await.expect("retried with the refreshed token");
+        let used: Vec<Option<String>> =
+            coord.http_log.lock().unwrap().iter().filter(|r| r.path == "/device/endpoint").map(|r| r.authorization.clone()).collect();
+        assert_eq!(used, [Some("Bearer at-0".into()), Some("Bearer at-1".into())]);
+        assert_eq!(p.lock().unwrap().refreshes, 1);
+        assert_eq!(c.bearer().as_deref(), Some("at-1"), "later calls use the new token");
+        assert_eq!(core.identity.read().await.as_ref().unwrap().auth.as_ref().unwrap().refresh_token, "rt-1", "rotated token stored");
+        assert_eq!(coord.ws_auth_log.lock().unwrap().len(), 1, "no reconnect");
+        tasks.iter().for_each(|t| t.abort());
+    }
+
+    #[tokio::test]
+    async fn concurrent_401s_share_one_refresh() {
+        let (p, coord) = platform(3600).await;
+        let (core, _ipc) = core_state("token-refresh-single").await;
+        login(&core, &p).await;
+        let (c, tasks) = client(&core, &coord.url, false).await;
+        wait_until("connected", || c.credential_kind() == "oidc").await;
+
+        p.lock().unwrap().current.as_mut().unwrap().1 = 0;
+        let results = futures_util::future::join_all((0..8).map(|_| post_endpoint(&c))).await;
+        assert!(results.iter().all(Result::is_ok), "{:?}", results);
+        // rt-0 is single-use: a second refresh would have been refused and
+        // ended the login.
+        assert_eq!(p.lock().unwrap().refreshes, 1);
+        assert!(!c.oidc_rejected());
+        tasks.iter().for_each(|t| t.abort());
+    }
+
+    #[tokio::test]
+    async fn refused_refresh_ends_in_guest_mode_once_the_token_expires() {
+        let (p, coord) = platform(2).await;
+        p.lock().unwrap().refuse_refresh = true;
+        let (core, _ipc) = core_state("token-refresh-refused").await;
+        login(&core, &p).await;
+        let (c, tasks) = client(&core, &coord.url, true).await;
+        wait_until("connected", || c.credential_kind() == "oidc").await;
+        assert!(!core.access_auth_required.load(Ordering::SeqCst));
+
+        wait_until("guest mode", || c.credential_kind() == "guest").await;
+        assert!(c.oidc_rejected());
+        assert!(core.access_auth_required.load(Ordering::SeqCst), "the Controller is asked to authenticate again");
+        assert!(core.identity.read().await.as_ref().unwrap().auth.is_none(), "dead credentials dropped, as before");
+        tasks.iter().for_each(|t| t.abort());
     }
 }

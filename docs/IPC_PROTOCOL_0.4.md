@@ -163,6 +163,14 @@ Add `"async": true` to a command request:
     (disconnected, or a Coordinator without guest tokens);
   - `Health.is_authenticated` is now `false` while the Coordinator refuses
     the stored credentials, even if their expiry time hasn't passed.
+  - the OIDC access token (5 minutes on the MSST platform) is refreshed in
+    the background before it expires, and a Coordinator API call that
+    still gets a 401 refreshes it and retries once.  Previously Core only
+    refreshed at startup and on reconnect, so 5 minutes after start every
+    API call (endpoint reports, node lookups, rooms, DNS, ACL name
+    resolution) failed with `access_auth_invalid` while the WebSocket stayed
+    up.  A refused refresh ends the login when the token expires (guest
+    mode and `AccessAuthRequired`, as above).
 - **Interactive authorization:**
   - an unanswered request times out 60 s after it was raised
     (`AccessRequestTimeout` within about a second; it used to take up to
