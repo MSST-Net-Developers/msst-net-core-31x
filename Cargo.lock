@@ -967,7 +967,7 @@ checksum = "9366861eb2a2c436c20b12c8dbec5f798cea6b47ad99216be0282942e2c81ea0"
 
 [[package]]
 name = "msst-acl-engine"
-version = "3.1.4"
+version = "3.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "msst-core-state"
-version = "3.1.4"
+version = "3.1.5"
 dependencies = [
  "base64 0.22.1",
  "boringtun",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "msst-ipc-protocol"
-version = "3.1.4"
+version = "3.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "msst-net-core"
-version = "3.1.4"
+version = "3.1.5"
 dependencies = [
  "anyhow",
  "argon2",
