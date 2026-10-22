@@ -309,6 +309,7 @@ impl CoreState {
         sched.set_keepalive_secs(s.p2p_keepalive_secs());
         drop(sched);
         crate::routing::set_bypass(self, s.bypass_other_vpns);
+        crate::routing::set_block_other_vpns(s.block_other_vpns_over_msst);
     }
 
     /// Emit `EncryptionChanged` for data-plane encryption state changes.

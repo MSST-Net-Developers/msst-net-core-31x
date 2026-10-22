@@ -9,6 +9,7 @@
   "response": {
     "body": {
       "data": {
+        "block_other_vpns_over_msst": true,
         "bypass_other_vpns": true,
         "disable_p2p": false,
         "keepalive_secs": null,

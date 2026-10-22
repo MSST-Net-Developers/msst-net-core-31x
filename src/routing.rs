@@ -28,6 +28,17 @@
 //!   their own mark (`dns::DNS_UPSTREAM_MARK`) and so follow the system's
 //!   routing.
 //!
+//! - **Other VPNs kept out of MSST** (`block_other_vpns_over_msst`,
+//!   default on).  Tailscale advertises every local address as a candidate
+//!   endpoint, MSST's included; between two machines on MSST it then picks
+//!   the path through MSST — WireGuard inside WireGuard, fragmented at
+//!   MSST's MTU, relayed when MSST is.  tailscaled marks its own sockets
+//!   ([`TAILSCALE_BYPASS_MARK`]), so a rule at [`BLOCK_PRIORITY`] makes
+//!   exactly those packets to the MSST ranges unreachable: Tailscale's path
+//!   probes over MSST fail and it uses its other paths.  Applications'
+//!   traffic over Tailscale or MSST is untouched.  (ZeroTier marks nothing;
+//!   its `local.conf` `interfacePrefixBlacklist` does the same there.)
+//!
 //! **Route checks** (Linux, macOS), at TUN setup and every housekeeping
 //! tick: the conflicts above and where traffic to an MSST address actually
 //! leaves.  Reported as `network_warnings` in `GetSystemState`; a change
@@ -45,10 +56,19 @@ use tracing::{info, warn};
 
 /// Policy routing table holding the TUN routes.
 pub const ROUTE_TABLE: u32 = 2222;
+/// `fwmark TAILSCALE_BYPASS_MARK to <MSST range> unreachable`: before the
+/// pin, which would otherwise route these packets into the TUN.
+pub const BLOCK_PRIORITY: u32 = 5199;
+/// The mark tailscaled puts on its own (WireGuard, disco) sockets on Linux
+/// — its rule 5210 `fwmark 0x80000/0xff0000 lookup main`.
+pub const TAILSCALE_BYPASS_MARK: &str = "0x80000/0xff0000";
 /// `to <MSST range> lookup ROUTE_TABLE`.
 pub const PIN_PRIORITY: u32 = 5200;
 /// `fwmark ROUTE_MARK lookup main`.
 pub const BYPASS_PRIORITY: u32 = 5201;
+// Tailscale's packets meet the block before the pin, and our rules all come
+// before Tailscale's own (5210–5270).
+const _: () = assert!(BLOCK_PRIORITY < PIN_PRIORITY && PIN_PRIORITY < BYPASS_PRIORITY && BYPASS_PRIORITY < 5210);
 /// Mark on Core's UDP sockets while the bypass is on ("MSR"; outside the
 /// bits Tailscale's rules match, `0xff0000` = `0x40000`/`0x80000`).
 pub const ROUTE_MARK: u32 = 0x4d5352;
@@ -184,6 +204,8 @@ struct Host {
     pinned: [bool; 2],
     /// Bypass rules installed.
     bypass: bool,
+    /// Rules keeping other VPNs out of MSST installed.
+    block_vpns: bool,
 }
 
 static HOST: Mutex<Option<Host>> = Mutex::new(None);
@@ -204,17 +226,19 @@ fn ranges() -> [(Prefix, bool); 2] {
 /// Take over host routing (desktop daemon): drop rules a previous run left
 /// behind, then apply the bypass setting.
 pub async fn enable(state: &Arc<CoreState>) {
-    *host() = Some(Host { tun: None, pinned: [false; 2], bypass: false });
+    *host() = Some(Host { tun: None, pinned: [false; 2], bypass: false, block_vpns: false });
     #[cfg(target_os = "linux")]
     {
         for (range, v6) in ranges() {
             delete_rule(v6, &pin_rule(&range));
             delete_rule(v6, &bypass_rule());
+            delete_rule(v6, &block_rule(&range));
             flush_table(v6);
         }
     }
-    let on = state.net_settings.read().await.bypass_other_vpns;
-    set_bypass(state, on);
+    let settings = state.net_settings.read().await.clone();
+    set_bypass(state, settings.bypass_other_vpns);
+    set_block_other_vpns(settings.block_other_vpns_over_msst);
     if let Err(e) = crate::netsock::start_routed_proxy().await {
         warn!("routing: no local proxy for Coordinator HTTP ({}); it follows the system routing", e);
     }
@@ -256,6 +280,25 @@ pub fn set_bypass(state: &CoreState, on: bool) {
     info!("routing: outer traffic bypass of other VPNs {}", if on { "on" } else { "off" });
 }
 
+/// Apply `block_other_vpns_over_msst`.  No-op unless [`enable`]d.
+pub fn set_block_other_vpns(on: bool) {
+    let mut guard = host();
+    let Some(h) = guard.as_mut() else { return };
+    if on == h.block_vpns {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    for (range, v6) in ranges() {
+        if on {
+            rule(v6, "add", &block_rule(&range));
+        } else {
+            delete_rule(v6, &block_rule(&range));
+        }
+    }
+    h.block_vpns = on;
+    info!("routing: other VPNs (Tailscale) over MSST {}", if on { "blocked" } else { "allowed" });
+}
+
 /// Mark a new Core UDP socket while the bypass is on.
 pub fn mark_new_socket<S: AsSocketFd>(s: &S) {
     if MARK_SOCKETS.load(Ordering::Acquire) {
@@ -271,6 +314,9 @@ pub fn teardown() {
     for (i, (range, v6)) in ranges().into_iter().enumerate() {
         if h.bypass {
             delete_rule(v6, &bypass_rule());
+        }
+        if h.block_vpns {
+            delete_rule(v6, &block_rule(&range));
         }
         if h.pinned[i] {
             delete_rule(v6, &pin_rule(&range));
@@ -357,6 +403,12 @@ fn bypass_rule() -> Vec<String> {
     ["fwmark", &format!("{:#x}", ROUTE_MARK), "lookup", "main", "priority", &BYPASS_PRIORITY.to_string()]
         .map(String::from)
         .to_vec()
+}
+
+#[cfg(target_os = "linux")]
+fn block_rule(range: &Prefix) -> Vec<String> {
+    let r = if range.addr.is_ipv4() { crate::ip::IPV4_NET } else { crate::ip::IPV6_NET };
+    ["fwmark", TAILSCALE_BYPASS_MARK, "to", r, "unreachable", "priority", &BLOCK_PRIORITY.to_string()].map(String::from).to_vec()
 }
 
 /// Install or remove the pin for one family.
@@ -564,6 +616,16 @@ mod tests {
         let mac = "   route to: 172.22.0.1\ndestination: 172.22.0.0\n       mask: 255.255.0.0\n  interface: utun4\n      flags: <UP,DONE,STATIC>\n";
         assert_eq!(parse_macos_route_get(mac), Some("utun4".into()));
         assert_eq!(parse_macos_route_get("route: writing to routing socket: not in table"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rules_in_priority_order() {
+        let [(v4, _), (v6, _)] = ranges();
+        assert_eq!(block_rule(&v4).join(" "), "fwmark 0x80000/0xff0000 to 172.22.0.0/16 unreachable priority 5199");
+        assert_eq!(block_rule(&v6).join(" "), "fwmark 0x80000/0xff0000 to fd22:2222:2222:2222::/64 unreachable priority 5199");
+        assert_eq!(pin_rule(&v4).join(" "), "to 172.22.0.0/16 lookup 2222 priority 5200");
+        assert_eq!(bypass_rule().join(" "), "fwmark 0x4d5352 lookup main priority 5201");
     }
 
     #[test]

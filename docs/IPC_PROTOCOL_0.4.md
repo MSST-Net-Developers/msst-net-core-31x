@@ -231,6 +231,15 @@ Add `"async": true` to a command request:
     programs' traffic is not affected.  Turn it off when relays or the
     Coordinator are only reachable through such a VPN.
     A non-boolean is `invalid_settings`;
+  - new setting `block_other_vpns_over_msst` (boolean, default `true`,
+    applies immediately; Linux): other VPNs may not use MSST as their
+    path.  Tailscale advertises MSST's address as an endpoint and, between
+    two machines on MSST, otherwise tunnels through MSST (WireGuard inside
+    WireGuard).  Only tailscaled's own packets to the MSST ranges are
+    refused (it marks its sockets); Tailscale then uses its other paths.
+    Turn it off to let Tailscale use MSST when that path is faster.  Not
+    for ZeroTier (use its `interfacePrefixBlacklist`).  A non-boolean is
+    `invalid_settings`;
   - on Linux the MSST ranges are routed to the MSST interface ahead of
     other VPNs' policy rules — unless another interface has a route inside
     a range (e.g. a Docker network on `172.22.0.0/16`): then that is

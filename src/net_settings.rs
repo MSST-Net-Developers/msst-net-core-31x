@@ -53,6 +53,11 @@ pub struct NetworkSettings {
     /// immediately.  Default on; absent in older files → on.
     #[serde(default = "default_true")]
     pub bypass_other_vpns: bool,
+    /// Linux: other VPNs' own traffic (Tailscale) may not use MSST as a
+    /// path (`crate::routing`).  Applies immediately.  Default on; absent
+    /// in older files → on.
+    #[serde(default = "default_true")]
+    pub block_other_vpns_over_msst: bool,
 }
 
 fn default_true() -> bool {
@@ -69,6 +74,7 @@ impl Default for NetworkSettings {
             keepalive_secs: None,
             linux_dns_mode: LinuxDnsMode::default(),
             bypass_other_vpns: true,
+            block_other_vpns_over_msst: true,
         }
     }
 }
@@ -108,6 +114,7 @@ impl NetworkSettings {
             "keepalive_secs": self.keepalive_secs,
             "linux_dns_mode": self.linux_dns_mode,
             "bypass_other_vpns": self.bypass_other_vpns,
+            "block_other_vpns_over_msst": self.block_other_vpns_over_msst,
         })
     }
 
@@ -130,6 +137,9 @@ impl NetworkSettings {
         }
         if let Some(v) = bool_field("bypass_other_vpns")? {
             self.bypass_other_vpns = v;
+        }
+        if let Some(v) = bool_field("block_other_vpns_over_msst")? {
+            self.block_other_vpns_over_msst = v;
         }
         if let Some(v) = obj.get("preferred_relay") {
             self.preferred_relay = v.as_str().map(str::to_string);
@@ -179,6 +189,7 @@ mod tests {
         assert_eq!(s.relay_keepalive_secs(), 10);
         assert_eq!(s.linux_dns_mode, LinuxDnsMode::IptablesOnly);
         assert!(s.bypass_other_vpns, "absent in 3.0.x files: on");
+        assert!(s.block_other_vpns_over_msst, "absent in older files: on");
         // Older files without some fields.
         let s: NetworkSettings = serde_json::from_str(r#"{"preferred_relay":null,"mtu_override":null,"keepalive_secs":null}"#).unwrap();
         assert_eq!(s, NetworkSettings::default());
@@ -217,6 +228,9 @@ mod tests {
         assert!(!s.bypass_other_vpns);
         assert_eq!(serde_json::from_str::<NetworkSettings>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
         assert!(s.apply_patch(&json!({"bypass_other_vpns": null})).is_err());
+        s.apply_patch(&json!({"block_other_vpns_over_msst": false})).unwrap();
+        assert!(!s.block_other_vpns_over_msst && !s.bypass_other_vpns, "independent switches");
+        assert!(s.apply_patch(&json!({"block_other_vpns_over_msst": "no"})).is_err());
         assert!(s.apply_patch(&json!([1])).is_err());
         assert_eq!(s.to_view()["linux_dns_mode"], "prefer_split");
     }
