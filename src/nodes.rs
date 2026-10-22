@@ -138,6 +138,31 @@ pub struct PeerData<'a> {
     pub is_authenticated: bool,
 }
 
+/// Whether a peer's public key (from the coordinator) belongs to its IDs.
+/// A device ID is derived from the device's key (`identity::derive_id`, the
+/// coordinator enforces it at registration), and so is an unauthenticated
+/// device's user ID (C9).  Checking here means a coordinator fault, or
+/// anyone posing as the coordinator, can't give a known device another key
+/// (which would let them stand in for it) without grinding ~2^32 keys, nor
+/// give a guest device an OIDC user's ID (user-level rules).  Without a key
+/// the peer is kept as `no_key` (unreachable), as before.
+fn peer_identity_ok(p: &PeerData<'_>) -> Result<(), &'static str> {
+    if p.public_key.is_empty() {
+        return Ok(());
+    }
+    let pk: [u8; 32] = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, p.public_key)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or("malformed public key")?;
+    if crate::identity::derive_id(&pk, "device") != p.device_id {
+        return Err("public key does not match the device ID");
+    }
+    if !p.is_authenticated && p.user_id.is_some_and(|u| !u.is_empty() && u != crate::identity::derive_id(&pk, "user")) {
+        return Err("unauthenticated device with a user ID not derived from its key");
+    }
+    Ok(())
+}
+
 /// Whether a peer's virtual addresses (from the coordinator) are usable:
 /// an IPv4 and an IPv6 address in MSST-Net's ranges, neither ours nor
 /// another known device's.  A peer packet is accepted from its address and
@@ -176,6 +201,10 @@ pub async fn apply_peer(state: &CoreState, p: PeerData<'_>) -> bool {
         debug!("nodes: ignoring {} with invalid addresses ({:?}, {:?})", p.device_id, p.ipv4, p.ipv6);
         return false;
     };
+    if let Err(why) = peer_identity_ok(&p) {
+        warn!("nodes: ignoring {}: {}", p.device_id, why);
+        return false;
+    }
     if let Err(why) = peer_addresses_ok(&*state.net.read().await, p.device_id, ipv4, ipv6) {
         warn!("nodes: ignoring {} ({}, {}): {}", p.device_id, ipv4, ipv6, why);
         return false;
@@ -460,6 +489,30 @@ mod tests {
         // Expired entries are swept: never more than the sweep threshold
         // plus what is still within its negative TTL.
         assert!(g.negative_until.len() < NEGATIVE_SWEEP_AT + 100 * NEGATIVE_TTL_SECS as usize, "{}", g.negative_until.len());
+    }
+
+    fn keyed<'a>(id: &'a crate::identity::Identity, v4: &'a str, v6: &'a str, pk: &'a str) -> PeerData<'a> {
+        PeerData { device_id: &id.device.id, ipv4: v4, ipv6: v6, public_key: pk, ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn a_peers_key_must_match_its_ids() {
+        let (state, _rx) = crate::test_support::core_state("nodes-keys").await;
+        let bob = crate::test_support::identity_with_key([0xb0; 32]);
+        let eve = crate::test_support::identity_with_key([0xe0; 32]);
+        let (v4, v6) = bob.virtual_ips();
+        let (bob_pk, eve_pk) = (bob.public_key_base64(), eve.public_key_base64());
+        // Another device's key under bob's ID, or no key at all: refused.
+        assert!(!apply_peer(&state, keyed(&bob, &v4, &v6, &eve_pk)).await);
+        assert!(!apply_peer(&state, keyed(&bob, &v4, &v6, "not base64!")).await);
+        // A guest claiming someone else's user ID: refused; its own derived
+        // ID, or an authenticated user's (OIDC) ID: fine.
+        assert!(!apply_peer(&state, PeerData { user_id: Some("user-478908b7"), ..keyed(&bob, &v4, &v6, &bob_pk) }).await);
+        assert!(apply_peer(&state, PeerData { user_id: Some(&bob.user.id), ..keyed(&bob, &v4, &v6, &bob_pk) }).await);
+        assert!(apply_peer(&state, PeerData { user_id: Some("user-478908b7"), is_authenticated: true, ..keyed(&bob, &v4, &v6, &bob_pk) }).await);
+        assert!(state.encryption.lock().await.has_peer(&bob.device.id));
+        // No key from the coordinator: kept, unreachable (no_key).
+        assert!(apply_peer(&state, PeerData { device_id: "device-0000000c", ipv4: "172.22.1.12", ipv6: "fd22:2222:2222:2222::c", ..Default::default() }).await);
     }
 
     #[tokio::test]
