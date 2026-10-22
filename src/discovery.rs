@@ -29,8 +29,8 @@
 //!   virtual address as its source and then injected into the TUN without
 //!   ACL evaluation — so this path carries no unicast, no other protocols
 //!   and no forged sources.  A packet that arrives through several relays
-//!   is injected once, and each sender is rate-limited (10/s) like our own
-//!   outbound discovery.
+//!   is injected once, and what is injected is rate-limited per sender
+//!   (10/s, like our own outbound discovery) and in total (100/s).
 //!
 //! Every outcome is counted in [`SdiscStats`] (reported by `GetRelays`).
 //!
@@ -72,7 +72,14 @@ const RELAY_LIST_RETRY: Duration = Duration::from_secs(60);
 const RELAY_LIST_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 const RELAY_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Discovery packets per sender per [`RATE_WINDOW`], sent and received.
 const RATE_LIMIT: usize = 10;
+/// Discovery packets injected per [`RATE_WINDOW`] from all senders
+/// together: room size is unlimited, so this bounds what reaches the TUN
+/// however many senders there are (or a room relay claims there are).
+/// Games announce about once a second; this leaves room for ~50 members
+/// announcing twice a second.
+const RX_GLOBAL_RATE_LIMIT: usize = 100;
 /// Broadcast address in MSST-Net space.
 const MSST_BROADCAST: Ipv4Addr = Ipv4Addr::new(172, 22, 255, 255);
 
@@ -255,9 +262,11 @@ struct SecureSession {
     /// Recently delivered packets (sender, payload), so a packet that
     /// arrives through several relays is delivered once.
     rx_seen: HashMap<[u8; 16], Instant>,
-    /// Per-sender rate limit on what is injected (the relay limits senders
-    /// too, but a room relay is run by whoever created the room).
+    /// Rate limits on what is injected: per sender, then all senders
+    /// together (the relay limits senders too, but a room relay is run by
+    /// whoever created the room).
     rx_rate: RateLimit<u64>,
+    rx_global_rate: GlobalRateLimit,
     last_drop_warn: Option<Instant>,
 }
 
@@ -354,8 +363,10 @@ impl SecureSession {
             stats.drop_duplicate.fetch_add(1, Ordering::Relaxed);
             return Err(None);
         }
-        // After de-duplication: copies via other relays cost nothing.
-        if self.rx_rate.exceeded(&d.sender, now) {
+        // After de-duplication: copies via other relays cost nothing.  Per
+        // sender first, so a flooding sender's excess doesn't use up the
+        // global budget and starve the others.
+        if self.rx_rate.exceeded(&d.sender, now) || self.rx_global_rate.0.exceeded(&(), now) {
             stats.drop_rate_limited.fetch_add(1, Ordering::Relaxed);
             return Err(None);
         }
@@ -431,14 +442,25 @@ struct TxState {
     rate: RateLimit<String>,
 }
 
-/// At most [`RATE_LIMIT`] packets per [`RATE_WINDOW`] per key (sender).
+/// At most `limit` packets per [`RATE_WINDOW`] per key: [`RATE_LIMIT`] per
+/// sender by default, [`RX_GLOBAL_RATE_LIMIT`] for [`GlobalRateLimit`].
 struct RateLimit<K> {
+    limit: usize,
     sent: HashMap<K, VecDeque<Instant>>,
 }
 
 impl<K> Default for RateLimit<K> {
     fn default() -> Self {
-        RateLimit { sent: HashMap::new() }
+        RateLimit { limit: RATE_LIMIT, sent: HashMap::new() }
+    }
+}
+
+/// [`RX_GLOBAL_RATE_LIMIT`] for all senders together (the one key `()`).
+struct GlobalRateLimit(RateLimit<()>);
+
+impl Default for GlobalRateLimit {
+    fn default() -> Self {
+        GlobalRateLimit(RateLimit { limit: RX_GLOBAL_RATE_LIMIT, sent: HashMap::new() })
     }
 }
 
@@ -453,7 +475,7 @@ impl<K: std::hash::Hash + Eq + Clone> RateLimit<K> {
             !q.is_empty()
         });
         let q = self.sent.entry(key.clone()).or_default();
-        if q.len() >= RATE_LIMIT {
+        if q.len() >= self.limit {
             return true;
         }
         q.push_back(now);
@@ -486,7 +508,7 @@ async fn tx_loop(mut rx: mpsc::Receiver<Vec<u8>>, sock: Arc<UdpSocket>, state: A
             let Some(vip) = vpn_ipv4(&state).await else { continue };
             rewrite_for_msst_broadcast(&mut pkt, vip);
         }
-        if discovery_datagram(&pkt).is_none() {
+        if discovery_datagram(&pkt).is_none() || is_foreign_member_packet(&pkt, vpn_ipv4(&state).await) {
             continue;
         }
         let now = Instant::now();
@@ -741,6 +763,14 @@ async fn physical_bcast_loop(disc_tx: mpsc::Sender<Vec<u8>>) {
     }
 }
 
+/// A packet from another MSST-Net address than ours: another member's
+/// broadcast the OS sent back out of the TUN (e.g. Linux with broadcast
+/// forwarding on).  Never sent to the room again — that would loop.
+fn is_foreign_member_packet(pkt: &[u8], own: Option<Ipv4Addr>) -> bool {
+    let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+    src.octets()[..2] == [172, 22] && Some(src) != own
+}
+
 /// A broadcast this machine sent on a physical LAN (`physical_bcast_loop`).
 /// The raw socket also sees broadcasts injected into the TUN; they are
 /// never ours (rebuilt from the room member's address,
@@ -985,6 +1015,47 @@ mod tests {
         // Another sender has its own budget; the window frees the first.
         assert!(s.accept(DEV, relay_addr(2), &stats, &pkt(8, 101), now_ms, t).is_ok());
         assert!(s.accept(DEV, relay_addr(2), &stats, &pkt(7, 102), now_ms, t + RATE_WINDOW).is_ok());
+    }
+
+    #[test]
+    fn all_senders_together_are_rate_limited_on_receive() {
+        let (mut s, keys) = session(&[2]);
+        let stats = SdiscStats::default();
+        let now_ms = 1_760_000_000_000u64;
+        let t = Instant::now();
+        let pkt = |sender: u64, c: u64| {
+            let ip = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(172, 22, 0, 7)), c as u16, IpAddr::V4(MSST_BROADCAST), 4000, b"x");
+            deliver(&keys[0], sender, sdisc::FLAG_SENDER_VERIFIED, (now_ms << 16) + c, &ip)
+        };
+        // A flooding sender's excess doesn't count against the others.
+        for c in 0..1000 {
+            let _ = s.accept(DEV, relay_addr(2), &stats, &pkt(1, c), now_ms, t);
+        }
+        assert_eq!(stats.snapshot()["drop"]["rate_limited"], 1000 - RATE_LIMIT as u64);
+        // Many senders (each within its own limit) share the global budget.
+        let mut accepted = RATE_LIMIT;
+        let mut c = 1000;
+        for sender in 2..200u64 {
+            for _ in 0..2 {
+                c += 1;
+                accepted += s.accept(DEV, relay_addr(2), &stats, &pkt(sender, c), now_ms, t).is_ok() as usize;
+            }
+        }
+        assert_eq!(accepted, RX_GLOBAL_RATE_LIMIT);
+        // The next window has a fresh budget.
+        assert!(s.accept(DEV, relay_addr(2), &stats, &pkt(500, c + 1), now_ms, t + RATE_WINDOW).is_ok());
+    }
+
+    #[test]
+    fn another_members_packet_is_never_sent_again() {
+        let own = Some(Ipv4Addr::new(172, 22, 0, 1));
+        let bcast = |src: [u8; 4]| ippkt::build_udp(IpAddr::V4(src.into()), 4000, IpAddr::V4(MSST_BROADCAST), 4000, b"x");
+        assert!(!is_foreign_member_packet(&bcast([172, 22, 0, 1]), own));
+        // Injected from member 172.22.0.7, bounced back out of the TUN.
+        assert!(is_foreign_member_packet(&bcast([172, 22, 0, 7]), own));
+        // A local app bound to another address (the receivers rebuild the
+        // source anyway).
+        assert!(!is_foreign_member_packet(&bcast([192, 168, 1, 5]), own));
     }
 
     #[test]

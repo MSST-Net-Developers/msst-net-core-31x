@@ -47,6 +47,26 @@ fn configure_interface(iface: &str, ipv6: &str) {
     // Multicast routes for the game discovery proxy.
     run_cmd("ip", &["route", "add", "224.0.2.60/32", "dev", iface]); // MCJE
     run_cmd("ip", &["route", "add", "224.0.0.251/32", "dev", iface]); // mDNS
+    no_broadcast_forwarding(iface);
+}
+
+/// Linux: never forward broadcasts arriving on the TUN, whatever
+/// `net.ipv4.conf.all.bc_forwarding` says.  With it on, a room member's
+/// discovery broadcast to 172.22.255.255, injected into the TUN, is not
+/// delivered locally but routed straight back out of the TUN (seen in a
+/// network-namespace test, docs/SECURITY_3.1.6.md) — no LAN discovery, and
+/// the copy would read as our own broadcast.  The per-interface value of
+/// the incoming interface decides.  General forwarding stays as it is:
+/// replies to containers NATed onto the TUN address are forwarded from it.
+#[cfg(target_os = "linux")]
+fn no_broadcast_forwarding(iface: &str) {
+    let path = format!("/proc/sys/net/ipv4/conf/{}/bc_forwarding", iface);
+    match std::fs::write(&path, "0") {
+        Ok(()) => info!("{}: broadcast forwarding off", iface),
+        // Kernels before 5.0 have no bc_forwarding (and never forward them).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("cannot turn off broadcast forwarding on {} ({}): {}", iface, path, e),
+    }
 }
 
 #[cfg(target_os = "macos")]
