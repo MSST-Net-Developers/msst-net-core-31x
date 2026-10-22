@@ -210,6 +210,25 @@ Add `"async": true` to a command request:
   name in our `relay:` endpoint and resolve it themselves (in their own
   address family); `room-relay:` likewise carries the room relay's
   address.  Core caches a lookup for 60 s.
+- **Other VPNs on the same host** (desktop Core):
+  - new setting `bypass_other_vpns` (`GetNetSettings` / `SetNetSettings`,
+    boolean, default `true`, applies immediately; Linux): Core's own UDP
+    traffic to peers and relays uses the main routing table instead of
+    another VPN's full tunnel (Tailscale exit node, wg-quick, Clash TUN…).
+    Turn it off when relays are only reachable through such a VPN.
+    A non-boolean is `invalid_settings`;
+  - on Linux the MSST ranges are routed to the MSST interface ahead of
+    other VPNs' policy rules — unless another interface has a route inside
+    a range (e.g. a Docker network on `172.22.0.0/16`): then that is
+    reported instead;
+  - new `GetSystemState.network_warnings` (Linux, macOS; checked at
+    start and every minute, a change advances `generation`): a list of
+    `{kind, range, interface, route}` — `kind` `route_conflict` (another
+    interface's route `route`, e.g. `172.22.0.0/16 dev br-1a2b table
+    main`, lies inside the MSST range `range`) or `route_hijacked`
+    (traffic to an address in `range` leaves through `interface`; `route`
+    is `null`).  Empty when all is well, and always empty on Windows,
+    Android and without a TUN.
 - **Removed from `Health`:** `local_device_id` and `local_user_id`
   (3.1.0-alpha aliases); use `device_id` and `user_id`.
 - **Peers' empty names / handles** are `null` in `GetNodes`, `NodeAdded`

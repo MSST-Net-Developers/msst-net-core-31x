@@ -29,7 +29,7 @@ pub enum LinuxDnsMode {
     IptablesOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NetworkSettings {
     /// Never upgrade relay paths to direct; report no P2P endpoints.
     #[serde(default)]
@@ -48,6 +48,29 @@ pub struct NetworkSettings {
     pub keepalive_secs: Option<u32>,
     #[serde(default)]
     pub linux_dns_mode: LinuxDnsMode,
+    /// Linux: Core's own UDP traffic (peers, relays) uses the main routing
+    /// table, not another VPN's full tunnel (`crate::routing`).  Applies
+    /// immediately.  Default on; absent in older files → on.
+    #[serde(default = "default_true")]
+    pub bypass_other_vpns: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        NetworkSettings {
+            disable_p2p: false,
+            lock_path: false,
+            preferred_relay: None,
+            mtu_override: None,
+            keepalive_secs: None,
+            linux_dns_mode: LinuxDnsMode::default(),
+            bypass_other_vpns: true,
+        }
+    }
 }
 
 impl NetworkSettings {
@@ -84,6 +107,7 @@ impl NetworkSettings {
             "mtu_override": self.mtu_override,
             "keepalive_secs": self.keepalive_secs,
             "linux_dns_mode": self.linux_dns_mode,
+            "bypass_other_vpns": self.bypass_other_vpns,
         })
     }
 
@@ -103,6 +127,9 @@ impl NetworkSettings {
         }
         if let Some(v) = bool_field("lock_path")? {
             self.lock_path = v;
+        }
+        if let Some(v) = bool_field("bypass_other_vpns")? {
+            self.bypass_other_vpns = v;
         }
         if let Some(v) = obj.get("preferred_relay") {
             self.preferred_relay = v.as_str().map(str::to_string);
@@ -151,6 +178,7 @@ mod tests {
         assert_eq!(s.mtu_override, Some(1200));
         assert_eq!(s.relay_keepalive_secs(), 10);
         assert_eq!(s.linux_dns_mode, LinuxDnsMode::IptablesOnly);
+        assert!(s.bypass_other_vpns, "absent in 3.0.x files: on");
         // Older files without some fields.
         let s: NetworkSettings = serde_json::from_str(r#"{"preferred_relay":null,"mtu_override":null,"keepalive_secs":null}"#).unwrap();
         assert_eq!(s, NetworkSettings::default());
@@ -185,6 +213,10 @@ mod tests {
         s.apply_patch(&json!({"linux_dns_mode": "bogus"})).unwrap();
         assert_eq!(s.linux_dns_mode, LinuxDnsMode::PreferSplit);
         assert!(s.apply_patch(&json!({"lock_path": "yes"})).is_err());
+        s.apply_patch(&json!({"bypass_other_vpns": false})).unwrap();
+        assert!(!s.bypass_other_vpns);
+        assert_eq!(serde_json::from_str::<NetworkSettings>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        assert!(s.apply_patch(&json!({"bypass_other_vpns": null})).is_err());
         assert!(s.apply_patch(&json!([1])).is_err());
         assert_eq!(s.to_view()["linux_dns_mode"], "prefer_split");
     }

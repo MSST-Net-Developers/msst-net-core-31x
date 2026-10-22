@@ -32,6 +32,7 @@ mod passwords;
 mod relay;
 mod room_relay;
 mod rooms;
+mod routing;
 mod sdisc;
 mod sreg;
 mod tunnel_probe;
@@ -245,6 +246,7 @@ async fn run(config: CoreConfig, shutdown: impl std::future::Future<Output = ()>
     let data_dir = config.resolve_data_dir();
     let ipc_socket = config.resolve_ipc_socket();
     let mut core = core::Core::start(core::CoreOptions { config, data_dir, ipc_socket, metrics: true }).await?;
+    routing::enable(&core.state).await;
 
     // TUN (optional — without root Core runs relay-only) and, with it, the
     // local DNS resolver and the game discovery proxy (as in 3.0.x).
@@ -253,6 +255,7 @@ async fn run(config: CoreConfig, shutdown: impl std::future::Future<Output = ()>
         Some((dev, iface)) => {
             core.attach_tun(dev).await;
             core.start_dns_and_discovery(&iface).await;
+            routing::attach_tun(&core.state, &iface, &ipv4, &ipv6).await;
             Some(iface)
         }
         None => None,
@@ -265,6 +268,7 @@ async fn run(config: CoreConfig, shutdown: impl std::future::Future<Output = ()>
     if let Some(iface) = &tun_iface {
         dns::system::unconfigure(iface);
     }
+    routing::teardown();
     core.shutdown().await;
     info!("MSST-Net Core stopped");
     Ok(())

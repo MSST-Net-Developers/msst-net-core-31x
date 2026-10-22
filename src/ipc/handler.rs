@@ -190,6 +190,7 @@ async fn handle_get_system_state(state: &Arc<CoreState>) -> IpcResponse {
     v["user_id"] = serde_json::json!(net.local_user_id);
     v["joined_rooms"] = serde_json::json!(net.joined_rooms);
     v["rule_count"] = serde_json::json!(net.acl_rules.len());
+    v["network_warnings"] = serde_json::json!(*state.network_warnings.lock().unwrap_or_else(|e| e.into_inner()));
     v["generation"] = serde_json::json!(state.generation.current());
     IpcResponse::Ok(v)
 }
@@ -241,8 +242,8 @@ async fn set_net_settings(state: &Arc<CoreState>, patch: serde_json::Value) -> R
         next.save(&state.data_dir).map_err(|e| err("persist_failed", format!("failed to save settings: {}", e)))?;
         *s = next;
         info!(
-            "IPC: network settings updated: disable_p2p={} lock_path={} preferred_relay={:?} mtu_override={:?} keepalive_secs={:?} linux_dns_mode={:?}",
-            s.disable_p2p, s.lock_path, s.preferred_relay, s.mtu_override, s.keepalive_secs, s.linux_dns_mode
+            "IPC: network settings updated: disable_p2p={} lock_path={} preferred_relay={:?} mtu_override={:?} keepalive_secs={:?} linux_dns_mode={:?} bypass_other_vpns={}",
+            s.disable_p2p, s.lock_path, s.preferred_relay, s.mtu_override, s.keepalive_secs, s.linux_dns_mode, s.bypass_other_vpns
         );
         s.to_view()
     };

@@ -151,6 +151,9 @@ pub struct CoreState {
     /// Inbound fragment verdicts (`crate::inbound`) — hot path, guarded by
     /// a `std::sync::Mutex`.  Never hold the guard across an `.await`.
     pub frag_track: std::sync::Mutex<FragmentTracker<crate::inbound::FragVerdict>>,
+    /// Host routing problems found by the last route check
+    /// (`crate::routing`), sorted.  Shown in `GetSystemState`.
+    pub network_warnings: std::sync::Mutex<Vec<crate::routing::NetworkWarning>>,
     /// Relay-selection epoch.  Bumped each time a selection starts; a
     /// selection whose epoch is no longer current must not apply its result
     /// (an older, slower selection must not overwrite a newer one).
@@ -242,6 +245,7 @@ impl CoreState {
             scheduler: tokio::sync::Mutex::new(P2PScheduler::new(String::new())),
             conn_track: std::sync::Mutex::new(ConnectionTracker::new()),
             frag_track: std::sync::Mutex::new(FragmentTracker::new()),
+            network_warnings: std::sync::Mutex::new(Vec::new()),
             relay_epoch: std::sync::atomic::AtomicU64::new(0),
             generation: Generation::new(),
             events: EventBus::new(),
@@ -303,6 +307,8 @@ impl CoreState {
         sched.set_disable_p2p(s.disable_p2p);
         sched.set_lock_path(s.lock_path);
         sched.set_keepalive_secs(s.p2p_keepalive_secs());
+        drop(sched);
+        crate::routing::set_bypass(self, s.bypass_other_vpns);
     }
 
     /// Emit `EncryptionChanged` for data-plane encryption state changes.

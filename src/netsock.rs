@@ -79,6 +79,7 @@ fn udp_socket_with(protector: Option<&Protector>, bind: SocketAddr) -> std::io::
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))?;
     apply(protector, raw_fd(&s))?;
+    crate::routing::mark_new_socket(&s);
     s.set_nonblocking(true)?;
     s.bind(&bind.into())?;
     UdpSocket::from_std(s.into())
