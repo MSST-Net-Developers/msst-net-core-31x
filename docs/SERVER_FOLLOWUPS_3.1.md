@@ -18,7 +18,7 @@
 |---|---|---|---|
 | C1 | Coordinator | `POST /relay/device-keys` | 已完成（`356e399`） |
 | C2 | Coordinator | `features` 存储与透传 | 已完成（`356e399`） |
-| C3 | Coordinator | `device_key_proof` 改为 `required` | 待做 |
+| C3 | Coordinator | `device_key_proof` 改为 `required` | 默认值已改（`ee45434`，同时默认 SQLite 持久化）；已有部署需手动修改配置 |
 | C4 | Coordinator | 客户端依赖的现有行为 | 无需改动，请保持 |
 | C5 | Coordinator | 访客设备的端点上报 `/device/endpoint` | 已完成（`54d0d04`） |
 | C6 | Coordinator | 快速重连时旧连接的清理覆盖新连接 | 待做 |
@@ -30,7 +30,7 @@
 | K2 | 客户端 | 成员分处不同中转时的游戏发现 | 已修复 |
 | R1 | 中转 | 退役 `0x06`/`0x07` 转发 | 已完成（`f5cd369`） |
 | R2 | 中转 | 退役 `0x03` | 已完成（`f5cd369`） |
-| R3 | 中转 | `relay.register_auth` 改为 `required` | 待做（最后一步） |
+| R3 | 中转 | `relay.register_auth` 改为 `required` | 默认值已改（`8286dd2`）；已有部署需手动修改配置 |
 | R4 | 中转 | 3.1 协议约定、sdisc、sreg | 已完成 |
 
 ## Coordinator
@@ -53,7 +53,9 @@
 
 部署 C1 之前不要部署 C2：客户端一看到 `sreg1` 就会切到 `0x0E`，而中转此时还取不到公钥。
 
-### C3 `device_key_proof`：`off` → `optional` → `required` — 待做
+### C3 `device_key_proof`：`off` → `optional` → `required` — 默认值已改为 `required`
+
+msstnetCoordinator31x `ee45434`：`device_key_proof` 默认（包括留空、缺省时）为 `required`，持久化默认改为 SQLite（`coordinator.db`），否则重启后所有密钥固定都会丢失，设备 ID 可被重新抢注。Coordinator 首次启动时会把当时的默认值写进 `config.yaml`，所以**已有部署保留着当时写入的 `off` 和 `driver: none`，需要手动改为 `required` 和 `sqlite`**。客户端（3.1 起）在 WebSocket 注册和 `POST /device/register` 中都会附带证明；3.1.6 起还会拒绝公钥与设备 ID 不对应的对端数据。以下为原始描述。
 
 当前默认 `off`。3.1 客户端每次 WS 注册都会附带 keyproof v1，所以可以先切到 `optional` 观察，再切到 `required`。
 
@@ -167,7 +169,9 @@ Coordinator 的 `handleJoin` 在每次 `join` 时都核对 `password_hash`（这
 
 中转目前把 `0x03`（3.0.x 打洞）当作注册处理。3.1 客户端从不发送它（打洞用的是直接发往对端的 `0x06`），它只剩一条未认证注册路径的作用。建议同样归入退役类型。
 
-### R3 `relay.register_auth`：`optional` → `required` — 待做（最后一步）
+### R3 `relay.register_auth`：`optional` → `required` — 默认值已改为 `required`
+
+msstnetRelay31x `8286dd2`：`register_auth` 默认（包括留空时）为 `required`。它需要 `control.server_url`，新写出的默认配置会要求先填写；没有 Coordinator 的中转（例如开发环境）需要显式写 `register_auth: optional`。**已有部署的配置里如写着 `optional`，需要手动修改**。以下为原始描述。
 
 在 C1–C3 上线、客户端全部升级之后再切。需要先定一个可观测的标准，例如连续 7 天 `reg_drop{unauth}` 只来自攻击流量。`required` 需要配置 `control.server_url`，中转启动时会检查。
 

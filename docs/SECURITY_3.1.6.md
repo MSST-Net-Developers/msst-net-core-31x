@@ -157,7 +157,7 @@ Coordinator 仍是信任根（下发公钥、中转列表、房间状态），�
 - DNS 只在 `*.msst.net` 域内应答，对端主机名不能劫持外部域名。
 - TLS：没有关闭证书校验的配置。
 
-仍然依赖 Coordinator 的部分：对端公钥、官方中转列表及其公钥、房间状态和成员关系。Coordinator 被攻破时这些都会受影响；服务端的 C3、R3 上线后，设备 ID 抢注和中转注册冒充这两条路径会被堵上。
+仍然依赖 Coordinator 的部分：对端公钥、官方中转列表及其公钥、房间状态和成员关系。Coordinator 被攻破时这些都会受影响。服务端 C3、R3 的默认值已改为 `required`（Coordinator 同时默认 SQLite 持久化，保证密钥固定在重启后仍然有效），已有部署改配置后，设备 ID 抢注和中转注册冒充这两条路径即被堵上。客户端另外校验对端公钥与设备 ID 的对应关系（`nodes::peer_identity_ok`），Coordinator 无法在不暴力碰撞约 2^32 个密钥的情况下给已知设备换公钥。
 
 ## 4. 测试结果（3.1.6，提交前）
 
@@ -175,6 +175,6 @@ Coordinator 仍是信任根（下发公钥、中转列表、房间状态），�
 
 - 与 Core 3.1.5 及以前、以及内嵌 Android Core 的成员之间没有游戏发现（会显示为 `unsupported`）。这是“拒绝静默降级”的直接结果。
 - 中转侧：sdisc 可在旧客户端退出后退役；Coordinator 创建房间时对房间中转 `sdisc1` 的要求可以取消（见 `SERVER_FOLLOWUPS_3.1.md`）。
-- 服务端 C3（`device_key_proof` 改为 `required`）、R3（中转 `register_auth` 改为 `required`）仍待上线。
+- 服务端 C3、R3 的默认值已改为 `required`，但已有 Coordinator、中转的 `config.yaml` 里保留着首次启动时写入的旧值，需要手动修改（Coordinator 同时把 `persistence.driver` 改为 `sqlite`）。
 - Windows、macOS、Android 上放行的广播是否会被转发或回发，尚待真机验证（第 3 节）。
 - 3.1.5 审查中的低危项（身份文件权限、P2P pong 泄露设备 ID、对端公布的直连地址未过滤、网页端登录限速）尚未处理。
