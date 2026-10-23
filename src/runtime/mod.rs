@@ -933,7 +933,7 @@ async fn send_wg(state: &CoreState, device_id: &str, target: std::net::SocketAdd
 const RELAY_SELECT_ATTEMPTS: u32 = 3;
 const RELAY_SELECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 /// … then background retries, 30 s doubling up to 5 min, until one works
-/// or a newer selection (reconnect, room join) takes over.  (Until 3.1.7 a
+/// or a newer selection (reconnect, room join) takes over.  (Up to 3.1.7 a
 /// selection gave up after the quick attempts — e.g. at boot, before the
 /// network was up — and left relay-routed traffic down until the next
 /// coordinator reconnect.)

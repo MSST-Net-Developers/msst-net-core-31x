@@ -90,7 +90,7 @@ implemented — "copy as new rule" remains the way to change sources/ports.
 
 `mtu_override`: `null` or an integer in **1280–1500** (IPv6 minimum to
 Ethernet MTU).  `keepalive_secs`: `null` or a positive integer (clamped to
-5–30, as 3.0.x); since 3.1.7 it sets the relay keepalive only — the
+5–30, as 3.0.x); since 3.1.8 it sets the relay keepalive only — the
 direct-path liveness ping stays at 1 s (3.0.x applied it to both, so any
 value set slowed dead-direct-path detection from 5 s to up to a minute).  `preferred_relay`: `null` or a string.  Anything else →
 `invalid_settings`, nothing changed.

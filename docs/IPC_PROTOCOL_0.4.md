@@ -117,7 +117,7 @@ Add `"async": true` to a command request:
   the new mode is `direct`; `direct` → `direct` means the direct path
   switched to a better endpoint.  The punch-triggered `relay` → `probing`
   transition is now reported too.
-- **`PathChanged.reason`** (optional, additive): why the path changed —
+- **`PathChanged.reason`** (3.1.8; optional, additive): why the path changed —
   `probe` (probing started), `punch` (probing started on a coordinator
   `punch_request`), `upgrade` (a probed candidate qualified), `switch`
   (a clearly better direct endpoint), `no_pong` (the direct endpoint
