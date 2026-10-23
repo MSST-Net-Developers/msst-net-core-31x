@@ -83,6 +83,9 @@ pub struct Inbound {
     pub reply: Vec<Vec<u8>>,
     /// A decrypted IP packet.
     pub packet: Option<Vec<u8>>,
+    /// The message was a valid WireGuard message from the peer (any type,
+    /// keepalives included): the peer is answering.
+    pub authenticated: bool,
 }
 
 /// A peer's session state changed.
@@ -304,6 +307,7 @@ impl EncryptionEngine {
                 return out;
             }
         }
+        out.authenticated = true;
         if s.usable() {
             if s.state != EncState::Encrypted {
                 info!("encryption: session with {} established", device_id);

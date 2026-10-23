@@ -12,7 +12,8 @@
 //! ```
 //!
 //! Mode names on the wire (IPC `PathChanged`, path view, metrics) are
-//! [`PeerPathMode::name`]: `relay`, `probing`, `direct`.
+//! [`PeerPathMode::name`]: `relay`, `probing`, `direct`; every transition
+//! records its [`PathChangeReason`].
 //!
 //! The path state is pure data — the actual probing/keepalive logic lives
 //! in the runtime's path monitor loop.  This module provides:
@@ -20,7 +21,7 @@
 //! - `PeerPath` — per-peer state (mode, probe stats, RTT, loss)
 //! - Transition helpers with hold timers and quality thresholds
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -47,10 +48,22 @@ pub const RTT_MIN_BASELINE_MS: f64 = 5.0;
 pub const RTT_EWMA_ALPHA: f64 = 0.125;
 /// Minimum consecutive successful probes before upgrading to Direct.
 pub const MIN_PROBE_OK: u32 = 5;
-/// P2P RTT must be ≤ this fraction of relay RTT to upgrade.
+/// To upgrade, the P2P RTT must be at most this multiple of the relay
+/// path RTT (1.0: no worse than the relay).
 pub const UPGRADE_RTT_FACTOR: f64 = 1.0;
 /// While probing, measure the end-to-end relay path RTT this often (3.0.x).
 pub const RELAY_PATH_PROBE_INTERVAL_MS: u64 = 2000;
+/// A relay-path probe still unanswered after this long is given up.
+pub const RELAY_PATH_PROBE_TIMEOUT_MS: u64 = 10_000;
+/// WireGuard traffic sent over the direct path and unanswered this long
+/// means the path drops data even if it answers pings (WireGuard answers
+/// any data with at least a keepalive within 10 s, a handshake within 5 s).
+pub const DATA_STALL_MS: u64 = 20_000;
+/// A stalled endpoint is not upgraded to for this long; doubled per
+/// further stall …
+pub const STALL_EXCLUDE_BASE_SECS: i64 = 60;
+/// … up to this.
+pub const STALL_EXCLUDE_MAX_SECS: i64 = 600;
 /// While direct, probe the other candidates this often (3.0.x).
 pub const BG_PROBE_INTERVAL_MS: u64 = 5000;
 /// Switch to another direct candidate when its RTT is at most this
@@ -71,6 +84,57 @@ pub fn is_lan_endpoint(addr: SocketAddr) -> bool {
             o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
         }
         std::net::IpAddr::V6(_) => false,
+    }
+}
+
+/// Whether two candidate lists hold the same endpoints, in any order.
+fn same_endpoints(a: &[SocketAddr], b: &[SocketAddr]) -> bool {
+    a.len() == b.len() && a.iter().all(|ep| b.contains(ep))
+}
+
+// ── PathChangeReason ──────────────────────────────────────────────────────
+
+/// Why a peer's path last changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathChangeReason {
+    /// Probing started: candidates are known and no backoff is pending.
+    Probe,
+    /// Probing started on a coordinator `punch_request`.
+    Punch,
+    /// A probed candidate met the upgrade criteria.
+    Upgrade,
+    /// A clearly better direct candidate took over.
+    Switch,
+    /// The direct endpoint stopped answering keepalives.
+    NoPong,
+    /// Keepalive loss on the direct path above the threshold.
+    Loss,
+    /// A sustained RTT spike on the direct path.
+    RttSpike,
+    /// WireGuard traffic over the direct path went unanswered although
+    /// its pings were answered.
+    DataStalled,
+    /// No probe candidate answered.
+    ProbeFailed,
+    /// P2P was disabled in the network settings.
+    P2pDisabled,
+}
+
+impl PathChangeReason {
+    /// The reason's wire name (IPC `PathChanged.reason`).
+    pub fn name(self) -> &'static str {
+        match self {
+            PathChangeReason::Probe => "probe",
+            PathChangeReason::Punch => "punch",
+            PathChangeReason::Upgrade => "upgrade",
+            PathChangeReason::Switch => "switch",
+            PathChangeReason::NoPong => "no_pong",
+            PathChangeReason::Loss => "loss",
+            PathChangeReason::RttSpike => "rtt_spike",
+            PathChangeReason::DataStalled => "data_stalled",
+            PathChangeReason::ProbeFailed => "probe_failed",
+            PathChangeReason::P2pDisabled => "p2p_disabled",
+        }
     }
 }
 
@@ -116,8 +180,13 @@ impl PeerPathMode {
 #[derive(Debug, Clone)]
 pub struct PeerPath {
     pub mode: PeerPathMode,
+    /// Why the mode last changed (`None` before the first transition).
+    pub last_change: Option<PathChangeReason>,
     /// No proactive upgrades before this timestamp (Unix seconds).
     pub hold_until: i64,
+    /// The hold was armed by leaving a direct path: a `punch_request`
+    /// keeps it (only network changes clear it).
+    pub hold_after_downgrade: bool,
 
     // ── Probing state ─────────────────────────────────────────────────────
     /// Candidate endpoints sorted IPv6-first.
@@ -149,7 +218,7 @@ pub struct PeerPath {
 
     // ── Relay-path probing ────────────────────────────────────────────────
     /// Pending relay-path probe pings: seq → sent_at_ms.
-    pub relay_path_pending: HashSet<u32>,
+    pub relay_path_pending: HashMap<u32, u64>,
     /// EWMA relay-path RTT (us → relay → peer → relay → us).
     pub relay_path_rtt_ms: Option<f64>,
     /// Last relay-path probe sent (ms).
@@ -162,13 +231,21 @@ pub struct PeerPath {
     pub next_probe_at: i64,
     /// The candidates of the last failed round: new ones are probed at once.
     pub failed_candidates: Vec<SocketAddr>,
+
+    // ── Data-plane stalls ─────────────────────────────────────────────────
+    /// Endpoints whose direct path dropped WireGuard traffic: endpoint →
+    /// (stalls so far, not upgraded to before this Unix time).  Kept across
+    /// mode changes; cleared on a network change.
+    pub stalled: HashMap<SocketAddr, (u32, i64)>,
 }
 
 impl PeerPath {
     pub fn new() -> Self {
         PeerPath {
             mode: PeerPathMode::Relay,
+            last_change: None,
             hold_until: 0,
+            hold_after_downgrade: false,
             probe_candidates: Vec::new(),
             probe_consecutive_ok: HashMap::new(),
             probe_rtt_ms: HashMap::new(),
@@ -181,19 +258,22 @@ impl PeerPath {
             next_seq: 0,
             last_keepalive_sent_ms: 0,
             last_bg_probe_sent_ms: 0,
-            relay_path_pending: HashSet::new(),
+            relay_path_pending: HashMap::new(),
             relay_path_rtt_ms: None,
             last_relay_path_probe_ms: 0,
             probe_failures: 0,
             next_probe_at: 0,
             failed_candidates: Vec::new(),
+            stalled: HashMap::new(),
         }
     }
 
     /// Transition to Relay mode: start the hold timer, reset all state
-    /// except the probe backoff (3.0.x `set_relay`).
-    pub fn set_relay(&mut self, now_unix: i64) {
+    /// except the probe backoff and stall records (3.0.x `set_relay`).
+    pub fn set_relay(&mut self, now_unix: i64, reason: PathChangeReason) {
+        self.hold_after_downgrade = self.mode.is_direct();
         self.mode = PeerPathMode::Relay;
+        self.last_change = Some(reason);
         self.hold_until = now_unix + HOLD_DURATION_SECS;
         self.consecutive_no_pong = 0;
         self.consecutive_spikes = 0;
@@ -211,7 +291,10 @@ impl PeerPath {
     /// Transition to Probing mode with the given candidates.  Does not touch
     /// the hold timer (only the upgrade decision respects it) and keeps the
     /// statistics of candidates seen before (3.0.x `start_probing`).
-    pub fn start_probing(&mut self, candidates: Vec<SocketAddr>, _now_unix: i64) {
+    pub fn start_probing(&mut self, candidates: Vec<SocketAddr>, _now_unix: i64, reason: PathChangeReason) {
+        if self.mode != PeerPathMode::Probing {
+            self.last_change = Some(reason);
+        }
         self.mode = PeerPathMode::Probing;
         self.probe_consecutive_ok = candidates
             .iter()
@@ -226,8 +309,9 @@ impl PeerPath {
 
     /// Transition to Direct mode with the active endpoint: start the hold
     /// timer, reset active-path metrics (3.0.x `set_direct`).
-    pub fn set_direct(&mut self, endpoint: SocketAddr, now_unix: i64) {
+    pub fn set_direct(&mut self, endpoint: SocketAddr, now_unix: i64, reason: PathChangeReason) {
         self.mode = PeerPathMode::Direct { endpoint };
+        self.last_change = Some(reason);
         self.hold_until = now_unix + HOLD_DURATION_SECS;
         self.probe_candidates.retain(|ep| ep != &endpoint);
         self.probe_miss = self.probe_candidates.iter().map(|&ep| (ep, 0u8)).collect();
@@ -253,6 +337,26 @@ impl PeerPath {
         self.failed_candidates = candidates.to_vec();
     }
 
+    /// The direct path to `endpoint` dropped WireGuard traffic: do not
+    /// upgrade to it again for a while (60 s, 120 s, … up to 10 min).
+    pub fn note_stall(&mut self, endpoint: SocketAddr, now_unix: i64) {
+        let entry = self.stalled.entry(endpoint).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        let shift = (entry.0 - 1).min(16);
+        entry.1 = now_unix + (STALL_EXCLUDE_BASE_SECS << shift).min(STALL_EXCLUDE_MAX_SECS);
+    }
+
+    /// Whether `endpoint` is excluded after a data-plane stall.
+    pub fn is_stalled(&self, endpoint: SocketAddr, now_unix: i64) -> bool {
+        self.stalled.get(&endpoint).is_some_and(|&(_, until)| now_unix < until)
+    }
+
+    /// Whether the candidate list is the one whose probe round failed last
+    /// (order does not matter).
+    pub fn failed_before(&self, candidates: &[SocketAddr]) -> bool {
+        same_endpoints(candidates, &self.failed_candidates)
+    }
+
     /// Forget the probe backoff (new information: a working path, new
     /// candidates, a punch request, a network change).
     pub fn reset_backoff(&mut self) {
@@ -263,7 +367,7 @@ impl PeerPath {
 
     /// Whether a new probe round may start with these candidates.
     pub fn may_probe(&self, candidates: &[SocketAddr], now_unix: i64) -> bool {
-        !candidates.is_empty() && (now_unix >= self.next_probe_at || candidates != self.failed_candidates)
+        !candidates.is_empty() && (now_unix >= self.next_probe_at || !self.failed_before(candidates))
     }
 
     /// Whether the background-probed `candidate` is clearly better than
@@ -391,13 +495,13 @@ mod tests {
     #[test]
     fn relay_to_probing() {
         let mut pp = PeerPath::new();
-        pp.start_probing(vec![v4(12345), v6(12345)], 1000);
+        pp.start_probing(vec![v4(12345), v6(12345)], 1000, PathChangeReason::Probe);
         assert_eq!(pp.mode, PeerPathMode::Probing);
         assert_eq!(pp.probe_candidates.len(), 2);
         // Starting a probe doesn't arm the hold timer (3.0.x) …
         assert!(!pp.hold_active(1000));
         // … falling back to relay does.
-        pp.set_relay(1000);
+        pp.set_relay(1000, PathChangeReason::NoPong);
         assert!(pp.hold_active(1000));
         assert!(!pp.hold_active(1031));
         assert!(pp.probe_candidates.is_empty());
@@ -406,21 +510,21 @@ mod tests {
     #[test]
     fn probing_to_direct() {
         let mut pp = PeerPath::new();
-        pp.start_probing(vec![v4(12345)], 1000);
+        pp.start_probing(vec![v4(12345)], 1000, PathChangeReason::Probe);
         pp.probe_consecutive_ok.insert(v4(12345), MIN_PROBE_OK);
         pp.probe_rtt_ms.insert(v4(12345), 20.0);
         assert!(pp.can_upgrade(v4(12345), Some(30.0)));
-        pp.set_direct(v4(12345), 1000);
+        pp.set_direct(v4(12345), 1000, PathChangeReason::Upgrade);
         assert_eq!(pp.mode, PeerPathMode::Direct { endpoint: v4(12345) });
     }
 
     #[test]
     fn direct_to_relay_on_no_pong() {
         let mut pp = PeerPath::new();
-        pp.set_direct(v4(12345), 1000);
+        pp.set_direct(v4(12345), 1000, PathChangeReason::Upgrade);
         pp.consecutive_no_pong = MAX_CONSECUTIVE_NO_PONG;
         assert!(pp.consecutive_no_pong >= MAX_CONSECUTIVE_NO_PONG);
-        pp.set_relay(1010);
+        pp.set_relay(1010, PathChangeReason::NoPong);
         assert_eq!(pp.mode, PeerPathMode::Relay);
     }
 
@@ -520,7 +624,7 @@ mod tests {
     #[test]
     fn hold_timer() {
         let mut pp = PeerPath::new();
-        pp.set_relay(1000);
+        pp.set_relay(1000, PathChangeReason::NoPong);
         assert!(pp.hold_active(1000));
         assert!(pp.hold_active(1029));
         assert!(!pp.hold_active(1030));

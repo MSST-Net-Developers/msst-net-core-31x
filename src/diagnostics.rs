@@ -28,12 +28,44 @@ fn err(code: &str, m: impl Into<String>) -> IpcError {
 // Traffic counters (hot path: one read lock + one atomic add)
 // ---------------------------------------------------------------------------
 
-/// Packets sent to / received from / dropped for one peer.
+/// Packets sent to / received from / dropped for one peer, on its current
+/// path (reset when the path changes).
 #[derive(Debug, Default)]
 pub struct TrafficStats {
     pub tx: AtomicU64,
     pub rx: AtomicU64,
     pub drop: AtomicU64,
+    /// When the first WireGuard message expecting an answer (data, a
+    /// handshake initiation) went out since the peer last sent us one (ms;
+    /// 0: none pending).  Feeds the scheduler's data-stall check.
+    pub unanswered_since_ms: AtomicU64,
+}
+
+/// WireGuard messages to `peer` went out at `now_ms`.  Data (not a bare
+/// keepalive) and handshake initiations are answered by a peer that gets
+/// them, so they start the unanswered clock.
+pub fn note_wg_sent(state: &CoreState, peer: &str, msgs: &[Vec<u8>], now_ms: u64) {
+    // WireGuard: type 1 = initiation, 4 = data (32 bytes: a keepalive).
+    let expects_answer = |m: &Vec<u8>| matches!(m.first(), Some(1)) || (m.first() == Some(&4) && m.len() > 32);
+    if msgs.iter().any(expects_answer) {
+        let _ = traffic(state, peer).unanswered_since_ms.compare_exchange(0, now_ms.max(1), Relaxed, Relaxed);
+    }
+}
+
+/// A valid WireGuard message from `peer` arrived.
+pub fn note_wg_answered(state: &CoreState, peer: &str) {
+    traffic(state, peer).unanswered_since_ms.store(0, Relaxed);
+}
+
+/// Per peer: when its unanswered WireGuard traffic started (ms).
+pub fn unanswered_since(state: &CoreState) -> HashMap<String, u64> {
+    state
+        .traffic
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(id, s)| Some((id.clone(), s.unanswered_since_ms.load(Relaxed))).filter(|(_, t)| *t != 0))
+        .collect()
 }
 
 pub type TrafficMap = std::sync::RwLock<HashMap<String, Arc<TrafficStats>>>;
@@ -365,6 +397,27 @@ mod tests {
         assert_eq!(v["peers"][0]["rx"], 2);
         reset_traffic(&state, "device-b");
         assert_eq!(traffic_view(&state).await["peers"][0]["tx"], 0);
+    }
+
+    #[tokio::test]
+    async fn unanswered_wireguard_traffic() {
+        let (state, _ipc) = core_state("unanswered").await;
+        let (keepalive, data, initiation) = (vec![4u8; 32], vec![4u8; 33], vec![1u8; 148]);
+        // A bare keepalive expects no answer.
+        note_wg_sent(&state, "device-b", &[keepalive], 1000);
+        assert!(unanswered_since(&state).is_empty());
+        // Data does; the clock keeps its first send …
+        note_wg_sent(&state, "device-b", std::slice::from_ref(&data), 2000);
+        note_wg_sent(&state, "device-b", &[data], 3000);
+        assert_eq!(unanswered_since(&state).get("device-b"), Some(&2000));
+        // … until the peer answers, …
+        note_wg_answered(&state, "device-b");
+        assert!(unanswered_since(&state).is_empty());
+        note_wg_sent(&state, "device-b", &[initiation], 4000);
+        assert_eq!(unanswered_since(&state).get("device-b"), Some(&4000));
+        // … or the path changes.
+        reset_traffic(&state, "device-b");
+        assert!(unanswered_since(&state).is_empty());
     }
 
     #[tokio::test]

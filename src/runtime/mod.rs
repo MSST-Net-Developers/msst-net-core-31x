@@ -239,18 +239,17 @@ async fn inbound_loop(
                     msst_packet::TYPE_P2P_PONG => {
                         // Process pong for path upgrade.
                         let peer_id = msst_packet::decode_id(pkt.src_id);
-                        let (seq, sent_ms) = match msst_packet::decode_ping_payload(&pkt.payload) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        let rtt_ms = (current_time_ms().saturating_sub(sent_ms)) as f64;
+                        // The echoed send time is the sender's to choose: the
+                        // RTT is measured against our own record of `seq`.
+                        let Some((seq, _)) = msst_packet::decode_ping_payload(&pkt.payload) else { continue };
                         let src_addr = msst_core_state::net::relay::unmap_addr(src);
                         let relay_rtt = {
                             let net = state.net.read().await;
                             net.relay_rtt.for_peer(net.relay_for_peer(&peer_id), net.relay_addr.as_deref())
                         };
                         let mut sched = state.scheduler.lock().await;
-                        let actions = sched.handle_pong(&peer_id, src_addr, seq, rtt_ms, relay_rtt, now);
+                        let actions = sched.handle_pong(&peer_id, src_addr, seq, current_time_ms(), relay_rtt, now);
+                        report_path_changes(&state, &sched, &actions);
                         drop(sched);
                         for action in actions {
                             execute_scheduler_action(&action, &state, &udp).await;
@@ -332,9 +331,12 @@ async fn scheduler_tick_loop(state: Arc<CoreState>) {
         if device_id.is_empty() { continue; }
 
         // Run the scheduler tick.
+        let unanswered = crate::diagnostics::unanswered_since(&state);
         let actions = {
             let mut sched = state.scheduler.lock().await;
-            sched.tick(now, now_ms, &endpoints, &relay_routed)
+            let actions = sched.tick(now, now_ms, &endpoints, &relay_routed, &unanswered);
+            report_path_changes(&state, &sched, &actions);
+            actions
         };
 
         // Execute all returned actions.
@@ -568,7 +570,9 @@ async fn coordinator_event_loop(
                 // Dispatch to scheduler.
                 let actions = {
                     let mut sched = state.scheduler.lock().await;
-                    sched.handle_punch_request(&peer_id, &parsed_eps, now, now_ms)
+                    let actions = sched.handle_punch_request(&peer_id, &parsed_eps, now, now_ms);
+                    report_path_changes(state, &sched, &actions);
+                    actions
                 };
 
                 // Execute scheduler actions (send punch packets).
@@ -752,6 +756,9 @@ async fn wg_inbound(state: &CoreState, device_id: &str, msg: &[u8], src: std::ne
         (enc.inbound(device_id, msg, now), enc.take_changes())
     };
     state.emit_encryption_changes(changes);
+    if res.authenticated {
+        crate::diagnostics::note_wg_answered(state, device_id);
+    }
     if !res.reply.is_empty() {
         let target = peer_target(state, device_id).await.unwrap_or(src);
         send_wg(state, device_id, target, &res.reply).await;
@@ -858,7 +865,6 @@ async fn on_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: crate::
             }
             let src = msst_core_state::net::relay::unmap_addr(src);
             let now = current_unix();
-            let rtt_ms = current_time_ms().saturating_sub(probe.sent_ms) as f64;
             let relay_rtt = {
                 let net = state.net.read().await;
                 // Back through our own relay: its binding for us works.
@@ -867,7 +873,12 @@ async fn on_tunnel_probe(state: &Arc<CoreState>, device_id: &str, probe: crate::
                 }
                 net.relay_rtt.for_peer(net.relay_for_peer(device_id), net.relay_addr.as_deref())
             };
-            let actions = state.scheduler.lock().await.handle_pong(device_id, src, probe.seq, rtt_ms, relay_rtt, now);
+            let actions = {
+                let mut sched = state.scheduler.lock().await;
+                let actions = sched.handle_pong(device_id, src, probe.seq, current_time_ms(), relay_rtt, now);
+                report_path_changes(state, &sched, &actions);
+                actions
+            };
             for action in actions {
                 execute_scheduler_action(&action, state, &state.udp_socket).await;
             }
@@ -902,6 +913,7 @@ async fn send_wg(state: &CoreState, device_id: &str, target: std::net::SocketAdd
             return false;
         }
     }
+    crate::diagnostics::note_wg_sent(state, device_id, msgs, current_time_ms());
     true
 }
 
@@ -1258,6 +1270,30 @@ fn room_peer_data(p: &crate::coordinator::messages::RoomStatePeer) -> crate::nod
 // Scheduler action execution
 // ---------------------------------------------------------------------------
 
+/// Report the path changes among `actions` while the scheduler that made
+/// them is still locked.  Two tasks change paths (the tick, inbound pongs);
+/// reporting after the lock is released could emit their `PathChanged`
+/// events in the opposite order, leaving a Controller on a stale mode.
+fn report_path_changes(state: &CoreState, sched: &msst_core_state::scheduler::P2PScheduler, actions: &[SchedulerAction]) {
+    for action in actions {
+        let SchedulerAction::PathModeChanged { peer_id, old_mode, new_mode, endpoint, reason } = action else { continue };
+        // Logged by the scheduler.  Traffic counters describe one path.
+        crate::diagnostics::reset_traffic(state, peer_id);
+        if let Some(m) = state.metrics.get() {
+            let (relay, probing, direct) = sched.mode_counts();
+            m.update_path_modes(relay as i64, probing as i64, direct as i64);
+        }
+        state.next_generation();
+        state.emit_ipc_event(msst_ipc_protocol::IpcEvent::PathChanged {
+            device_id: peer_id.clone(),
+            old_mode: old_mode.clone(),
+            new_mode: new_mode.clone(),
+            endpoint: endpoint.map(|e| e.to_string()),
+            reason: reason.map(str::to_string),
+        });
+    }
+}
+
 /// Execute a single `SchedulerAction` from the P2P scheduler.
 async fn execute_scheduler_action(
     action: &SchedulerAction,
@@ -1270,20 +1306,8 @@ async fn execute_scheduler_action(
                 debug!("scheduler: UDP send to {} failed: {}", target, e);
             }
         }
-        SchedulerAction::PathModeChanged { peer_id, old_mode, new_mode, endpoint } => {
-            // Logged by the scheduler.  Traffic counters describe one path.
-            crate::diagnostics::reset_traffic(state, peer_id);
-            if let Some(m) = state.metrics.get() {
-                let (relay, probing, direct) = state.scheduler.lock().await.mode_counts();
-                m.update_path_modes(relay as i64, probing as i64, direct as i64);
-            }
-            state.next_generation();
-            state.emit_ipc_event(msst_ipc_protocol::IpcEvent::PathChanged {
-                device_id: peer_id.clone(),
-                old_mode: old_mode.clone(),
-                new_mode: new_mode.clone(),
-                endpoint: endpoint.map(|e| e.to_string()),
-            });
+        SchedulerAction::PathModeChanged { .. } => {
+            // Reported under the scheduler lock (`report_path_changes`).
         }
         SchedulerAction::RelayPathProbe { peer_id, seq, sent_ms } => {
             let (Some(src), Some(dst)) = (vpn_ipv4(state).await, peer_ipv4(state, peer_id).await) else { return };
@@ -1617,6 +1641,33 @@ mod tests {
         let mut bad = ipv4(6, 0, false, &tcp_syn(22));
         bad[0] = 0x44;
         assert!(parse_ip_packet(&bad).is_none());
+    }
+
+    // ── Path change events ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn path_changes_are_reported_with_their_reason() {
+        let state = test_state().await;
+        let mut events = state.subscribe_events();
+        let peer = "device-22222222";
+        let ep: std::net::SocketAddr = "203.0.113.7:21031".parse().unwrap();
+        {
+            let mut sched = state.scheduler.lock().await;
+            let actions = sched.handle_punch_request(peer, &[ep], current_unix(), current_time_ms());
+            report_path_changes(&state, &sched, &actions);
+            // Executing the action afterwards does not report it again.
+            drop(sched);
+            for a in &actions {
+                execute_scheduler_action(a, &state, &state.udp_socket).await;
+            }
+        }
+        let mut seen = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            if let msst_ipc_protocol::IpcEvent::PathChanged { old_mode, new_mode, reason, .. } = e {
+                seen.push((old_mode, new_mode, reason));
+            }
+        }
+        assert_eq!(seen, [("relay".to_string(), "probing".to_string(), Some("punch".to_string()))]);
     }
 
     // ── Outbound routing (end-to-end over loopback UDP) ──────────────────
@@ -2195,7 +2246,7 @@ mod tests {
             sched.handle_punch_request(&b.id.device.id, &[candidate], current_unix(), current_time_ms());
             let routed = std::collections::HashSet::from([b.id.device.id.clone()]);
             let eps = std::collections::HashMap::from([(b.id.device.id.clone(), vec![candidate])]);
-            sched.tick(current_unix(), current_time_ms(), &eps, &routed)
+            sched.tick(current_unix(), current_time_ms(), &eps, &routed, &std::collections::HashMap::new())
         };
         assert!(actions.iter().any(|x| matches!(x, SchedulerAction::RelayPathProbe { .. })));
         seen_a.lock().unwrap().clear();

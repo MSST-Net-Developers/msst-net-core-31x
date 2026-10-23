@@ -283,12 +283,18 @@ pub enum IpcEvent {
     /// A peer's path mode changed.  Modes are `relay`, `probing` or
     /// `direct`; `endpoint` is the direct endpoint (`direct` only — a
     /// `direct` → `direct` change is a switch to another endpoint).
+    /// `reason` says why: `probe`, `punch`, `upgrade`, `switch`, `no_pong`,
+    /// `loss`, `rtt_spike`, `data_stalled`, `probe_failed` or
+    /// `p2p_disabled` (new values may be added; treat unknown ones as
+    /// opaque).
     PathChanged {
         device_id: String,
         old_mode: String,
         new_mode: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         endpoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     /// A peer's WireGuard session state changed.  States are `unknown`,
@@ -513,8 +519,27 @@ mod tests {
                 old_mode: "relay".into(),
                 new_mode: "direct".into(),
                 endpoint: Some("203.0.113.7:21031".into()),
+                reason: Some("upgrade".into()),
             },
         });
+    }
+
+    #[test]
+    fn event_path_changed_without_reason() {
+        // The shape older Cores send: no `reason` key at all.
+        let msg = IpcMessage::Event {
+            seq: None,
+            body: IpcEvent::PathChanged {
+                device_id: "device-deadbeef".into(),
+                old_mode: "direct".into(),
+                new_mode: "relay".into(),
+                endpoint: None,
+                reason: None,
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("reason"), "{}", json);
+        roundtrip(&msg);
     }
 
     #[test]

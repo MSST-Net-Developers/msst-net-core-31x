@@ -45,7 +45,8 @@ pub struct NetworkSettings {
     /// TUN MTU override; applied on next start.
     #[serde(default)]
     pub mtu_override: Option<u16>,
-    /// Relay + P2P keepalive interval (seconds).
+    /// Relay keepalive interval (seconds).  The P2P liveness ping does not
+    /// follow it: it detects a dead direct path, so it stays at 1 s.
     #[serde(default)]
     pub keepalive_secs: Option<u32>,
     #[serde(default)]
@@ -102,8 +103,11 @@ impl NetworkSettings {
         self.keepalive_secs.map(u64::from).unwrap_or(DEFAULT_RELAY_KEEPALIVE_SECS)
     }
 
+    /// The direct-path liveness ping interval: fixed.  (3.0.x used
+    /// `keepalive_secs` for it too, so any value set — 5–30 s — slowed
+    /// dead-path detection from 5 s to up to a minute.)
     pub fn p2p_keepalive_secs(&self) -> i64 {
-        self.keepalive_secs.map(i64::from).unwrap_or(DEFAULT_P2P_KEEPALIVE_SECS)
+        DEFAULT_P2P_KEEPALIVE_SECS
     }
 
     /// The JSON shape returned by `GetNetSettings` (3.0.x `GET /net/settings`).
@@ -201,6 +205,15 @@ mod tests {
     fn defaults_match_3_0_x() {
         let s = NetworkSettings::default();
         assert_eq!((s.relay_keepalive_secs(), s.p2p_keepalive_secs(), s.mtu_override), (25, 1, None));
+    }
+
+    #[test]
+    fn keepalive_setting_is_for_the_relay_only() {
+        let mut s = NetworkSettings::default();
+        s.apply_patch(&json!({"keepalive_secs": 25})).unwrap();
+        assert_eq!((s.relay_keepalive_secs(), s.p2p_keepalive_secs()), (25, 1));
+        s.apply_patch(&json!({"keepalive_secs": 1})).unwrap();
+        assert_eq!((s.relay_keepalive_secs(), s.p2p_keepalive_secs()), (5, 1));
     }
 
     #[test]

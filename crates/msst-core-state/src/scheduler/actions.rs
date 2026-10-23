@@ -16,12 +16,15 @@ pub enum SchedulerAction {
         target: SocketAddr,
     },
     /// A peer's path mode (or direct endpoint) changed.  Modes are
-    /// `relay`, `probing` or `direct`; `endpoint` is the direct endpoint.
+    /// `relay`, `probing` or `direct`; `endpoint` is the direct endpoint;
+    /// `reason` is a [`PathChangeReason`](crate::net::path::PathChangeReason)
+    /// wire name.
     PathModeChanged {
         peer_id: String,
         old_mode: String,
         new_mode: String,
         endpoint: Option<SocketAddr>,
+        reason: Option<&'static str>,
     },
     /// Send relay-path probe `seq` to the peer inside its WireGuard session,
     /// over the relay route; feed the pong to `handle_pong`.

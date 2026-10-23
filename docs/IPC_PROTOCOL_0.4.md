@@ -117,6 +117,16 @@ Add `"async": true` to a command request:
   the new mode is `direct`; `direct` → `direct` means the direct path
   switched to a better endpoint.  The punch-triggered `relay` → `probing`
   transition is now reported too.
+- **`PathChanged.reason`** (optional, additive): why the path changed —
+  `probe` (probing started), `punch` (probing started on a coordinator
+  `punch_request`), `upgrade` (a probed candidate qualified), `switch`
+  (a clearly better direct endpoint), `no_pong` (the direct endpoint
+  stopped answering), `loss`, `rtt_spike`, `data_stalled` (pings answered
+  but WireGuard traffic over the direct path unanswered for 20 s; the
+  endpoint is then not used for 1 min, doubling up to 10 min, until a
+  network change), `probe_failed` (no candidate answered) or
+  `p2p_disabled`.  Treat unknown values as opaque.  `PathChanged` events
+  are emitted in the order the changes happened.
 - **`GetPathView`:** a direct peer also lists its background-probed
   candidates; a peer whose probes keep failing has `probe_failures` and
   `next_probe_at` (Unix seconds — no probing before then: 30 s after the
