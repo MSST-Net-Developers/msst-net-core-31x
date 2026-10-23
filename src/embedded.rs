@@ -113,20 +113,14 @@ impl EmbeddedCore {
         }
     }
 
-    /// The device's network changed (Wi-Fi ↔ mobile): flush DNS, restart
-    /// path probing promptly and re-announce our endpoints (3.0.x
-    /// network-change handler, debounced by the caller).
+    /// The device's network changed (Wi-Fi ↔ mobile; debounced by the
+    /// caller): flush DNS, reconnect to the coordinator, re-register with
+    /// the relays, restart path probing promptly and re-announce our
+    /// endpoints ([`crate::netwatch::on_network_changed`]).
     pub fn network_changed(&self) {
         let Some(core) = self.core.as_ref() else { return };
         let state = core.state.clone();
-        self.runtime.block_on(async move {
-            info!("embedded: network changed — re-detecting endpoints");
-            if let Some(dns) = state.dns.get() {
-                dns.clear_cache();
-            }
-            state.scheduler.lock().await.clear_hold_timers();
-            crate::endpoints::spawn_detect_and_report(state.clone());
-        });
+        self.runtime.block_on(async move { crate::netwatch::on_network_changed(&state).await });
     }
 
     /// Shut Core down and flush its state.

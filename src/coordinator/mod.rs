@@ -4,7 +4,10 @@
 //! - WebSocket connection with bounded exponential backoff
 //! - Device registration on every (re)connect
 //! - Re-joining rooms (`join`) after a reconnect
-//! - Node heartbeat, room keepalive and WS ping, bound to the connection
+//! - Node heartbeat, room keepalive and WS ping, bound to the connection;
+//!   a connection that receives nothing — not even the pong to our ping —
+//!   for [`WS_IDLE_TIMEOUT`] is dead (e.g. its local address went away in a
+//!   network switch, where TCP alone takes many minutes to notice)
 //! - Bearer-token auth: OIDC, else a guest token (see `credentials`).  The
 //!   OIDC access token is short-lived (5 min on the MSST platform) and the
 //!   Coordinator checks it only at the WS handshake but on every HTTP API
@@ -54,6 +57,9 @@ use tracing::{debug, error, info, warn};
 
 /// WS-level ping to keep NAT/proxy state alive.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Nothing received for this long (two pings unanswered): the connection
+/// is dead; reconnect.
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 /// `node_heartbeat` must be sent before the server's 90-second timeout.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// `room_keepalive` interval (coordinator room TTL is 2 minutes).
@@ -150,6 +156,8 @@ pub struct CoordinatorClient {
     credential: std::sync::RwLock<Option<Credential>>,
     /// Drops the current connection so the next one uses new credentials.
     reconnect: Notify,
+    /// Cuts a reconnect backoff short (the network changed).
+    reconnect_now: Notify,
     /// Serializes OIDC refreshes (a refresh token may be single-use).
     refresh_lock: tokio::sync::Mutex<()>,
     /// The access token the last refresh replaced: a request still carrying
@@ -162,6 +170,9 @@ pub struct CoordinatorClient {
     /// refreshing on an HTTP 401.
     core: std::sync::OnceLock<std::sync::Weak<CoreState>>,
     pub(crate) refresh_policy: RefreshPolicy,
+    /// WS ping interval and idle timeout ([`WS_PING_INTERVAL`],
+    /// [`WS_IDLE_TIMEOUT`]; shorter in tests).
+    pub(crate) ws_timing: (Duration, Duration),
 }
 
 /// The current state of the Coordinator connection.
@@ -276,12 +287,23 @@ impl CoordinatorClient {
             guest: std::sync::Mutex::new(None),
             credential: std::sync::RwLock::new(None),
             reconnect: Notify::new(),
+            reconnect_now: Notify::new(),
             refresh_lock: tokio::sync::Mutex::new(()),
             previous_oidc: std::sync::Mutex::new(None),
             auth_changed: Notify::new(),
             core: std::sync::OnceLock::new(),
             refresh_policy: RefreshPolicy::DEFAULT,
+            ws_timing: (WS_PING_INTERVAL, WS_IDLE_TIMEOUT),
         }
+    }
+
+    /// The local network changed: the current connection may be bound to
+    /// an address that is gone.  Drop it and connect again at once (also
+    /// cutting a pending reconnect backoff short).
+    pub fn network_changed(&self) {
+        info!("coordinator: network changed — reconnecting");
+        self.reconnect.notify_waiters();
+        self.reconnect_now.notify_one();
     }
 
     fn attach(&self, core: &Arc<CoreState>) {
@@ -473,8 +495,10 @@ impl CoordinatorClient {
                 }
             }
             info!("coordinator: reconnecting in {}s…", backoff);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            backoff = next_backoff(backoff);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(backoff)) => backoff = next_backoff(backoff),
+                _ = self.reconnect_now.notified() => backoff = BACKOFF_MIN_SECS,
+            }
         }
     }
 
@@ -582,9 +606,14 @@ impl CoordinatorClient {
         let _ = self.event_tx.send(CoordinatorEvent::Connected).await;
 
         let (ws_writer, mut ws_reader) = ws_stream.split();
-        let writer_task = tokio::spawn(writer_loop(ws_writer, rx, core.clone()));
+        let (ping_interval, idle_timeout) = self.ws_timing;
+        let writer_task = tokio::spawn(writer_loop(ws_writer, rx, core.clone(), ping_interval));
+        // A permit stored before this connection is stale.
+        let _ = tokio::time::timeout(Duration::ZERO, self.reconnect_now.notified()).await;
 
         let mut outcome = ConnectOutcome::Disconnected;
+        let idle = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle);
         loop {
             let msg = tokio::select! {
                 m = ws_reader.next() => match m {
@@ -592,7 +621,12 @@ impl CoordinatorClient {
                     None => break,
                 },
                 _ = self.reconnect.notified() => break,
+                _ = &mut idle => {
+                    warn!("coordinator: nothing received for {}s (ping unanswered) — connection lost, reconnecting", idle_timeout.as_secs());
+                    break;
+                }
             };
+            idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
             match msg {
                 Ok(Message::Text(text)) => match self.parse_incoming(&text) {
                     Ok(Some(CoordinatorEvent::Error { code: Some(code), .. }))
@@ -941,12 +975,12 @@ impl CoordinatorClient {
 /// Drains the connection's outgoing queue and emits the periodic WS ping,
 /// `node_heartbeat` and `room_keepalive`.  Exits on the first write error;
 /// the reader loop notices and tears the connection down.
-async fn writer_loop<S>(mut ws: S, mut rx: mpsc::Receiver<String>, core: Arc<CoreState>)
+async fn writer_loop<S>(mut ws: S, mut rx: mpsc::Receiver<String>, core: Arc<CoreState>, ping_interval: Duration)
 where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
-    let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+    let mut ping = tokio::time::interval(ping_interval);
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut keepalive = tokio::time::interval(ROOM_KEEPALIVE_INTERVAL);
     for t in [&mut ping, &mut heartbeat, &mut keepalive] {
@@ -1560,6 +1594,87 @@ mod tests {
         assert_eq!(client.send("x").await, Err(NotConnected));
     }
 
+    /// Acceptor for a hand-driven fake coordinator: WebSocket upgrades go to
+    /// the test; the key-challenge POST is answered like a Coordinator
+    /// without keyproof (404).
+    fn ws_acceptor(listener: tokio::net::TcpListener) -> mpsc::Receiver<tokio::net::TcpStream> {
+        let (ws_conn_tx, ws_conns) = mpsc::channel(4);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let mut peek = [0u8; 4];
+                let n = tcp.peek(&mut peek).await.unwrap_or(0);
+                if peek[..n].starts_with(b"GET") {
+                    let _ = ws_conn_tx.send(tcp).await;
+                } else {
+                    let mut req = [0u8; 2048];
+                    let _ = tcp.read(&mut req).await;
+                    let _ = tcp.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                }
+            }
+        });
+        ws_conns
+    }
+
+    /// A client against a hand-driven fake coordinator, with short WS ping
+    /// and idle timings.
+    async fn client_with_short_ws_timing() -> (Arc<CoordinatorClient>, mpsc::Receiver<tokio::net::TcpStream>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let core = Arc::new(CoreState::new(udp, std::env::temp_dir()));
+        core.apply_identity(&test_identity(false)).await;
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let mut client = CoordinatorClient::new(CoordinatorConfig { coord_url: format!("http://127.0.0.1:{}", port) }, event_tx);
+        client.ws_timing = (Duration::from_millis(100), Duration::from_millis(400));
+        let client = Arc::new(client);
+        let runner = {
+            let client = client.clone();
+            tokio::spawn(async move { client.run(core).await })
+        };
+        (client, ws_acceptor(listener), runner)
+    }
+
+    async fn next_conn(conns: &mut mpsc::Receiver<tokio::net::TcpStream>, within: Duration) -> Option<tokio::net::TcpStream> {
+        tokio::time::timeout(within, conns.recv()).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_is_dropped_and_replaced() {
+        let (_client, mut conns, runner) = client_with_short_ws_timing().await;
+        // The server stops reading: our pings go unanswered, as when the
+        // connection's local address vanished in a network switch.
+        let first = next_conn(&mut conns, Duration::from_secs(5)).await.expect("connect");
+        let _silent = tokio_tungstenite::accept_async(first).await.unwrap();
+        assert!(next_conn(&mut conns, Duration::from_secs(3)).await.is_some(), "reconnected after the idle timeout");
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn an_answering_connection_is_kept() {
+        let (_client, mut conns, runner) = client_with_short_ws_timing().await;
+        let first = next_conn(&mut conns, Duration::from_secs(5)).await.expect("connect");
+        let mut ws = tokio_tungstenite::accept_async(first).await.unwrap();
+        // Reading answers the pings (tungstenite replies with pongs).
+        tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+        assert!(next_conn(&mut conns, Duration::from_millis(1500)).await.is_none(), "no reconnect");
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn a_network_change_reconnects_at_once() {
+        let (client, mut conns, runner) = client_with_short_ws_timing().await;
+        let first = next_conn(&mut conns, Duration::from_secs(5)).await.expect("connect");
+        let mut ws = tokio_tungstenite::accept_async(first).await.unwrap();
+        tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+        // Let the connection settle, then report a network change.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.network_changed();
+        assert!(next_conn(&mut conns, Duration::from_millis(1500)).await.is_some(), "reconnected");
+        runner.abort();
+    }
+
     /// End-to-end against a local fake coordinator: every connection must
     /// start with `register` followed by the joined rooms, and after the
     /// server drops the connection the client must reconnect and do it again.
@@ -1588,23 +1703,7 @@ mod tests {
             tokio::spawn(async move { client.run(core).await })
         };
 
-        // Acceptor: WebSocket upgrades go to the test; the key-challenge
-        // POST is answered like a Coordinator without keyproof (404).
-        let (ws_conn_tx, mut ws_conns) = mpsc::channel(4);
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            while let Ok((mut tcp, _)) = listener.accept().await {
-                let mut peek = [0u8; 4];
-                let n = tcp.peek(&mut peek).await.unwrap_or(0);
-                if peek[..n].starts_with(b"GET") {
-                    let _ = ws_conn_tx.send(tcp).await;
-                } else {
-                    let mut req = [0u8; 2048];
-                    let _ = tcp.read(&mut req).await;
-                    let _ = tcp.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
-                }
-            }
-        });
+        let mut ws_conns = ws_acceptor(listener);
 
         for round in 0..2 {
             let tcp = tokio::time::timeout(Duration::from_secs(10), ws_conns.recv())

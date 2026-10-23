@@ -438,27 +438,79 @@ async fn tx_loop(mut rx: mpsc::Receiver<Vec<u8>>, state: Arc<CoreState>) {
     }
 }
 
+/// How often the capture re-reads this machine's networks: they change
+/// when it switches networks (Wi-Fi ↔ hotspot), and a stale view would
+/// take its own broadcasts for another machine's.
+#[cfg(all(unix, not(target_os = "android"), not(target_os = "ios")))]
+const LOCAL_NETS_REFRESH: Duration = Duration::from_secs(2);
+
+/// This machine's physical IPv4 networks: its addresses and the broadcast
+/// addresses of their subnets (MSST-Net's own range left out).
+#[cfg(any(test, all(unix, not(target_os = "android"), not(target_os = "ios"))))]
+#[derive(Debug, Default, PartialEq)]
+struct LocalNets {
+    ips: std::collections::HashSet<Ipv4Addr>,
+    broadcasts: std::collections::HashSet<Ipv4Addr>,
+}
+
+#[cfg(any(test, all(unix, not(target_os = "android"), not(target_os = "ios"))))]
+impl LocalNets {
+    #[cfg(all(unix, not(target_os = "android"), not(target_os = "ios")))]
+    fn read() -> Self {
+        Self::of(if_addrs::get_if_addrs().unwrap_or_default().into_iter().filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(a) => Some((a.ip, a.prefixlen, a.broadcast)),
+            _ => None,
+        }))
+    }
+
+    /// From (address, prefix length, broadcast address) per interface
+    /// address; a missing broadcast address is derived from the prefix
+    /// (none for /31 and /32).
+    fn of(addrs: impl IntoIterator<Item = (Ipv4Addr, u8, Option<Ipv4Addr>)>) -> Self {
+        let mut nets = LocalNets::default();
+        for (ip, prefix, broadcast) in addrs {
+            if ip.is_loopback() || is_msst(ip) {
+                continue;
+            }
+            nets.ips.insert(ip);
+            let derived = (prefix < 31).then(|| Ipv4Addr::from(u32::from(ip) | (u32::MAX >> prefix.min(32))));
+            nets.broadcasts.extend(broadcast.or(derived).filter(|b| !is_msst(*b) && *b != ip));
+        }
+        nets
+    }
+
+    /// A UDP broadcast this machine sent on one of its physical networks:
+    /// from one of its addresses, to 255.255.255.255 or a subnet's
+    /// broadcast address (e.g. 172.20.10.15 on an iPhone hotspot's /28).
+    /// The raw socket also sees broadcasts injected into the TUN; they are
+    /// never ours (rebuilt from the room member's address, [`Message`]), so
+    /// a room member's broadcast can't be forwarded back to the room.
+    fn is_own_broadcast(&self, pkt: &[u8]) -> bool {
+        if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[9] != 17 {
+            return false;
+        }
+        let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+        let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+        self.ips.contains(&src) && (dst == Ipv4Addr::BROADCAST || self.broadcasts.contains(&dst))
+    }
+}
+
+/// In MSST-Net's IPv4 range (172.22.0.0/16).
+#[cfg(any(test, all(unix, not(target_os = "android"), not(target_os = "ios"))))]
+fn is_msst(ip: Ipv4Addr) -> bool {
+    ip.octets()[..2] == [172, 22]
+}
+
 /// Unix desktop: capture UDP broadcasts this machine sends on its physical
 /// LAN (raw socket, needs CAP_NET_RAW/root) and forward them.  Broadcasts
 /// from other machines are ignored — their own client forwards them.
+/// Keeps running across network changes, and without any network at first.
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "ios")))]
 async fn physical_bcast_loop(disc_tx: mpsc::Sender<Vec<u8>>) {
     use socket2::{Domain, Protocol, Socket, Type};
-    use std::collections::HashSet;
     use std::mem::MaybeUninit;
     use tokio::io::unix::AsyncFd;
 
-    let local_ips: HashSet<Ipv4Addr> = if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|i| match i.ip() {
-            IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
-            _ => None,
-        })
-        .collect();
-    if local_ips.is_empty() {
-        return;
-    }
     let raw = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::UDP)).and_then(|s| s.set_nonblocking(true).map(|_| s)) {
         Ok(s) => s,
         Err(e) => {
@@ -468,22 +520,54 @@ async fn physical_bcast_loop(disc_tx: mpsc::Sender<Vec<u8>>) {
     };
     let Ok(fd) = AsyncFd::new(raw) else { return };
     info!("discovery: physical LAN broadcast capture active");
+    let mut nets = LocalNets::read();
+    let mut refresh = tokio::time::interval(LOCAL_NETS_REFRESH);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut recv_failed = false;
     let mut buf = vec![MaybeUninit::<u8>::uninit(); 65536];
     loop {
-        let Ok(mut guard) = fd.readable().await else { break };
+        let mut guard = tokio::select! {
+            _ = refresh.tick() => {
+                let now = LocalNets::read();
+                if now != nets {
+                    debug!("discovery: local networks now {:?} (broadcast {:?})", now.ips, now.broadcasts);
+                    nets = now;
+                }
+                continue;
+            }
+            g = fd.readable() => match g {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!("discovery: physical broadcast capture stopped: {}", e);
+                    return;
+                }
+            },
+        };
         let len = match guard.try_io(|inner| inner.get_ref().recv_from(&mut buf)) {
-            Ok(Ok((n, _))) => n,
+            Ok(Ok((n, _))) => {
+                recv_failed = false;
+                n
+            }
             Ok(Err(e)) => {
-                warn!("discovery: raw recv error: {}", e);
-                break;
+                // E.g. an interface going away: keep capturing.
+                if !recv_failed {
+                    warn!("discovery: raw recv error: {}", e);
+                    recv_failed = true;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
             }
             Err(_) => continue,
         };
         // SAFETY: recv_from initialized buf[..len].
-        let pkt: Vec<u8> = buf[..len].iter().map(|b| unsafe { b.assume_init() }).collect();
-        if !is_own_physical_broadcast(&pkt, &local_ips) {
+        let mut pkt: Vec<u8> = buf[..len].iter().map(|b| unsafe { b.assume_init() }).collect();
+        if !nets.is_own_broadcast(&pkt) {
             continue;
         }
+        // Any subnet broadcast becomes a limited one, which the outbound
+        // path rewrites into MSST-Net space (`rewrite_for_msst_broadcast`
+        // recomputes both checksums).
+        pkt[16..20].copy_from_slice(&Ipv4Addr::BROADCAST.octets());
         if disc_tx.send(pkt).await.is_err() {
             break;
         }
@@ -496,14 +580,6 @@ async fn physical_bcast_loop(disc_tx: mpsc::Sender<Vec<u8>>) {
 fn is_foreign_member_packet(pkt: &[u8], own: Option<Ipv4Addr>) -> bool {
     let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
     src.octets()[..2] == [172, 22] && Some(src) != own
-}
-
-/// A broadcast this machine sent on a physical LAN (`physical_bcast_loop`).
-/// The raw socket also sees broadcasts injected into the TUN; they are
-/// never ours (rebuilt from the room member's address, [`Message`]), so a
-/// room member's broadcast can't be forwarded back to the room.
-fn is_own_physical_broadcast(pkt: &[u8], local_ips: &std::collections::HashSet<Ipv4Addr>) -> bool {
-    needs_msst_rewrite(pkt) && local_ips.contains(&Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]))
 }
 
 /// IPv4/UDP subnet broadcast outside MSST-Net space (needs rewriting).
@@ -633,18 +709,70 @@ mod tests {
         assert_eq!(unicast.rebuild(b), None);
     }
 
+    fn udp(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+        ippkt::build_udp(IpAddr::V4(src.into()), 4000, IpAddr::V4(dst.into()), 4000, b"x")
+    }
+
     #[test]
     fn injected_broadcasts_are_not_captured_again() {
-        // This machine: LAN 192.168.1.5, MSST-Net 172.22.0.1.
-        let local: std::collections::HashSet<Ipv4Addr> = [Ipv4Addr::new(192, 168, 1, 5), Ipv4Addr::new(172, 22, 0, 1)].into();
-        let ours = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 4000, IpAddr::V4(Ipv4Addr::BROADCAST), 4000, b"x");
-        assert!(is_own_physical_broadcast(&ours, &local));
+        // This machine: LAN 192.168.1.5/24, MSST-Net 172.22.0.1/16.
+        let local = LocalNets::of([
+            (Ipv4Addr::new(192, 168, 1, 5), 24, Some(Ipv4Addr::new(192, 168, 1, 255))),
+            (Ipv4Addr::new(172, 22, 0, 1), 16, Some(MSST_BROADCAST)),
+        ]);
+        let ours = udp([192, 168, 1, 5], [255, 255, 255, 255]);
+        assert!(local.is_own_broadcast(&ours));
         // A member's broadcast claiming our LAN address, as injected: rebuilt
         // from the member's address, so the capture ignores it.
         let injected = Message::of(&discovery_datagram(&ours).unwrap()).rebuild(Ipv4Addr::new(172, 22, 0, 7)).unwrap();
-        assert!(!is_own_physical_broadcast(&injected, &local));
-        let msst = ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(172, 22, 0, 1)), 4000, IpAddr::V4(MSST_BROADCAST), 4000, b"x");
-        assert!(!is_own_physical_broadcast(&msst, &local));
+        assert!(!local.is_own_broadcast(&injected));
+        assert!(!local.is_own_broadcast(&udp([172, 22, 0, 1], [172, 22, 255, 255])));
+    }
+
+    #[test]
+    fn subnet_broadcasts_follow_the_networks_prefix() {
+        // An iPhone hotspot (/28): its broadcast address doesn't end in .255.
+        let hotspot = LocalNets::of([(Ipv4Addr::new(172, 20, 10, 2), 28, None)]);
+        assert_eq!(hotspot.broadcasts, [Ipv4Addr::new(172, 20, 10, 15)].into());
+        assert!(hotspot.is_own_broadcast(&udp([172, 20, 10, 2], [172, 20, 10, 15])));
+        // A unicast address ending in .255 in a /16 is not a broadcast.
+        let wide = LocalNets::of([(Ipv4Addr::new(10, 0, 1, 5), 16, Some(Ipv4Addr::new(10, 0, 255, 255)))]);
+        assert!(!wide.is_own_broadcast(&udp([10, 0, 1, 5], [10, 0, 1, 255])));
+        assert!(wide.is_own_broadcast(&udp([10, 0, 1, 5], [10, 0, 255, 255])));
+        // No broadcast address on point-to-point /31 and /32.
+        assert!(LocalNets::of([(Ipv4Addr::new(10, 1, 1, 1), 32, None), (Ipv4Addr::new(10, 2, 2, 0), 31, None)]).broadcasts.is_empty());
+        // Loopback is never a physical network.
+        assert_eq!(LocalNets::of([(Ipv4Addr::LOCALHOST, 8, None)]), LocalNets::default());
+    }
+
+    #[test]
+    fn broadcasts_count_only_from_the_current_networks() {
+        // After a switch from Wi-Fi (192.168.222.22) to a hotspot
+        // (10.128.12.85), a view taken on Wi-Fi would drop every broadcast
+        // the machine now sends; the current one takes them.
+        let wifi = LocalNets::of([(Ipv4Addr::new(192, 168, 222, 22), 24, None)]);
+        let hotspot = LocalNets::of([(Ipv4Addr::new(10, 128, 12, 85), 24, None)]);
+        let sent = udp([10, 128, 12, 85], [255, 255, 255, 255]);
+        assert!(!wifi.is_own_broadcast(&sent));
+        assert!(hotspot.is_own_broadcast(&sent));
+        // Not UDP, not IPv4: never.
+        let mut tcp = sent.clone();
+        tcp[9] = 6;
+        assert!(!hotspot.is_own_broadcast(&tcp));
+        assert!(!hotspot.is_own_broadcast(&sent[..19]));
+    }
+
+    #[test]
+    fn a_captured_subnet_broadcast_is_carried_as_an_msst_broadcast() {
+        // The capture makes it a limited broadcast; the outbound path then
+        // rewrites it into MSST-Net space, and it is a discovery datagram.
+        let mut pkt = udp([172, 20, 10, 2], [172, 20, 10, 15]);
+        pkt[16..20].copy_from_slice(&Ipv4Addr::BROADCAST.octets());
+        assert!(needs_msst_rewrite(&pkt));
+        rewrite_for_msst_broadcast(&mut pkt, Ipv4Addr::new(172, 22, 245, 6));
+        assert!(ippkt::checksums_valid(&pkt));
+        let d = discovery_datagram(&pkt).unwrap();
+        assert_eq!((d.dst, d.dst_port), (MSST_BROADCAST, 4000));
     }
 
     #[test]

@@ -136,6 +136,14 @@ impl CoreRuntime {
         }
     }
 
+    /// Watch for network changes (desktops, [`crate::netwatch`]).
+    pub fn start_network_watch(&mut self) {
+        let state = self.state.clone();
+        self.spawn("netwatch", async move {
+            crate::netwatch::watch(state).await;
+        });
+    }
+
     /// Start the outbound loop (TUN → route → UDP).
     pub fn start_outbound(&mut self, tun_rx: mpsc::Receiver<Vec<u8>>) {
         let state = self.state.clone();
@@ -921,9 +929,25 @@ async fn send_wg(state: &CoreState, device_id: &str, target: std::net::SocketAdd
 // Relay: selection, keepalive, RTT
 // ---------------------------------------------------------------------------
 
-/// Attempts per relay selection (bounded; the next reconnect starts over).
+/// Quick attempts per relay selection, 10 s apart …
 const RELAY_SELECT_ATTEMPTS: u32 = 3;
 const RELAY_SELECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+/// … then background retries, 30 s doubling up to 5 min, until one works
+/// or a newer selection (reconnect, room join) takes over.  (Until 3.1.7 a
+/// selection gave up after the quick attempts — e.g. at boot, before the
+/// network was up — and left relay-routed traffic down until the next
+/// coordinator reconnect.)
+const RELAY_RESELECT_MIN_SECS: u64 = 30;
+const RELAY_RESELECT_MAX_SECS: u64 = 300;
+
+/// The wait after failed selection attempt `attempt` (1-based).
+fn relay_select_retry_delay(attempt: u32) -> std::time::Duration {
+    if attempt < RELAY_SELECT_ATTEMPTS {
+        return RELAY_SELECT_RETRY_DELAY;
+    }
+    let shift = (attempt - RELAY_SELECT_ATTEMPTS).min(16);
+    std::time::Duration::from_secs((RELAY_RESELECT_MIN_SECS << shift).min(RELAY_RESELECT_MAX_SECS))
+}
 
 /// Select the best relay and register with it, in the background.
 ///
@@ -943,7 +967,7 @@ fn spawn_relay_selection(
         // The persisted network setting wins over the config file.
         let preferred = state.net_settings.read().await.preferred_relay.clone().or(preferred);
 
-        for attempt in 1..=RELAY_SELECT_ATTEMPTS {
+        for attempt in 1.. {
             if state.relay_epoch.load(Ordering::SeqCst) != epoch {
                 debug!("relay: selection epoch {} superseded", epoch);
                 return;
@@ -976,14 +1000,16 @@ fn spawn_relay_selection(
                     return;
                 }
                 Err(e) => {
-                    warn!("relay: selection attempt {}/{} failed: {}", attempt, RELAY_SELECT_ATTEMPTS, e);
+                    let delay = relay_select_retry_delay(attempt);
                     if attempt < RELAY_SELECT_ATTEMPTS {
-                        tokio::time::sleep(RELAY_SELECT_RETRY_DELAY).await;
+                        warn!("relay: selection attempt {}/{} failed: {}", attempt, RELAY_SELECT_ATTEMPTS, e);
+                    } else {
+                        warn!("relay: selection attempt {} failed: {}; no relay selected, retrying in {}s", attempt, e, delay.as_secs());
                     }
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
-        warn!("relay: no relay selected; relay-routed traffic unavailable until next coordinator reconnect");
     });
 }
 
@@ -1026,6 +1052,20 @@ async fn register_with_relay(state: &Arc<CoreState>, relay_addr: &str, device_id
         Ok(_) => info!("relay: registered with {} ({})", relay_addr, if sreg { "sreg1" } else { "legacy" }),
         Err(e) => warn!("relay: register with {} failed: {}", relay_addr, e),
     }
+}
+
+/// The network changed: register with our relay and the room relay again
+/// right away (early schedule), so they forward to our new address without
+/// waiting for the next keepalive.
+pub(crate) async fn reregister_with_relays(state: &Arc<CoreState>) {
+    let (relay, device_id) = {
+        let net = state.net.read().await;
+        (net.relay_addr.clone(), net.local_device_id.clone())
+    };
+    if let Some(relay) = relay {
+        register_with_relay(state, &relay, &device_id).await;
+    }
+    register_with_room_relay(state).await;
 }
 
 /// The next registration packet for our relay: `0x0E` (sreg v1), else the
@@ -1641,6 +1681,15 @@ mod tests {
         let mut bad = ipv4(6, 0, false, &tcp_syn(22));
         bad[0] = 0x44;
         assert!(parse_ip_packet(&bad).is_none());
+    }
+
+    // ── Relay selection ──────────────────────────────────────────────────
+
+    #[test]
+    fn relay_selection_retries_quickly_then_backs_off() {
+        let secs: Vec<u64> = (1..=8).map(|a| relay_select_retry_delay(a).as_secs()).collect();
+        assert_eq!(secs, [10, 10, 30, 60, 120, 240, 300, 300]);
+        assert_eq!(relay_select_retry_delay(u32::MAX).as_secs(), 300);
     }
 
     // ── Path change events ───────────────────────────────────────────────

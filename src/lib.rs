@@ -20,6 +20,7 @@ mod ippkt;
 mod endpoints;
 mod contacts;
 mod net_settings;
+mod netwatch;
 pub mod netsock;
 mod nodes;
 mod coordinator;
@@ -245,6 +246,7 @@ async fn run(config: CoreConfig, shutdown: impl std::future::Future<Output = ()>
     let data_dir = config.resolve_data_dir();
     let ipc_socket = config.resolve_ipc_socket();
     let mut core = core::Core::start(core::CoreOptions { config, data_dir, ipc_socket, metrics: true, host_routing: true }).await?;
+    core.start_network_watch();
 
     // TUN (optional — without root Core runs relay-only) and, with it, the
     // local DNS resolver and the game discovery proxy (as in 3.0.x).

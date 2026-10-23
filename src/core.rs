@@ -197,6 +197,12 @@ impl Core {
         self.rt.start_dns_and_discovery(iface).await;
     }
 
+    /// Desktops: react to network changes ([`crate::netwatch`]).  (The
+    /// embedded Core is told by its app instead.)
+    pub fn start_network_watch(&mut self) {
+        self.rt.start_network_watch();
+    }
+
     /// Embedded (Android) DNS: a resolver answering queries the system sends
     /// into the TUN (no local server, no system configuration).
     pub fn enable_tun_dns(&self) {
