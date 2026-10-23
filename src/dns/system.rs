@@ -1,6 +1,10 @@
 //! Platform-specific system DNS configuration (ported unchanged from 3.0.x).
 //!
-//! Routes *.msst.net queries to the local resolver on 127.0.0.1:21053.
+//! Routes queries for the MSST-Net zone (`*.net.msst2031.cn`, see
+//! [`super::MSST_ZONE`]) to the local resolver on 127.0.0.1:21053.
+//! Configuring also removes what 3.1.6 and older left for the former zone
+//! `msst.net` (a domain MSST does not hold) on macOS and Windows; on Linux
+//! that state is per-link and goes away with the old TUN.
 //! All functions are best-effort: failures are logged as warnings rather than
 //! propagated, because DNS is a convenience feature and the VPN still works
 //! if system DNS is not configured.
@@ -60,15 +64,19 @@ fn configure_linux(iface: &str, mode: LinuxDnsMode) -> bool {
             false
         }
         LinuxDnsMode::PreferSplit => {
-            // Per-link split DNS: only *.msst.net queries go to our resolver.
+            // Per-link split DNS: only queries for our zone go to our resolver.
             // The ~ prefix marks these as routing domains (not search domains).
+            // DNSSEC is off for this link: our zone sits under the public
+            // msst2031.cn, and a validating systemd-resolved would otherwise
+            // reject the local, unsigned answers if that zone is ever signed.
             if let Ok(true) = Path::new("/usr/bin/resolvectl").try_exists() {
                 info!(
-                    "DNS: systemd-resolved configured ({} → {} for .msst.net)",
-                    iface, super::DNS_LISTEN_ADDR,
+                    "DNS: systemd-resolved configured ({} → {} for .{})",
+                    iface, super::DNS_LISTEN_ADDR, super::MSST_ZONE,
                 );
                 run("resolvectl", &["dns", iface, super::DNS_LISTEN_ADDR]);
-                run("resolvectl", &["domain", iface, "~msst.net"]);
+                run("resolvectl", &["domain", iface, &format!("~{}", super::MSST_ZONE)]);
+                run("resolvectl", &["dnssec", iface, "no"]);
                 false
             } else {
                 // resolvectl not available — fall back to iptables DNS interception.
@@ -143,14 +151,24 @@ fn unconfigure_linux(_iface: &str) {}
 
 // ── macOS: /etc/resolver/ ────────────────────────────────────────────────────
 
+/// Written by 3.1.6 and older for the former zone.
+#[cfg(target_os = "macos")]
+const MACOS_LEGACY_RESOLVER: &str = "/etc/resolver/msst.net";
+
+#[cfg(target_os = "macos")]
+fn macos_resolver_path() -> String {
+    format!("/etc/resolver/{}", super::MSST_ZONE)
+}
+
 #[cfg(target_os = "macos")]
 fn configure_macos() {
-    // macOS reads per-domain resolver config from /etc/resolver/<domain>.
-    // For *.msst.net we create /etc/resolver/msst.net so all subdomains are routed.
+    // macOS reads per-domain resolver config from /etc/resolver/<domain>;
+    // the file for our zone routes it and all subdomains.
     // The `port` directive tells the resolver to use a non-standard port.
+    remove_macos_legacy_resolver();
     let content = "nameserver 127.0.0.1\nport 21053\n";
-    let path = "/etc/resolver/msst.net";
-    match std::fs::write(path, content) {
+    let path = macos_resolver_path();
+    match std::fs::write(&path, content) {
         Ok(()) => info!("DNS: wrote {}", path),
         Err(e) => error!("DNS: could not write {} (root required?): {}", path, e),
     }
@@ -158,11 +176,21 @@ fn configure_macos() {
 
 #[cfg(target_os = "macos")]
 fn unconfigure_macos() {
-    let path = "/etc/resolver/msst.net";
-    if let Err(e) = std::fs::remove_file(path) {
+    let path = macos_resolver_path();
+    if let Err(e) = std::fs::remove_file(&path) {
         warn!("DNS: could not remove {}: {}", path, e);
     }
-    info!("DNS: removed /etc/resolver/msst.net");
+    info!("DNS: removed {}", path);
+    remove_macos_legacy_resolver();
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_legacy_resolver() {
+    match std::fs::remove_file(MACOS_LEGACY_RESOLVER) {
+        Ok(()) => info!("DNS: removed legacy {}", MACOS_LEGACY_RESOLVER),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("DNS: could not remove legacy {}: {}", MACOS_LEGACY_RESOLVER, e),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -176,23 +204,41 @@ fn unconfigure_macos() {}
 // 127.0.0.1:53 on Windows (see dns/mod.rs).  Administrator privileges are
 // required for both WinTun and binding port 53, so this is acceptable.
 
+/// NRPT namespace added by 3.1.6 and older for the former zone.
+#[cfg(windows)]
+const WINDOWS_LEGACY_NRPT: &str = ".msst.net";
+
 #[cfg(windows)]
 fn configure_windows() {
+    // Drop a stale rule for our zone (unclean exit) and the legacy one, so
+    // rules don't pile up, then add ours.
+    remove_nrpt_rule(&format!(".{}", super::MSST_ZONE));
+    remove_nrpt_rule(WINDOWS_LEGACY_NRPT);
     let cmd = format!(
-        "Add-DnsClientNrptRule -Namespace '.msst.net' -NameServers '127.0.0.1' \
--ErrorAction SilentlyContinue"
+        "Add-DnsClientNrptRule -Namespace '.{}' -NameServers '127.0.0.1' \
+-ErrorAction SilentlyContinue",
+        super::MSST_ZONE
     );
     run("powershell", &["-NoProfile", "-NonInteractive", "-Command", &cmd]);
-    info!("DNS: NRPT rule added for .msst.net (127.0.0.1:53)");
+    info!("DNS: NRPT rule added for .{} (127.0.0.1:53)", super::MSST_ZONE);
 }
 
 #[cfg(windows)]
 fn unconfigure_windows() {
-    let cmd = "Get-DnsClientNrptRule | \
-Where-Object { $_.Namespace -eq '.msst.net' } | \
-Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue".to_string();
+    remove_nrpt_rule(&format!(".{}", super::MSST_ZONE));
+    remove_nrpt_rule(WINDOWS_LEGACY_NRPT);
+    info!("DNS: NRPT rule removed for .{}", super::MSST_ZONE);
+}
+
+#[cfg(windows)]
+fn remove_nrpt_rule(namespace: &str) {
+    let cmd = format!(
+        "Get-DnsClientNrptRule | \
+Where-Object {{ $_.Namespace -eq '{}' }} | \
+Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue",
+        namespace
+    );
     run("powershell", &["-NoProfile", "-NonInteractive", "-Command", &cmd]);
-    info!("DNS: NRPT rule removed for .msst.net");
 }
 
 #[cfg(not(windows))]

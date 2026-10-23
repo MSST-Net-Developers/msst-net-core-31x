@@ -417,7 +417,7 @@ mod tests {
                 (Some("join"), Some("space-1")) => vec![json!({ "type": "room_state", "data": {
                     "room_id": "space-1", "room_name": "Test",
                     "peers": [{ "device_id": "device-0000000b", "public_key": "", "ipv4": "172.22.1.1",
-                                "ipv6": "fd22:2222:2222:2222::b", "hostname": "pc.bob.ezplay.msst.net",
+                                "ipv6": "fd22:2222:2222:2222::b", "hostname": "pc.bob.ezplay.net.msst2031.cn",
                                 "endpoints": [], "is_authenticated": false }] } })],
                 (Some("join"), Some("space-2")) => vec![json!({ "type": "error", "data": { "message": "wrong password" } })],
                 (Some("join"), Some("space-4")) => vec![json!({ "type": "room_state", "data": { "room_id": "space-4", "room_name": "Open", "peers": [] } })],

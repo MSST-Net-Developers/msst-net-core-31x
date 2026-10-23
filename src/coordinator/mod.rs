@@ -982,11 +982,11 @@ where
 
 /// Builds the client-side ezPlay hostname proposal (3.0.x `ip::build_hostname`).
 ///
-/// Format: `<device_label>.<user_label>.ezplay.msst.net`; an empty (or
+/// Format: `<device_label>.<user_label>.ezplay.net.msst2031.cn`; an empty (or
 /// invalid) handle falls back to the full ID.  The server may return a
 /// different (conflict-resolved) hostname in `registered`.
 pub fn build_hostname(device_handle: &str, device_id: &str, user_handle: &str, user_id: &str) -> String {
-    format!("{}.{}.ezplay.msst.net", handle_or_id(device_handle, device_id), handle_or_id(user_handle, user_id))
+    format!("{}.{}{}", handle_or_id(device_handle, device_id), handle_or_id(user_handle, user_id), crate::dns::EZPLAY_SUFFIX)
 }
 
 /// The handle to register: unset (or invalid) handles are replaced by the
@@ -1316,11 +1316,11 @@ mod tests {
     #[test]
     fn parse_registered_message() {
         let client = make_client();
-        let json = r#"{"type":"registered","data":{"hostname":"pc.abjust.ezplay.msst.net","ipv4":"172.22.1.1","ipv6":"fd22:2222:2222:2222::aabb:ccdd","user_handle":"abjust","user_display_name":"Abjust"}}"#;
+        let json = r#"{"type":"registered","data":{"hostname":"pc.abjust.ezplay.net.msst2031.cn","ipv4":"172.22.1.1","ipv6":"fd22:2222:2222:2222::aabb:ccdd","user_handle":"abjust","user_display_name":"Abjust"}}"#;
         let event = client.parse_incoming(json).unwrap().unwrap();
         match event {
             CoordinatorEvent::Registered { hostname, ipv4, .. } => {
-                assert_eq!(hostname, "pc.abjust.ezplay.msst.net");
+                assert_eq!(hostname, "pc.abjust.ezplay.net.msst2031.cn");
                 assert_eq!(ipv4, "172.22.1.1");
             }
             _ => panic!("expected Registered"),
@@ -1400,7 +1400,7 @@ mod tests {
     fn parse_registered_requires_all_fields() {
         // A 3.0.x coordinator (no ipv6) is not supported.
         let client = make_client();
-        let json = r#"{"type":"registered","data":{"hostname":"pc.abjust.ezplay.msst.net","ipv4":"172.22.1.1","user_handle":"abjust","user_display_name":"Abjust"}}"#;
+        let json = r#"{"type":"registered","data":{"hostname":"pc.abjust.ezplay.net.msst2031.cn","ipv4":"172.22.1.1","user_handle":"abjust","user_display_name":"Abjust"}}"#;
         assert!(client.parse_incoming(json).is_err());
     }
 
@@ -1456,7 +1456,7 @@ mod tests {
         assert_eq!(d["device"]["pub_key"], "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=");
         assert_eq!(d["network"]["ipv4"], "172.22.178.196");
         assert_eq!(d["network"]["ipv6"], "fd22:2222:2222:2222::a1b2:c3d4");
-        assert_eq!(d["network"]["hostname"], "device-a1b2c3d4.user-11223344.ezplay.msst.net");
+        assert_eq!(d["network"]["hostname"], "device-a1b2c3d4.user-11223344.ezplay.net.msst2031.cn");
         assert_eq!(d["meta"]["user_display_name"], "U");
         assert_eq!(d["meta"]["device_display_name"], "D");
     }
@@ -1469,7 +1469,7 @@ mod tests {
         id.device.assigned_ipv4 = Some("172.22.9.9".into());
         let d = &build_register_message(&id)["data"];
         assert_eq!(d["device"]["handle"], "pc");
-        assert_eq!(d["network"]["hostname"], "pc.abjust.ezplay.msst.net");
+        assert_eq!(d["network"]["hostname"], "pc.abjust.ezplay.net.msst2031.cn");
         assert_eq!(d["network"]["ipv4"], "172.22.9.9");
     }
 
@@ -1484,15 +1484,15 @@ mod tests {
         id.device.handle = "My PC".into();
         let d = &build_register_message(&id)["data"];
         assert_eq!(d["device"]["handle"], "device-a1b2c3d4");
-        assert_eq!(d["network"]["hostname"], "device-a1b2c3d4.user-11223344.ezplay.msst.net");
+        assert_eq!(d["network"]["hostname"], "device-a1b2c3d4.user-11223344.ezplay.net.msst2031.cn");
     }
 
     #[test]
     fn apply_registered_keeps_hostname_when_none_assigned() {
         let mut id = test_identity(false);
-        id.device.hostname = "pc.abjust.ezplay.msst.net".into();
+        id.device.hostname = "pc.abjust.ezplay.net.msst2031.cn".into();
         assert!(!apply_registered(&mut id, "", "", "", ""));
-        assert_eq!(id.device.hostname, "pc.abjust.ezplay.msst.net");
+        assert_eq!(id.device.hostname, "pc.abjust.ezplay.net.msst2031.cn");
     }
 
     #[test]

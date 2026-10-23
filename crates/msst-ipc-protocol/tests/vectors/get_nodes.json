@@ -14,7 +14,7 @@
             "device_handle": "pc",
             "device_id": "device-0000000b",
             "display_name": "Bob PC",
-            "hostname": "pc.bob.ezplay.msst.net",
+            "hostname": "pc.bob.ezplay.net.msst2031.cn",
             "ipv4": "172.22.1.1",
             "ipv6": "fd22:2222:2222:2222::b",
             "is_authenticated": true,

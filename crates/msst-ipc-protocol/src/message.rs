@@ -498,7 +498,7 @@ mod tests {
                 device_id: "device-deadbeef".into(),
                 ipv4: "172.22.1.2".into(),
                 ipv6: "fd22:2222:2222:2222::dead:beef".into(),
-                hostname: Some("pc.example.ezplay.msst.net".into()),
+                hostname: Some("pc.example.ezplay.net.msst2031.cn".into()),
                 display_name: Some("Example PC".into()),
             },
         });

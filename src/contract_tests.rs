@@ -92,7 +92,7 @@ async fn fixture(name: &str) -> (Arc<CoreState>, crate::state::EventReceiver) {
         user_id: Some("user-0000000b"),
         device_handle: Some("pc"),
         user_handle: Some("bob"),
-        hostname: Some("pc.bob.ezplay.msst.net"),
+        hostname: Some("pc.bob.ezplay.net.msst2031.cn"),
         display_name: Some("Bob PC".into()),
         user_display_name: Some("Bob".into()),
         endpoints: &["203.0.113.7:21031".to_string(), "relay:198.51.100.1:7000".to_string()],
@@ -196,7 +196,7 @@ async fn contract_vectors() {
     crate::acl::set_ping_enabled(&state, true).await.unwrap();
     crate::nodes::apply_peer(&state, crate::nodes::PeerData {
         device_id: "device-0000000b", ipv4: "172.22.1.1", ipv6: "fd22:2222:2222:2222::b",
-        hostname: Some("pc.bob.ezplay.msst.net"), display_name: Some("Bob's new PC".into()), is_authenticated: true,
+        hostname: Some("pc.bob.ezplay.net.msst2031.cn"), display_name: Some("Bob's new PC".into()), is_authenticated: true,
         ..Default::default()
     })
     .await;

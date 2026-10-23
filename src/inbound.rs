@@ -784,7 +784,7 @@ mod tests {
         {
             let mut net = state.net.write().await;
             net.peer_list.upsert("device-0000000b", "172.22.1.1".parse().unwrap(), "fd22:2222:2222:2222::b".parse().unwrap(),
-                Some("user-0000000b"), Some("pc"), Some("bob"), Some("pc.bob.ezplay.msst.net"), Some("Bob PC".into()), None, true, 0);
+                Some("user-0000000b"), Some("pc"), Some("bob"), Some("pc.bob.ezplay.net.msst2031.cn"), Some("Bob PC".into()), None, true, 0);
             net.peer_list.update_relay("device-0000000b", &relay.local_addr().unwrap().to_string());
             net.set_official_relays(&[relay.local_addr().unwrap().to_string()]);
             if in_room {

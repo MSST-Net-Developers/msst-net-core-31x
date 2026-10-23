@@ -406,7 +406,7 @@ mod tests {
                                       "expires_at": 4102444800i64, "preferred_username": "John.Doe", "display_name": "John" }))
                     }
                 }
-                "/device/register" => (200, json!({ "hostname": "laptop.john-doe.ezplay.msst.net", "ipv4": "172.22.178.196", "ipv6": "x" })),
+                "/device/register" => (200, json!({ "hostname": "laptop.john-doe.ezplay.net.msst2031.cn", "ipv4": "172.22.178.196", "ipv6": "x" })),
                 _ => (404, json!({})),
             },
             |_| vec![],
@@ -436,7 +436,7 @@ mod tests {
         let reg = coord.http_log.lock().unwrap().iter().find(|r| r.path == "/device/register").cloned().unwrap();
         assert_eq!(reg.authorization.as_deref(), Some("Bearer AT"));
         assert_eq!(reg.body["user"]["id"], "user-0000abcd");
-        assert!(eventually(|| state.identity.try_read().is_ok_and(|g| g.as_ref().unwrap().device.hostname == "laptop.john-doe.ezplay.msst.net")).await);
+        assert!(eventually(|| state.identity.try_read().is_ok_and(|g| g.as_ref().unwrap().device.hostname == "laptop.john-doe.ezplay.net.msst2031.cn")).await);
 
         // With OIDC active, user-level edits are ignored; device-level apply.
         let out = update_display_name(&state, Some("Other".into()), Some("Laptop".into())).await.unwrap();
@@ -447,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn handle_update_validates_saves_and_reregisters() {
         let coord = FakeCoordinator::start(
-            |req| if req.path == "/device/register" { (200, json!({ "hostname": "pc.me.ezplay.msst.net", "ipv4": "172.22.9.9" })) } else { (404, json!({})) },
+            |req| if req.path == "/device/register" { (200, json!({ "hostname": "pc.me.ezplay.net.msst2031.cn", "ipv4": "172.22.9.9" })) } else { (404, json!({})) },
             |_| vec![],
         ).await;
         let (state, _ipc) = core_state("handles").await;
@@ -462,12 +462,12 @@ mod tests {
         assert_eq!(reg.body["device"]["handle"], "pc");
         // The Coordinator has no keyproof (404): registered without a proof.
         assert!(reg.body["device"].get("key_proof").is_none());
-        assert_eq!(reg.body["network"]["hostname"], "pc.me.ezplay.msst.net");
+        assert_eq!(reg.body["network"]["hostname"], "pc.me.ezplay.net.msst2031.cn");
         let id = identity_on_disk(&state);
         assert_eq!(id.device.handle, "pc");
         // Coordinator-assigned IPv4 recorded for next start.
         assert_eq!(id.device.assigned_ipv4.as_deref(), Some("172.22.9.9"));
-        assert_eq!(id.device.hostname, "pc.me.ezplay.msst.net");
+        assert_eq!(id.device.hostname, "pc.me.ezplay.net.msst2031.cn");
     }
 
     #[tokio::test]
@@ -503,9 +503,9 @@ mod tests {
         assert!(out["device_handle"].is_null());
         let last = registers().last().unwrap().clone();
         assert_eq!(last["device"]["handle"], dev_id.as_str());
-        assert_eq!(last["network"]["hostname"], format!("{}.{}.ezplay.msst.net", dev_id, user_id));
+        assert_eq!(last["network"]["hostname"], format!("{}.{}.ezplay.net.msst2031.cn", dev_id, user_id));
         assert_eq!(identity_on_disk(&state).device.handle, "");
-        assert_eq!(identity_on_disk(&state).device.hostname, format!("{}.{}.ezplay.msst.net", dev_id, user_id));
+        assert_eq!(identity_on_disk(&state).device.hostname, format!("{}.{}.ezplay.net.msst2031.cn", dev_id, user_id));
 
         // No change → nothing to send.
         let n = registers().len();

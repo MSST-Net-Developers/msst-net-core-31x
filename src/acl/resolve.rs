@@ -60,7 +60,7 @@ impl LocalIdentity {
 
 /// Remote (coordinator) lookups.  `Ok(None)` = definitively unknown.
 pub trait RemoteResolver {
-    /// Resolve an ezPlay hostname (`<device>.<user>.ezplay.msst.net`) to a device ID.
+    /// Resolve an ezPlay hostname (`<device>.<user>.ezplay.net.msst2031.cn`) to a device ID.
     fn device_id(&self, hostname: &str) -> impl std::future::Future<Output = Result<Option<String>, String>> + Send;
     /// Resolve a user handle to a user ID.
     fn user_id(&self, handle: &str) -> impl std::future::Future<Output = Result<Option<String>, String>> + Send;
@@ -101,9 +101,9 @@ pub fn resolve_locally(kind: Kind, mnemonic: &str, me: &LocalIdentity, peers: &P
 /// The hostname the coordinator's DNS resolves for a device mnemonic.
 pub fn device_hostname(mnemonic: &str, me: &LocalIdentity) -> String {
     if mnemonic.contains('.') {
-        format!("{}.ezplay.msst.net", mnemonic)
+        format!("{}{}", mnemonic, crate::dns::EZPLAY_SUFFIX)
     } else {
-        format!("{}.{}.ezplay.msst.net", mnemonic, me.user_label())
+        format!("{}.{}{}", mnemonic, me.user_label(), crate::dns::EZPLAY_SUFFIX)
     }
 }
 
@@ -219,17 +219,17 @@ mod tests {
 
     #[test]
     fn hostnames_for_coordinator_lookup() {
-        assert_eq!(device_hostname("nas", &me()), "nas.abjust.ezplay.msst.net");
-        assert_eq!(device_hostname("pc.carol", &me()), "pc.carol.ezplay.msst.net");
+        assert_eq!(device_hostname("nas", &me()), "nas.abjust.ezplay.net.msst2031.cn");
+        assert_eq!(device_hostname("pc.carol", &me()), "pc.carol.ezplay.net.msst2031.cn");
         let mut no_handle = me();
         no_handle.user_handle.clear();
-        assert_eq!(device_hostname("nas", &no_handle), "nas.user-00000001.ezplay.msst.net");
+        assert_eq!(device_hostname("nas", &no_handle), "nas.user-00000001.ezplay.net.msst2031.cn");
     }
 
     #[tokio::test]
     async fn remote_resolution_success_not_found_and_unavailable() {
         let remote = FakeRemote {
-            devices: [("nas.abjust.ezplay.msst.net".to_string(), "device-0000000a".to_string())].into(),
+            devices: [("nas.abjust.ezplay.net.msst2031.cn".to_string(), "device-0000000a".to_string())].into(),
             users: [("carol".to_string(), "user-0000000c".to_string())].into(),
             down: false,
         };
@@ -248,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn remote_answer_with_wrong_id_kind_is_rejected() {
         let remote = FakeRemote {
-            devices: [("x.abjust.ezplay.msst.net".to_string(), "user-0000000c".to_string())].into(),
+            devices: [("x.abjust.ezplay.net.msst2031.cn".to_string(), "user-0000000c".to_string())].into(),
             users: HashMap::new(),
             down: false,
         };

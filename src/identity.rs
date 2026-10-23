@@ -36,7 +36,7 @@ pub struct DeviceInfo {
     /// Empty = not set; registered as [`default_device_display_name`].
     #[serde(default)]
     pub display_name: String,
-    /// Server-assigned ezPlay hostname, e.g. "abjust-archlinux.abjust.ezplay.msst.net".
+    /// Server-assigned ezPlay hostname, e.g. "abjust-archlinux.abjust.ezplay.net.msst2031.cn".
     /// Populated (and persisted) after the first successful coordinator registration.
     #[serde(default)]
     pub hostname: String,
@@ -354,7 +354,7 @@ mod tests {
             format!(
                 r#"{{"user":{{"id":"usr-11223344","handle":"abjust","display_name":"A"}},
                 "device":{{"id":"dev-{hex}","handle":"pc","display_name":"PC",
-                          "hostname":"pc.abjust.ezplay.msst.net","assigned_ipv4":"172.22.9.9"}},
+                          "hostname":"pc.abjust.ezplay.net.msst2031.cn","assigned_ipv4":"172.22.9.9"}},
                 "auth":{{"user_id":"user-11223344","access_token":"t","refresh_token":"r","expires_at":1}}}}"#
             ),
         )
@@ -362,7 +362,7 @@ mod tests {
         let id = load_or_create(&dir).unwrap();
         assert_eq!(id.user.id, "user-11223344");
         assert_eq!(id.device.id, format!("device-{}", hex));
-        assert_eq!(id.device.hostname, "pc.abjust.ezplay.msst.net");
+        assert_eq!(id.device.hostname, "pc.abjust.ezplay.net.msst2031.cn");
         assert!(id.auth.is_some());
         // Coordinator-assigned IPv4 wins over the derived one.
         assert_eq!(id.virtual_ips().0, "172.22.9.9");
@@ -387,7 +387,7 @@ mod tests {
             dir.join("identity.json"),
             r#"{"user":{"id":"user-11223344","handle":"abjust","display_name":"A"},
                 "device":{"id":"device-a1b2c3d4","handle":"pc","display_name":"PC",
-                          "hostname":"pc.abjust.ezplay.msst.net","assigned_ipv4":"172.22.9.9"}}"#,
+                          "hostname":"pc.abjust.ezplay.net.msst2031.cn","assigned_ipv4":"172.22.9.9"}}"#,
         )
         .unwrap();
         let id = load_or_create(&dir).unwrap();

@@ -28,7 +28,7 @@ pub struct PeerEntry {
     pub device_handle: Option<String>,
     /// User-level mnemonic handle (e.g. "abjust").
     pub user_handle: Option<String>,
-    /// Server-assigned ezPlay hostname (e.g. "abjust-archlinux.abjust.ezplay.msst.net").
+    /// Server-assigned ezPlay hostname (e.g. "abjust-archlinux.abjust.ezplay.net.msst2031.cn").
     pub hostname: Option<String>,
     pub ipv4: IpAddr,
     pub ipv6: IpAddr,
@@ -580,7 +580,7 @@ mod tests {
             v4(172, 22, 1, 1),
             v6(),
             None, None, None,
-            Some("old-host.example.msst.net"),
+            Some("old-host.example.net.msst2031.cn"),
             None, None, false, NOW,
         );
         pl.upsert(
@@ -588,7 +588,7 @@ mod tests {
             v4(172, 22, 1, 1),
             v6(),
             None, None, None,
-            Some("new-host.example.msst.net"),
+            Some("new-host.example.net.msst2031.cn"),
             None, None, false, NOW,
         );
         // Note: hostname lookup is not directly exposed as a public method
@@ -792,8 +792,8 @@ mod tests {
     fn find_by_hostname_case_insensitive() {
         let mut pl = PeerList::new();
         pl.upsert("device-aabbccdd", "172.22.1.1".parse().unwrap(), "fd22:2222:2222:2222::1".parse().unwrap(),
-            None, None, None, Some("PC.Bob.ezplay.msst.net"), None, None, false, 0);
-        assert_eq!(pl.find_by_hostname("pc.bob.ezplay.msst.net").unwrap().device_id, "device-aabbccdd");
-        assert!(pl.find_by_hostname("x.msst.net").is_none());
+            None, None, None, Some("PC.Bob.ezplay.net.msst2031.cn"), None, None, false, 0);
+        assert_eq!(pl.find_by_hostname("pc.bob.ezplay.net.msst2031.cn").unwrap().device_id, "device-aabbccdd");
+        assert!(pl.find_by_hostname("x.net.msst2031.cn").is_none());
     }
 }

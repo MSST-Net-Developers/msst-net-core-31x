@@ -7,7 +7,7 @@
             "device_id": "device-0000000b",
             "discovery": "unsupported",
             "display_name": "Bob PC",
-            "hostname": "pc.bob.ezplay.msst.net",
+            "hostname": "pc.bob.ezplay.net.msst2031.cn",
             "ipv4": "172.22.1.1",
             "ipv6": "fd22:2222:2222:2222::b"
           },
@@ -65,7 +65,7 @@
         "change": {
           "device_handle": "pc",
           "display_name": "Bob's new PC",
-          "hostname": "pc.bob.ezplay.msst.net",
+          "hostname": "pc.bob.ezplay.net.msst2031.cn",
           "ipv4": "172.22.1.1",
           "ipv6": "fd22:2222:2222:2222::b",
           "is_authenticated": true,

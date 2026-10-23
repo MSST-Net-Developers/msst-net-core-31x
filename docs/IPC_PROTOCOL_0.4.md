@@ -99,7 +99,7 @@ Add `"async": true` to a command request:
   `invalid_handle`.  A cleared value is reported as `null`, like one never
   set, and Core registers the default instead: the device handle becomes
   the device ID (so the ezPlay hostname becomes
-  `<device_id>.<user handle or ID>.ezplay.msst.net`), the device display
+  `<device_id>.<user handle or ID>.ezplay.net.msst2031.cn`), the device display
   name becomes `用户<short user ID>的设备`, the user ID without its
   `user-` prefix, at most 8 characters (`user-1a2b3c4d` →
   `用户1a2b3c4d的设备`).  Display names are trimmed and at
@@ -225,7 +225,7 @@ Add `"async": true` to a command request:
 - **Relay addresses keep their host names:** `Health.relay`, the room
   view's `relay` and `GetRelays.current` are the relay's address as
   listed by the Coordinator or configured as the preferred relay (e.g.
-  `relay1.msst.net:7000`), no longer the IP it resolved to.  Peers get the
+  `relay1.msst-net.msst2031.cn:7000`), no longer the IP it resolved to.  Peers get the
   name in our `relay:` endpoint and resolve it themselves (in their own
   address family); `room-relay:` likewise carries the room relay's
   address.  Core caches a lookup for 60 s.

@@ -594,7 +594,7 @@ mod tests {
     fn node_info_parses_3_0_x_shape() {
         let r: NodesResponse = serde_json::from_str(r#"{"nodes":[{"device_id":"device-0000000b","device_handle":"pc",
             "user_id":"user-0000000b","user_handle":"bob","public_key":"","ipv4":"172.22.1.1",
-            "ipv6":"fd22:2222:2222:2222::b","hostname":"pc.bob.ezplay.msst.net",
+            "ipv6":"fd22:2222:2222:2222::b","hostname":"pc.bob.ezplay.net.msst2031.cn",
             "endpoints":["1.2.3.4:21031","relay:5.6.7.8:7000"],"status":"online","is_authenticated":true}]}"#).unwrap();
         assert_eq!(r.nodes[0].user_handle.as_deref(), Some("bob"));
         assert_eq!(crate::relay::extract_relay(&r.nodes[0].endpoints).as_deref(), Some("5.6.7.8:7000"));

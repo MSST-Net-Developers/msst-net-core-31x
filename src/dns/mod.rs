@@ -1,20 +1,21 @@
 //! Local DNS resolver for MSST-Net (ported from 3.0.x `dns/mod.rs`).
 //!
 //! Desktop: a UDP server on 127.0.0.1:21053 (Windows: :53) plus system
-//! split-DNS so `*.msst.net` queries reach it (`system.rs`).  On Linux in
+//! split-DNS so `*.net.msst2031.cn` queries reach it (`system.rs`).  On Linux in
 //! iptables mode, port-53 queries are DNAT'ed to 172.22.0.1:21053, routed
 //! into the TUN, and answered by [`intercept_tun_dns`].
 //!
 //! Resolution:
-//! - `*.msst.net` A / AAAA / ANY → peer list hostname (local, no network),
+//! - names in [`MSST_ZONE`] (the zone itself and below), A / AAAA / ANY
+//!   → peer list hostname (local, no network),
 //!   else the coordinator's `/dns/resolve`; a known peer's tunnel IPs win
 //!   over the coordinator's.  An unknown peer gets a 3 s TTL and an
 //!   on-demand fetch.
-//! - `*.msst.net` TXT / SRV → the user records of custom namespaces, from
+//! - in-zone TXT / SRV → the user records of custom namespaces, from
 //!   the coordinator's `POST /dns/lookup` (its PowerDNS backend, the only
 //!   API that returns them).  No record of the type but a CNAME → the
 //!   CNAME; a name that exists otherwise → NODATA; else NXDOMAIN.
-//! - `*.msst.net`, any other type → NODATA for existing names.
+//! - in-zone, any other type → NODATA for existing names.
 //! - everything else → all upstream resolvers in parallel, first answer wins.
 //!   In Linux iptables mode, where every local query is intercepted, the
 //!   upstreams are the system's own resolvers (`/etc/resolv.conf`, e.g.
@@ -36,6 +37,25 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
+
+/// The MSST-Net internal zone.  Resolved only by this resolver (asking the
+/// coordinator); nothing is published under it in public DNS.  Until 3.1.6
+/// it was `msst.net`, a domain MSST does not hold; that zone is no longer
+/// handled here.
+pub const MSST_ZONE: &str = "net.msst2031.cn";
+/// Suffix of ezPlay device hostnames (`<device>.<user>.ezplay.net.msst2031.cn`).
+pub const EZPLAY_SUFFIX: &str = ".ezplay.net.msst2031.cn";
+
+/// Whether `name` is [`MSST_ZONE`] or below it (ASCII case-insensitive,
+/// trailing dot allowed).  Label-aware: `coord.msst-net.msst2031.cn`, where
+/// the official servers live, is not in the zone.
+pub fn in_msst_zone(name: &str) -> bool {
+    let n = name.strip_suffix('.').unwrap_or(name);
+    let Some(prefix_len) = n.len().checked_sub(MSST_ZONE.len()) else { return false };
+    n.is_char_boundary(prefix_len)
+        && n[prefix_len..].eq_ignore_ascii_case(MSST_ZONE)
+        && (prefix_len == 0 || n.as_bytes()[prefix_len - 1] == b'.')
+}
 
 const QTYPE_A: u16 = 1;
 const QTYPE_CNAME: u16 = 5;
@@ -187,9 +207,6 @@ impl DnsResolver {
         self.cache().remove(&key);
     }
 
-    fn is_msst_domain(name: &str) -> bool {
-        name.to_ascii_lowercase().ends_with(".msst.net")
-    }
 
     async fn resolve_msst(&self, name: &str, qtype: u16) -> MsstResult<IpAddr> {
         let key = name.to_ascii_lowercase();
@@ -282,7 +299,7 @@ impl DnsResolver {
         Some(records)
     }
 
-    /// TXT / SRV for a `*.msst.net` name.
+    /// TXT / SRV for a name in [`MSST_ZONE`].
     async fn resolve_records(&self, name: &str, qtype: u16) -> MsstResult<Answer> {
         let name = name.to_ascii_lowercase();
         let Some(records) = self.user_records(&name).await else { return MsstResult::Error };
@@ -311,7 +328,7 @@ impl DnsResolver {
     pub async fn handle_query(&self, buf: &[u8]) -> Option<Vec<u8>> {
         let q = parse_dns_query(buf)?;
         debug!("DNS: {} qtype={}", q.name, q.qtype);
-        if Self::is_msst_domain(&q.name) {
+        if in_msst_zone(&q.name) {
             let result = match q.qtype {
                 QTYPE_TXT | QTYPE_SRV => self.resolve_records(&q.name, q.qtype).await,
                 _ => match self.resolve_msst(&q.name, q.qtype).await {
@@ -702,7 +719,7 @@ pub async fn start(resolver: Arc<DnsResolver>, iface: &str, mode: crate::net_set
             (fell_back, Some(tokio::spawn(serve_loop(resolver, Arc::new(sock)))))
         }
         Err(e) => {
-            error!("DNS: failed to bind {} — *.msst.net names will not resolve: {}", DNS_LISTEN_ADDR, e);
+            error!("DNS: failed to bind {} — *.{} names will not resolve: {}", DNS_LISTEN_ADDR, MSST_ZONE, e);
             (false, None)
         }
     }
@@ -752,6 +769,25 @@ pub async fn intercept_tun_dns(resolver: &DnsResolver, pkt: &[u8]) -> Option<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zone_membership_is_label_aware() {
+        for name in ["net.msst2031.cn", "pc.bob.ezplay.net.msst2031.cn", "PC.Bob.EZPLAY.NET.MSST2031.CN.", "x.abjust.net.msst2031.cn."] {
+            assert!(in_msst_zone(name), "{name} should be in the zone");
+        }
+        for name in [
+            "coord.msst-net.msst2031.cn", // official servers: public DNS
+            "evilnet.msst2031.cn",
+            "msst2031.cn",
+            "net.msst2031.cn.example.com",
+            "pc.bob.ezplay.msst.net", // the former zone is no longer ours
+            "",
+            "é.cn",
+        ] {
+            assert!(!in_msst_zone(name), "{name} should not be in the zone");
+        }
+        assert!(EZPLAY_SUFFIX.ends_with(MSST_ZONE));
+    }
 
     #[test]
     fn resolv_conf_nameservers() {
@@ -831,8 +867,8 @@ mod tests {
 
     #[test]
     fn codec_round_trip() {
-        let q = parse_dns_query(&query("PC.Bob.ezplay.MSST.net", QTYPE_A)).unwrap();
-        assert_eq!(q.name, "pc.bob.ezplay.msst.net");
+        let q = parse_dns_query(&query("PC.Bob.ezplay.NET.Msst2031.cn", QTYPE_A)).unwrap();
+        assert_eq!(q.name, "pc.bob.ezplay.net.msst2031.cn");
         assert_eq!(q.edns, None);
         let r = build_response(&q, &[Answer { ttl: TTL_POSITIVE, rdata: Rdata::Addr(IpAddr::V4(Ipv4Addr::new(172, 22, 1, 1))) }]);
         assert_eq!(&r[0..2], &[0x12, 0x34]);
@@ -842,7 +878,7 @@ mod tests {
         assert_eq!(&r[r.len() - 4..], &[172, 22, 1, 1]);
         assert_eq!(build_rcode(&q, 3)[3] & 0x0F, 3);
         // AD set in the query (as dig does) is not echoed: nothing is validated.
-        let mut ad = query("pc.bob.ezplay.msst.net", QTYPE_A);
+        let mut ad = query("pc.bob.ezplay.net.msst2031.cn", QTYPE_A);
         ad[3] |= 0x20 | 0x10;
         let r = build_rcode(&parse_dns_query(&ad).unwrap(), 0);
         assert_eq!(r[3] & 0x20, 0, "AD clear");
@@ -884,9 +920,9 @@ mod tests {
     #[test]
     fn srv_content() {
         let srv = |p, w, port, t: &str| Some(Rdata::Srv { priority: p, weight: w, port, target: t.into() });
-        assert_eq!(parse_srv("0 5 25565 pc.bob.ezplay.msst.net"), srv(0, 5, 25565, "pc.bob.ezplay.msst.net"));
+        assert_eq!(parse_srv("0 5 25565 pc.bob.ezplay.net.msst2031.cn"), srv(0, 5, 25565, "pc.bob.ezplay.net.msst2031.cn"));
         assert_eq!(parse_srv("  10 0 7777  host.example.com. "), srv(10, 0, 7777, "host.example.com."));
-        assert_eq!(parse_srv("5 25565 pc.bob.ezplay.msst.net"), srv(0, 5, 25565, "pc.bob.ezplay.msst.net"));
+        assert_eq!(parse_srv("5 25565 pc.bob.ezplay.net.msst2031.cn"), srv(0, 5, 25565, "pc.bob.ezplay.net.msst2031.cn"));
         for bad in ["", "1 2", "a 5 25565 x.y", "0 5 70000 x.y", "0 5 1 2 3", "0 5 1 bad..name"] {
             assert_eq!(parse_srv(bad), None, "{bad}");
         }
@@ -912,16 +948,16 @@ mod tests {
 
     #[test]
     fn srv_and_txt_wire_format() {
-        let q = parse_dns_query(&query("_minecraft._tcp.abjust.msst.net", QTYPE_SRV)).unwrap();
+        let q = parse_dns_query(&query("_minecraft._tcp.abjust.net.msst2031.cn", QTYPE_SRV)).unwrap();
         let r = build_response(&q, &[
-            Answer { ttl: 300, rdata: Rdata::Srv { priority: 0, weight: 5, port: 25565, target: "pc.bob.ezplay.msst.net".into() } },
+            Answer { ttl: 300, rdata: Rdata::Srv { priority: 0, weight: 5, port: 25565, target: "pc.bob.ezplay.net.msst2031.cn".into() } },
             Answer { ttl: 60, rdata: Rdata::Txt(vec![b"ab".to_vec(), b"c".to_vec()]) },
             Answer { ttl: 60, rdata: Rdata::Cname("bad..name".into()) }, // skipped
         ]);
         let d = decode(&r);
         assert_eq!((d.rcode, d.tc, d.arcount), (0, false, 0));
         assert_eq!(d.answers, vec![
-            (QTYPE_SRV, 300, srv_rdata(0, 5, 25565, "pc.bob.ezplay.msst.net")),
+            (QTYPE_SRV, 300, srv_rdata(0, 5, 25565, "pc.bob.ezplay.net.msst2031.cn")),
             (QTYPE_TXT, 60, vec![2, b'a', b'b', 1, b'c']),
         ]);
         // NODATA: NOERROR without answers.
@@ -934,14 +970,14 @@ mod tests {
         let big: Vec<Answer> = (0..20).map(|i| Answer { ttl: 60, rdata: Rdata::Txt(vec![vec![b'a' + i as u8; 100]]) }).collect();
 
         // Without EDNS: at most 512 bytes, TC set, no OPT.
-        let q = parse_dns_query(&query("t.abjust.msst.net", QTYPE_TXT)).unwrap();
+        let q = parse_dns_query(&query("t.abjust.net.msst2031.cn", QTYPE_TXT)).unwrap();
         let r = build_response(&q, &big);
         let d = decode(&r);
         assert!(r.len() <= 512 && d.tc && d.arcount == 0);
         assert_eq!(d.answers.len(), 4);
 
         // EDNS 4096 is capped at 1232; our OPT record is echoed.
-        let q = parse_dns_query(&query_edns("t.abjust.msst.net", QTYPE_TXT, 4096)).unwrap();
+        let q = parse_dns_query(&query_edns("t.abjust.net.msst2031.cn", QTYPE_TXT, 4096)).unwrap();
         assert_eq!(q.edns, Some(1232));
         let r = build_response(&q, &big);
         let d = decode(&r);
@@ -950,7 +986,7 @@ mod tests {
         assert_eq!(&r[r.len() - 8..r.len() - 6], &1232u16.to_be_bytes(), "advertised size");
 
         // Fits: no TC.  An advertised size below 512 counts as 512.
-        let q = parse_dns_query(&query_edns("t.abjust.msst.net", QTYPE_TXT, 100)).unwrap();
+        let q = parse_dns_query(&query_edns("t.abjust.net.msst2031.cn", QTYPE_TXT, 100)).unwrap();
         assert_eq!(q.edns, Some(512));
         let d = decode(&build_response(&q, &big[..2]));
         assert!(!d.tc && d.answers.len() == 2 && d.arcount == 1);
@@ -975,13 +1011,13 @@ mod tests {
                     let name = req.body["parameters"]["qname"].as_str().unwrap().to_string();
                     let mut result = soa_ns(&name);
                     let extra = match name.as_str() {
-                        "_minecraft._tcp.abjust.msst.net" => vec![
-                            serde_json::json!({"qtype": "SRV", "qname": name, "content": "0 5 25565 pc.bob.ezplay.msst.net", "ttl": 300}),
+                        "_minecraft._tcp.abjust.net.msst2031.cn" => vec![
+                            serde_json::json!({"qtype": "SRV", "qname": name, "content": "0 5 25565 pc.bob.ezplay.net.msst2031.cn", "ttl": 300}),
                             serde_json::json!({"qtype": "SRV", "qname": name, "content": "not an srv", "ttl": 300}),
                         ],
-                        "info.abjust.msst.net" => vec![serde_json::json!({"qtype": "TXT", "qname": name, "content": "hello world", "ttl": 120})],
-                        "mc.abjust.msst.net" => vec![serde_json::json!({"qtype": "CNAME", "qname": name, "content": "pc.bob.ezplay.msst.net", "ttl": 300})],
-                        "broken.abjust.msst.net" => return (500, serde_json::json!({})),
+                        "info.abjust.net.msst2031.cn" => vec![serde_json::json!({"qtype": "TXT", "qname": name, "content": "hello world", "ttl": 120})],
+                        "mc.abjust.net.msst2031.cn" => vec![serde_json::json!({"qtype": "CNAME", "qname": name, "content": "pc.bob.ezplay.net.msst2031.cn", "ttl": 300})],
+                        "broken.abjust.net.msst2031.cn" => return (500, serde_json::json!({})),
                         _ => vec![],
                     };
                     result.extend(extra);
@@ -997,55 +1033,55 @@ mod tests {
         let _ = state.coordinator.set(Arc::new(crate::coordinator::CoordinatorClient::new(
             crate::coordinator::CoordinatorConfig { coord_url: coord.url.clone() }, tx)));
         state.net.write().await.peer_list.upsert("device-0000000b", "172.22.1.1".parse().unwrap(),
-            "fd22:2222:2222:2222::b".parse().unwrap(), None, None, None, Some("pc.bob.ezplay.msst.net"), None, None, false, 0);
+            "fd22:2222:2222:2222::b".parse().unwrap(), None, None, None, Some("pc.bob.ezplay.net.msst2031.cn"), None, None, false, 0);
         let r = DnsResolver::new(&state);
         let lookups = || coord.http_log.lock().unwrap().iter().filter(|q| q.path == "/dns/lookup").count();
 
         // SRV: the valid record is answered, the malformed one dropped.
-        let d = decode(&r.handle_query(&query("_minecraft._tcp.abjust.msst.net", QTYPE_SRV)).await.unwrap());
+        let d = decode(&r.handle_query(&query("_minecraft._tcp.abjust.net.msst2031.cn", QTYPE_SRV)).await.unwrap());
         assert_eq!(d.rcode, 0);
-        assert_eq!(d.answers, vec![(QTYPE_SRV, 300, srv_rdata(0, 5, 25565, "pc.bob.ezplay.msst.net"))]);
+        assert_eq!(d.answers, vec![(QTYPE_SRV, 300, srv_rdata(0, 5, 25565, "pc.bob.ezplay.net.msst2031.cn"))]);
         // Cached: no second lookup.
         let n = lookups();
-        r.handle_query(&query("_minecraft._tcp.abjust.msst.net", QTYPE_SRV)).await.unwrap();
+        r.handle_query(&query("_minecraft._tcp.abjust.net.msst2031.cn", QTYPE_SRV)).await.unwrap();
         assert_eq!(lookups(), n);
 
         // TXT.
-        let d = decode(&r.handle_query(&query_edns("info.abjust.msst.net", QTYPE_TXT, 1232)).await.unwrap());
+        let d = decode(&r.handle_query(&query_edns("info.abjust.net.msst2031.cn", QTYPE_TXT, 1232)).await.unwrap());
         assert_eq!(d.answers, vec![(QTYPE_TXT, 120, [&[11u8][..], b"hello world"].concat())]);
         assert_eq!(d.arcount, 1);
 
         // A name with records, but none of this type: NODATA.
-        let d = decode(&r.handle_query(&query("info.abjust.msst.net", QTYPE_SRV)).await.unwrap());
+        let d = decode(&r.handle_query(&query("info.abjust.net.msst2031.cn", QTYPE_SRV)).await.unwrap());
         assert_eq!((d.rcode, d.answers.len()), (0, 0));
 
         // An alias: the CNAME is returned for the resolver to follow.
-        let d = decode(&r.handle_query(&query("mc.abjust.msst.net", QTYPE_TXT)).await.unwrap());
-        assert_eq!(d.answers, vec![(QTYPE_CNAME, 300, encode_name("pc.bob.ezplay.msst.net").unwrap())]);
+        let d = decode(&r.handle_query(&query("mc.abjust.net.msst2031.cn", QTYPE_TXT)).await.unwrap());
+        assert_eq!(d.answers, vec![(QTYPE_CNAME, 300, encode_name("pc.bob.ezplay.net.msst2031.cn").unwrap())]);
 
         // A device hostname has no user records (only SOA/NS come back): NODATA.
-        let d = decode(&r.handle_query(&query("pc.bob.ezplay.msst.net", QTYPE_TXT)).await.unwrap());
+        let d = decode(&r.handle_query(&query("pc.bob.ezplay.net.msst2031.cn", QTYPE_TXT)).await.unwrap());
         assert_eq!((d.rcode, d.answers.len()), (0, 0));
         // … and its address records are unchanged; other types get NODATA.
-        let d = decode(&r.handle_query(&query("pc.bob.ezplay.msst.net", QTYPE_A)).await.unwrap());
+        let d = decode(&r.handle_query(&query("pc.bob.ezplay.net.msst2031.cn", QTYPE_A)).await.unwrap());
         assert_eq!(d.answers, vec![(QTYPE_A, TTL_POSITIVE, vec![172, 22, 1, 1])]);
-        let d = decode(&r.handle_query(&query("pc.bob.ezplay.msst.net", 15)).await.unwrap());
+        let d = decode(&r.handle_query(&query("pc.bob.ezplay.net.msst2031.cn", 15)).await.unwrap());
         assert_eq!((d.rcode, d.answers.len()), (0, 0));
 
         // Unknown name: NXDOMAIN.
-        let d = decode(&r.handle_query(&query("_x._tcp.nobody.msst.net", QTYPE_SRV)).await.unwrap());
+        let d = decode(&r.handle_query(&query("_x._tcp.nobody.net.msst2031.cn", QTYPE_SRV)).await.unwrap());
         assert_eq!(d.rcode, 3);
 
         // Coordinator failure: SERVFAIL, and nothing cached.
-        let d = decode(&r.handle_query(&query("broken.abjust.msst.net", QTYPE_TXT)).await.unwrap());
+        let d = decode(&r.handle_query(&query("broken.abjust.net.msst2031.cn", QTYPE_TXT)).await.unwrap());
         assert_eq!(d.rcode, 2);
         let n = lookups();
-        r.handle_query(&query("broken.abjust.msst.net", QTYPE_TXT)).await.unwrap();
+        r.handle_query(&query("broken.abjust.net.msst2031.cn", QTYPE_TXT)).await.unwrap();
         assert_eq!(lookups(), n + 1);
 
         // clear_cache forgets records.
         r.clear_cache();
-        r.handle_query(&query("info.abjust.msst.net", QTYPE_TXT)).await.unwrap();
+        r.handle_query(&query("info.abjust.net.msst2031.cn", QTYPE_TXT)).await.unwrap();
         assert_eq!(lookups(), n + 2);
     }
 
@@ -1054,8 +1090,8 @@ mod tests {
         use crate::test_support::{core_state, FakeCoordinator};
         let coord = FakeCoordinator::start(
             |req| match req.path.as_str() {
-                "/dns/resolve?name=nas.carol.ezplay.msst.net" => (200, serde_json::json!({"device_id": "device-0000000c", "ipv4": "172.22.3.3", "ipv6": ""})),
-                "/dns/resolve?name=www.abjust.msst.net" => (200, serde_json::json!({"device_id": "", "ipv4": "10.1.2.3", "ipv6": ""})),
+                "/dns/resolve?name=nas.carol.ezplay.net.msst2031.cn" => (200, serde_json::json!({"device_id": "device-0000000c", "ipv4": "172.22.3.3", "ipv6": ""})),
+                "/dns/resolve?name=www.abjust.net.msst2031.cn" => (200, serde_json::json!({"device_id": "", "ipv4": "10.1.2.3", "ipv6": ""})),
                 _ => (404, serde_json::json!({})),
             },
             |_| vec![],
@@ -1066,22 +1102,22 @@ mod tests {
         let _ = state.coordinator.set(Arc::new(crate::coordinator::CoordinatorClient::new(
             crate::coordinator::CoordinatorConfig { coord_url: coord.url.clone() }, tx)));
         state.net.write().await.peer_list.upsert("device-0000000b", "172.22.1.1".parse().unwrap(),
-            "fd22:2222:2222:2222::b".parse().unwrap(), None, None, None, Some("pc.bob.ezplay.msst.net"), None, None, false, 0);
+            "fd22:2222:2222:2222::b".parse().unwrap(), None, None, None, Some("pc.bob.ezplay.net.msst2031.cn"), None, None, false, 0);
         let r = DnsResolver::new(&state);
 
-        let ans = r.handle_query(&query("pc.bob.ezplay.msst.net", QTYPE_A)).await.unwrap();
+        let ans = r.handle_query(&query("pc.bob.ezplay.net.msst2031.cn", QTYPE_A)).await.unwrap();
         assert_eq!(&ans[ans.len() - 4..], &[172, 22, 1, 1]);
         assert!(coord.http_log.lock().unwrap().is_empty(), "known peer resolved locally");
 
-        let ans = r.handle_query(&query("nas.carol.ezplay.msst.net", QTYPE_A)).await.unwrap();
+        let ans = r.handle_query(&query("nas.carol.ezplay.net.msst2031.cn", QTYPE_A)).await.unwrap();
         assert_eq!(&ans[ans.len() - 4..], &[172, 22, 3, 3]);
-        let ans = r.handle_query(&query("www.abjust.msst.net", QTYPE_A)).await.unwrap();
+        let ans = r.handle_query(&query("www.abjust.net.msst2031.cn", QTYPE_A)).await.unwrap();
         assert_eq!(&ans[ans.len() - 4..], &[10, 1, 2, 3]);
-        let ans = r.handle_query(&query("ghost.msst.net", QTYPE_A)).await.unwrap();
+        let ans = r.handle_query(&query("ghost.net.msst2031.cn", QTYPE_A)).await.unwrap();
         assert_eq!(ans[3] & 0x0F, 3, "NXDOMAIN");
         // Negative answer cached: no second coordinator request.
         let before = coord.http_log.lock().unwrap().len();
-        r.handle_query(&query("ghost.msst.net", QTYPE_A)).await.unwrap();
+        r.handle_query(&query("ghost.net.msst2031.cn", QTYPE_A)).await.unwrap();
         assert_eq!(coord.http_log.lock().unwrap().len(), before);
     }
 
@@ -1089,9 +1125,9 @@ mod tests {
     async fn tun_interception_builds_reply_packet() {
         let (state, _ipc) = crate::test_support::core_state("dns-tun").await;
         state.net.write().await.peer_list.upsert("device-0000000b", "172.22.1.1".parse().unwrap(),
-            "fd22:2222:2222:2222::b".parse().unwrap(), None, None, None, Some("pc.bob.ezplay.msst.net"), None, None, false, 0);
+            "fd22:2222:2222:2222::b".parse().unwrap(), None, None, None, Some("pc.bob.ezplay.net.msst2031.cn"), None, None, false, 0);
         let r = DnsResolver::new(&state);
-        let q = query("pc.bob.ezplay.msst.net", QTYPE_A);
+        let q = query("pc.bob.ezplay.net.msst2031.cn", QTYPE_A);
         let pkt = crate::ippkt::build_udp(IpAddr::V4(Ipv4Addr::new(172, 22, 9, 9)), 40000, IpAddr::V4(TUN_DNS_IP), TUN_DNS_PORT, &q);
         assert!(is_tun_dns_query(&pkt));
         let reply = intercept_tun_dns(&r, &pkt).await.unwrap();

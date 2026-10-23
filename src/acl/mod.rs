@@ -804,13 +804,13 @@ mod tests {
     #[tokio::test]
     async fn coordinator_resolver_endpoints() {
         let (url, seen) = fake_coordinator(vec![
-            ("/dns/resolve?name=nas.abjust.ezplay.msst.net", 200, r#"{"device_id":"device-0000000a"}"#),
+            ("/dns/resolve?name=nas.abjust.ezplay.net.msst2031.cn", 200, r#"{"device_id":"device-0000000a"}"#),
             ("/nodes/by-user/carol", 200, r#"{"nodes":[{"device_id":"device-0000000c","user_id":"user-0000000c"}]}"#),
             ("/nodes/by-user/broken", 500, "{}"),
         ]).await;
         let r = CoordResolver { http: reqwest::Client::new(), coord_url: url, bearer: Some("tok".into()) };
-        assert_eq!(r.device_id("nas.abjust.ezplay.msst.net").await.unwrap().as_deref(), Some("device-0000000a"));
-        assert_eq!(r.device_id("ghost.abjust.ezplay.msst.net").await.unwrap(), None); // 404
+        assert_eq!(r.device_id("nas.abjust.ezplay.net.msst2031.cn").await.unwrap().as_deref(), Some("device-0000000a"));
+        assert_eq!(r.device_id("ghost.abjust.ezplay.net.msst2031.cn").await.unwrap(), None); // 404
         assert_eq!(r.user_id("carol").await.unwrap().as_deref(), Some("user-0000000c"));
         assert!(r.user_id("broken").await.is_err()); // 5xx → unavailable, not "not found"
         assert!(seen.lock().unwrap().iter().all(|req| req.to_ascii_lowercase().contains("authorization: bearer tok")));
