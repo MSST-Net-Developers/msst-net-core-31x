@@ -47,6 +47,8 @@ pub struct EmbeddedCore {
     core: Option<Core>,
     ipv4: String,
     ipv6: String,
+    /// Addresses as of the last network change ([`Self::network_changed`]).
+    addresses: std::sync::Mutex<crate::netwatch::Reported>,
 }
 
 impl EmbeddedCore {
@@ -83,7 +85,8 @@ impl EmbeddedCore {
         // Must be created inside the runtime (it spawns nothing, but keeps
         // the API symmetric with the desktop path).
         runtime.block_on(async { core.enable_tun_dns() });
-        Ok(EmbeddedCore { runtime, core: Some(core), ipv4, ipv6 })
+        let addresses = std::sync::Mutex::new(crate::netwatch::Reported::new(crate::netwatch::Snapshot::read()));
+        Ok(EmbeddedCore { runtime, core: Some(core), ipv4, ipv6, addresses })
     }
 
     /// The device's virtual IPv4 / IPv6 (for `VpnService.Builder.addAddress`).
@@ -114,13 +117,17 @@ impl EmbeddedCore {
     }
 
     /// The device's network changed (Wi-Fi ↔ mobile; debounced by the
-    /// caller): flush DNS, reconnect to the coordinator, re-register with
-    /// the relays, restart path probing promptly and re-announce our
-    /// endpoints ([`crate::netwatch::on_network_changed`]).
+    /// caller): flush DNS, restart path probing promptly and re-announce our
+    /// endpoints; if our addresses changed, also reconnect to the
+    /// coordinator and re-register with the relays
+    /// ([`crate::netwatch::on_network_changed`]).  The app's callbacks also
+    /// fire at start and for other networks coming and going: those don't
+    /// reconnect.
     pub fn network_changed(&self) {
         let Some(core) = self.core.as_ref() else { return };
+        let changed = self.addresses.lock().unwrap_or_else(|e| e.into_inner()).changed(crate::netwatch::Snapshot::read());
         let state = core.state.clone();
-        self.runtime.block_on(async move { crate::netwatch::on_network_changed(&state).await });
+        self.runtime.block_on(async move { crate::netwatch::on_network_changed(&state, changed).await });
     }
 
     /// Shut Core down and flush its state.
@@ -153,7 +160,7 @@ mod tests {
             .unwrap();
         let (ipv4, ipv6) = runtime.block_on(core.virtual_ips());
         runtime.block_on(async { core.enable_tun_dns() });
-        let mut emb = EmbeddedCore { runtime, core: Some(core), ipv4, ipv6 };
+        let mut emb = EmbeddedCore { runtime, core: Some(core), ipv4, ipv6, addresses: Default::default() };
         let (v4, v6) = emb.virtual_ips();
         assert!(v4.starts_with("172.22.") && v6.starts_with("fd22:2222:2222:2222::"));
 

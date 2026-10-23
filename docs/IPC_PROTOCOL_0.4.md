@@ -126,7 +126,9 @@ Add `"async": true` to a command request:
   endpoint is then not used for 1 min, doubling up to 10 min, until a
   network change), `probe_failed` (no candidate answered) or
   `p2p_disabled`.  Treat unknown values as opaque.  `PathChanged` events
-  are emitted in the order the changes happened.
+  are emitted in the order the changes happened.  `GetPathView` peers carry
+  the same optional `reason` for their current `chosen` path (absent before
+  the first change), so a Controller that connects later sees it too.
 - **`GetPathView`:** a direct peer also lists its background-probed
   candidates; a peer whose probes keep failing has `probe_failures` and
   `next_probe_at` (Unix seconds — no probing before then: 30 s after the

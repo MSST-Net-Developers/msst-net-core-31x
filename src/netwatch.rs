@@ -11,7 +11,10 @@
 //! renews them all.
 //!
 //! Desktops: [`watch`] polls the interface addresses.  The embedded
-//! (Android) Core is told by the app (`EmbeddedCore::network_changed`).
+//! (Android) Core is told by the app (`EmbeddedCore::network_changed`); as
+//! the app's callbacks also fire when nothing we use changed (at start, a
+//! second network coming and going), [`Reported`] lets only an address
+//! change reconnect.
 
 use crate::state::CoreState;
 use std::collections::BTreeSet;
@@ -85,6 +88,27 @@ impl Watch {
     }
 }
 
+/// For network events a platform reports itself (the embedded Core): the
+/// addresses as of the last change.
+#[derive(Debug, Default)]
+pub struct Reported(Option<Snapshot>);
+
+impl Reported {
+    pub fn new(now: Snapshot) -> Self {
+        Reported(Some(now).filter(|s| !s.is_empty()))
+    }
+
+    /// Take in the addresses at a reported event; true: they changed
+    /// (none at all is no change — the next event brings the new ones).
+    pub fn changed(&mut self, now: Snapshot) -> bool {
+        if now.is_empty() || self.0.as_ref() == Some(&now) {
+            return false;
+        }
+        self.0 = Some(now);
+        true
+    }
+}
+
 /// Desktops: watch the interface addresses and handle network changes.
 pub async fn watch(state: Arc<CoreState>) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
@@ -95,25 +119,32 @@ pub async fn watch(state: Arc<CoreState>) {
         let now = Snapshot::read();
         debug!("network: addresses {:?}", now.0);
         if w.observe(now) {
-            on_network_changed(&state).await;
+            on_network_changed(&state, true).await;
         }
     }
 }
 
-/// The network changed: reconnect to the coordinator, register with the
-/// relays again from the new address, re-detect and announce our endpoints,
-/// and let every path probe again at once (3.0.x network-change handler,
-/// extended).
-pub async fn on_network_changed(state: &Arc<CoreState>) {
-    info!("network: changed — reconnecting, re-registering with the relays, re-announcing endpoints");
+/// The network changed: flush DNS, re-detect and announce our endpoints,
+/// and let every path probe again at once (3.0.x network-change handler);
+/// if our addresses changed, also reconnect to the coordinator and register
+/// with the relays again from the new address — what was bound to the old
+/// one is dead.
+pub async fn on_network_changed(state: &Arc<CoreState>, addresses_changed: bool) {
+    if addresses_changed {
+        info!("network: changed — reconnecting, re-registering with the relays, re-announcing endpoints");
+    } else {
+        info!("network: event, addresses unchanged — re-announcing endpoints");
+    }
     if let Some(dns) = state.dns.get() {
         dns.clear_cache();
     }
     state.scheduler.lock().await.clear_hold_timers();
-    if let Some(client) = state.coordinator.get() {
-        client.network_changed();
+    if addresses_changed {
+        if let Some(client) = state.coordinator.get() {
+            client.network_changed();
+        }
+        crate::runtime::reregister_with_relays(state).await;
     }
-    crate::runtime::reregister_with_relays(state).await;
     crate::endpoints::spawn_detect_and_report(state.clone());
 }
 
@@ -196,7 +227,7 @@ mod tests {
             }
         }
 
-        on_network_changed(&state).await;
+        on_network_changed(&state, true).await;
 
         // Registered with the relay at once (legacy relay: `0x01`) …
         let mut buf = [0u8; 64];
@@ -207,6 +238,32 @@ mod tests {
         let (_, pp) = sched.paths().find(|(id, _)| *id == peer).unwrap();
         assert!(!pp.hold_active(crate::runtime::current_unix()));
         assert_eq!((pp.probe_failures, pp.next_probe_at), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn an_event_without_new_addresses_only_refreshes() {
+        let (state, _ipc) = crate::test_support::core_state("netwatch-same").await;
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        state.net.write().await.relay_addr = Some(relay.local_addr().unwrap().to_string());
+        on_network_changed(&state, false).await;
+        let mut buf = [0u8; 64];
+        assert!(tokio::time::timeout(Duration::from_millis(300), relay.recv_from(&mut buf)).await.is_err(), "no re-registration");
+    }
+
+    #[test]
+    fn reported_events_count_only_with_new_addresses() {
+        let (wifi, mobile) = (snap(&[("wlan0", "192.168.1.5")]), snap(&[("rmnet0", "10.20.30.40")]));
+        // The app's first callback comes for the network we started on.
+        let mut r = Reported::new(wifi.clone());
+        assert!(!r.changed(wifi.clone()));
+        // Mid-switch, no address: not yet; the new network's event is.
+        assert!(!r.changed(Snapshot::default()));
+        assert!(r.changed(mobile.clone()));
+        assert!(!r.changed(mobile));
+        assert!(r.changed(wifi));
+        // Started without a network: the first one is a change.
+        let mut r = Reported::new(Snapshot::default());
+        assert!(r.changed(snap(&[("wlan0", "192.168.1.5")])));
     }
 
     #[test]

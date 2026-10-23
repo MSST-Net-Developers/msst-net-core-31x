@@ -171,6 +171,11 @@ pub async fn path_view(state: &CoreState) -> Value {
             if let Some(t) = ev.and_then(|e| e.last_handshake_at) {
                 v["last_handshake_at"] = json!(t);
             }
+            // Why `chosen` last changed (`PathChanged.reason`), so a
+            // Controller connecting later sees it too.
+            if let Some(r) = pp.last_change {
+                v["reason"] = json!(r.name());
+            }
             // Unreachable peer: when the next probe round may start.
             if pp.probe_failures > 0 {
                 v["probe_failures"] = json!(pp.probe_failures);
@@ -462,5 +467,10 @@ mod tests {
         assert_eq!(v["peers"][0]["device_id"], "device-b");
         assert_eq!(v["peers"][0]["chosen"], "relay");
         assert_eq!(v["peers"][0]["candidates"][0]["status"], "relay");
+        assert!(v["peers"][0].get("reason").is_none(), "no change yet");
+        // After a change, the reason PathChanged carried.
+        state.scheduler.lock().await.handle_punch_request("device-b", &["203.0.113.7:21031".parse().unwrap()], 1000, 1_000_000);
+        let v = path_view(&state).await;
+        assert_eq!((v["peers"][0]["chosen"].as_str(), v["peers"][0]["reason"].as_str()), (Some("probing"), Some("punch")));
     }
 }
