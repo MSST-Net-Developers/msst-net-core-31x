@@ -21,7 +21,7 @@
 | C3 | Coordinator | `device_key_proof` 改为 `required` | 默认值已改（`ee45434`，同时默认 SQLite 持久化）；已有部署需手动修改配置 |
 | C4 | Coordinator | 客户端依赖的现有行为 | 无需改动，请保持 |
 | C5 | Coordinator | 访客设备的端点上报 `/device/endpoint` | 已完成（`54d0d04`） |
-| C6 | Coordinator | 快速重连时旧连接的清理覆盖新连接 | 待做 |
+| C6 | Coordinator | 快速重连时旧连接的清理覆盖新连接 | 已完成（`35ee56f`） |
 | C7 | Coordinator | 房间密码改用 Argon2id 校验值 | 待做（与客户端同时上线） |
 | C8 | Coordinator | 一台设备同一时间只在一个房间 | 待做（与客户端同时上线） |
 | C9 | Coordinator | 未认证注册只能使用由设备公钥推导的用户 ID | 待做（建议） |
@@ -80,7 +80,7 @@ msstnetCoordinator31x `ee45434`：`device_key_proof` 默认（包括留空、缺
 
 另：`POST /device/register` 只认 OIDC 令牌，访客设备通过 HTTP 改名不会立即同步（`synced: false`），会在下次 WS 注册时生效。这是现有行为，可按需放开。
 
-### C6 快速重连时，旧连接的清理覆盖新连接 — 待做
+### C6 快速重连时，旧连接的清理覆盖新连接 — 已完成（`35ee56f`）
 
 同一设备建立新的 WS 连接时，`Hub.register` 会关闭旧连接；旧连接的 `readPump` 随后退出并调用 `unregister(old)`。`unregister` 只在删除 `h.clients` 条目时检查 `cur == c`，其余步骤不检查，照常执行：
 
@@ -97,6 +97,14 @@ msstnetCoordinator31x `ee45434`：`device_key_proof` 默认（包括留空、缺
 网络切换、NAT 超时等让旧连接半开的情况下，客户端会在服务端察觉之前重连，最容易触发。
 
 修法：`unregister` 判断旧连接已被取代（`h.clients[deviceID]` 存在且不是 `c`）时，只关闭这条连接，跳过上面三步。建议补一个测试：同一设备连续建立两条连接，新连接 `join` 和 `discovery_join` 之后关闭旧连接，设备仍是房间成员、仍在线，并且仍在 `GetDiscoveryPeers` 中。
+
+**已在 `35ee56f` 中实现**（`hub.go` 的 `unregister`；测试 `TestUnregister_SupersededConnectionKeepsState`）。
+
+**适用范围：** 只有客户端在 Coordinator 察觉旧连接断开之前重连，也就是在 `pongWait`（60 秒）内，新连接才会走上面“已被取代”的分支。超过 60 秒，Coordinator 会先按正常断线处理：设备离开房间，其他成员收到 `member_left`；等客户端重连并重新 `join` 后，再收到 `member_joined`。
+
+- 3.1.7 及以前的客户端不检测网络切换，WS 失效要靠 TCP 超时才能发现（实测约 27 分钟），所以切换网络时总会先被移出房间。期间其他成员丢弃它的游戏发现消息，房间内已有连接也被撤销。
+- 客户端 `0d2b711` 起：桌面端约 4 秒内发现地址变化并立即重连（Android 由应用通知）；WS 超过 75 秒收不到任何帧时也会重连。切换网络本身不超过约 60 秒时，设备不会离开房间。
+- 断网超过 60 秒仍会离开房间、之后重新加入。若希望连这种情况也保留成员身份，需要 Coordinator 对断线成员设宽限期；这是服务端的设计决定，目前未做。
 
 ### C7 房间密码改用 Argon2id 校验值 — 待做（与客户端同时上线）
 
