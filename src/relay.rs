@@ -20,8 +20,10 @@ const PING_TIMEOUT: Duration = Duration::from_millis(2000);
 const INTER_PING_DELAY: Duration = Duration::from_millis(100);
 /// IPv4 is chosen if its RTT is within 20% of the IPv6 RTT.
 const IPV4_PREFER_RATIO: f64 = 1.2;
-/// Relay RTT pings older than this are considered lost.
-pub const RELAY_PING_STALE: Duration = Duration::from_secs(6);
+/// Relay RTT pings older than this are considered lost.  Shorter than the
+/// 5 s ping interval: a lost ping must not block the next round's (which
+/// made one loss count as two missed rounds for the room relay's health).
+pub const RELAY_PING_STALE: Duration = Duration::from_millis(4500);
 
 #[derive(Debug, Deserialize)]
 struct RelayEntry {
@@ -357,6 +359,19 @@ fn resolved_cache() -> std::sync::MutexGuard<'static, HashMap<String, Resolved>>
     RESOLVED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The network changed: forget every resolved relay name, so the next use
+/// looks it up again and picks the family the new network can route.  (A
+/// cached address — even one pinned by the last selection — may be of a
+/// family the new network lacks, and was otherwise kept for [`DNS_TTL`],
+/// then kept again by [`pick_resolved`].)
+pub fn forget_resolved() {
+    // The cache is process-wide: in tests a simulated network change would
+    // drop names that tests running alongside have pinned.
+    if !cfg!(test) {
+        resolved_cache().clear();
+    }
+}
+
 /// Record that relay `name` was reached at `addr` (relay selection).
 pub fn pin_resolved(name: &str, addr: SocketAddr) {
     if name.parse::<SocketAddr>().is_err() {
@@ -421,9 +436,11 @@ async fn refresh_resolved_from(name: &str, prev: Option<SocketAddr>) -> Option<S
 }
 
 /// The address to use from a lookup: the previous one if still listed, else
-/// one of its family, else the family the host can route.
+/// one of its family, else the family the host can route.  A previous IPv6
+/// address is not kept once the host has no IPv6 route (e.g. after moving
+/// from a phone hotspot to a Wi-Fi without IPv6): every send to it fails.
 fn pick_resolved(addrs: &[SocketAddr], prev: Option<SocketAddr>, v6_ok: bool) -> Option<SocketAddr> {
-    if let Some(p) = prev {
+    if let Some(p) = prev.filter(|p| p.is_ipv4() || v6_ok) {
         if addrs.contains(&p) {
             return Some(p);
         }
@@ -441,36 +458,51 @@ fn pick_resolved(addrs: &[SocketAddr], prev: Option<SocketAddr>, v6_ok: bool) ->
 /// EWMA RTT per relay address plus the relay pings currently in flight.
 ///
 /// The relay echoes a `TYPE_RELAY_PING` datagram back from its own address,
-/// so replies are matched by source `SocketAddr`.
+/// so replies are matched by source `SocketAddr`.  One relay can be known
+/// under several names (our relay by its listed name, the room relay by
+/// its resolved address, a peer's relay): it is pinged once, and the reply
+/// counts for every name.
 #[derive(Debug, Default)]
 pub struct RelayRttTracker {
     /// relay address string (as stored in NetState / PeerEntry) → EWMA ms.
     rtt: HashMap<String, f64>,
-    /// resolved relay address → (address string, send time).
-    in_flight: HashMap<SocketAddr, (String, Instant)>,
+    /// resolved relay address → (its names, send time).
+    in_flight: HashMap<SocketAddr, (Vec<String>, Instant)>,
 }
 
 impl RelayRttTracker {
-    /// Record that a ping to `resolved` is about to be sent.  Returns `false`
-    /// (send nothing) if a ping to that relay is still outstanding.
+    /// Record that a ping to `resolved` (known as `addr`) is about to be
+    /// sent.  Returns `false` (send nothing) if a ping to that relay is
+    /// already outstanding; its reply then counts for `addr` as well.
     pub fn begin(&mut self, addr: &str, resolved: SocketAddr, now: Instant) -> bool {
-        if self.in_flight.contains_key(&resolved) {
+        if let Some((names, _)) = self.in_flight.get_mut(&resolved) {
+            if !names.iter().any(|n| n == addr) {
+                names.push(addr.to_string());
+            }
             return false;
         }
-        self.in_flight.insert(resolved, (addr.to_string(), now));
+        self.in_flight.insert(resolved, (vec![addr.to_string()], now));
         true
     }
 
-    /// Match an echoed relay ping.  Returns the relay address and its new EWMA.
-    pub fn on_reply(&mut self, src: SocketAddr, now: Instant) -> Option<(String, f64)> {
-        let (addr, sent) = self.in_flight.remove(&src)?;
+    /// Match an echoed relay ping.  Returns every name the relay was pinged
+    /// under, with its new EWMA.
+    pub fn on_reply(&mut self, src: SocketAddr, now: Instant) -> Option<Vec<(String, f64)>> {
+        let (names, sent) = self.in_flight.remove(&src)?;
         let sample = now.saturating_duration_since(sent).as_secs_f64() * 1000.0;
-        let ewma = match self.rtt.get(&addr) {
-            None => sample,
-            Some(prev) => RTT_EWMA_ALPHA * sample + (1.0 - RTT_EWMA_ALPHA) * prev,
-        };
-        self.rtt.insert(addr.clone(), ewma);
-        Some((addr, ewma))
+        Some(
+            names
+                .into_iter()
+                .map(|addr| {
+                    let ewma = match self.rtt.get(&addr) {
+                        None => sample,
+                        Some(prev) => RTT_EWMA_ALPHA * sample + (1.0 - RTT_EWMA_ALPHA) * prev,
+                    };
+                    self.rtt.insert(addr.clone(), ewma);
+                    (addr, ewma)
+                })
+                .collect(),
+        )
     }
 
     /// Drop pings that were never answered.
@@ -513,6 +545,9 @@ mod tests {
         assert_eq!(pick_resolved(&[v4, v6], None, true), Some(v6));
         assert_eq!(pick_resolved(&[v6, v4], None, false), Some(v4));
         assert_eq!(pick_resolved(&[], Some(v4), true), None);
+        // IPv6 is gone (hotspot → Wi-Fi without IPv6): not kept.
+        assert_eq!(pick_resolved(&[v6, v4], Some(v6), false), Some(v4));
+        assert_eq!(pick_resolved(&[v6, v4], Some(v6), true), Some(v6));
     }
 
     #[tokio::test]
@@ -563,17 +598,34 @@ mod tests {
         let t0 = Instant::now();
         assert!(t.begin("5.6.7.8:7000", r, t0));
         assert!(!t.begin("5.6.7.8:7000", r, t0)); // still in flight
-        let (addr, ewma) = t.on_reply(r, t0 + Duration::from_millis(40)).unwrap();
+        let replies = t.on_reply(r, t0 + Duration::from_millis(40)).unwrap();
+        assert_eq!(replies.len(), 1);
+        let (addr, ewma) = &replies[0];
         assert_eq!(addr, "5.6.7.8:7000");
         assert!((ewma - 40.0).abs() < 0.5);
 
         assert!(t.begin("5.6.7.8:7000", r, t0));
-        let (_, ewma) = t.on_reply(r, t0 + Duration::from_millis(120)).unwrap();
+        let (_, ewma) = t.on_reply(r, t0 + Duration::from_millis(120)).unwrap()[0].clone();
         let expected = RTT_EWMA_ALPHA * 120.0 + (1.0 - RTT_EWMA_ALPHA) * 40.0;
         assert!((ewma - expected).abs() < 0.5);
 
         // Unknown source → ignored.
         assert!(t.on_reply(sa("9.9.9.9:1"), t0).is_none());
+    }
+
+    /// One relay under two names (our relay's listed name, the room
+    /// relay's resolved address): one ping, and the reply counts for both.
+    #[test]
+    fn rtt_tracker_credits_every_name_of_a_relay() {
+        let mut t = RelayRttTracker::default();
+        let r = sa("5.6.7.8:7000");
+        let t0 = Instant::now();
+        assert!(t.begin("us1.example:7000", r, t0));
+        assert!(!t.begin("5.6.7.8:7000", r, t0), "one ping per relay");
+        assert!(!t.begin("5.6.7.8:7000", r, t0));
+        let names: Vec<String> = t.on_reply(r, t0 + Duration::from_millis(30)).unwrap().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["us1.example:7000", "5.6.7.8:7000"]);
+        assert!(t.get("us1.example:7000").is_some() && t.get("5.6.7.8:7000").is_some());
     }
 
     #[test]

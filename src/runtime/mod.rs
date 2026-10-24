@@ -269,11 +269,16 @@ async fn inbound_loop(
                         let now_i = std::time::Instant::now();
                         let change = {
                             let mut net = state.net.write().await;
-                            let Some((addr, ewma)) = net.relay_rtt.on_reply(src, now_i) else { continue };
-                            debug!("relay RTT {} EWMA {:.1}ms", addr, ewma);
+                            let Some(replies) = net.relay_rtt.on_reply(src, now_i) else { continue };
+                            for (addr, ewma) in &replies {
+                                debug!("relay RTT {} EWMA {:.1}ms", addr, ewma);
+                            }
+                            // The room relay may be our relay or a peer's
+                            // too (pinged once, under its other name):
+                            // matched by its address, not by name.
                             net.room_relay
                                 .as_mut()
-                                .filter(|r| r.addr.as_deref() == Some(addr.as_str()))
+                                .filter(|r| r.addr.as_deref().and_then(|a| a.parse::<std::net::SocketAddr>().ok()) == Some(src))
                                 .and_then(|r| r.health.reply(now_i))
                         };
                         if let Some(change) = change {
@@ -1058,6 +1063,10 @@ async fn register_with_relay(state: &Arc<CoreState>, relay_addr: &str, device_id
 /// right away (early schedule), so they forward to our new address without
 /// waiting for the next keepalive.
 pub(crate) async fn reregister_with_relays(state: &Arc<CoreState>) {
+    // Resolve relay names afresh: the new network may lack the address
+    // family they resolved to.
+    crate::relay::forget_resolved();
+    resolve_room_relay_again(state).await;
     let (relay, device_id) = {
         let net = state.net.read().await;
         (net.relay_addr.clone(), net.local_device_id.clone())
@@ -1167,6 +1176,20 @@ pub(crate) async fn apply_room_relay(state: &Arc<CoreState>, room_id: &str, rela
     state.net.write().await.room_relay = new;
     register_with_room_relay(state).await;
     room_relay_updated(state).await;
+}
+
+/// The network changed: look the room relay's name up again (it was
+/// resolved once, when the room relay was taken).  Kept if the lookup fails.
+async fn resolve_room_relay_again(state: &Arc<CoreState>) {
+    let Some(address) = state.net.read().await.room_relay.as_ref().map(|r| r.address.clone()) else { return };
+    if address.parse::<std::net::SocketAddr>().is_ok() {
+        return;
+    }
+    let Some(a) = crate::room_relay::checked_resolution(&address, crate::relay::resolve_addr(&address).await) else { return };
+    if let Some(r) = state.net.write().await.room_relay.as_mut().filter(|r| r.address == address && r.addr.as_deref() != Some(a.as_str())) {
+        info!("room relay: {} now at {}", address, a);
+        r.addr = Some(a);
+    }
 }
 
 /// Where to register for the room relay: its address and key, unless it is
@@ -2411,6 +2434,44 @@ mod tests {
         ).await.unwrap();
         assert_eq!(chosen.addr, relay_addr.to_string());
         assert_eq!(chosen.pub_key, None);
+    }
+
+    /// The room relay is our own relay, known to us by its listed name
+    /// (field logs, 3.1.8: `us1…` as both — "probing → down" 9 s after
+    /// joining, every time).  It is pinged once, under that name; the echo
+    /// must still count for the room relay's health.
+    #[tokio::test]
+    async fn room_relay_that_is_also_our_relay_becomes_ok() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use crate::room_relay::HealthState;
+        let state = test_state().await;
+        let (tun_tx, _tun) = mpsc::channel(4);
+        tokio::spawn(inbound_loop(state.udp_socket.clone(), state.clone(), tun_tx));
+        let relay = crate::test_support::echo_relay().await;
+        let name = format!("own-relay.invalid:{}", relay.port());
+        crate::relay::pin_resolved(&name, relay);
+        state.net.write().await.relay_addr = Some(name.clone());
+        let relay_pk = *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2u8; 32])).as_bytes();
+        let r = crate::coordinator::messages::RoomStateRelay {
+            address: relay.to_string(),
+            pub_key: STANDARD.encode(relay_pk),
+            features: vec!["sreg1".into()],
+            self_hosted: false,
+        };
+        apply_room_relay(&state, "space-1", Some(&r)).await;
+        let rtt = tokio::spawn(relay_rtt_loop(state.clone()));
+        let mut ok = false;
+        for _ in 0..100 {
+            if state.net.read().await.room_relay.as_ref().unwrap().health.state() == HealthState::Ok {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        rtt.abort();
+        assert!(ok, "the echo was credited to our relay's name only");
+        let net = state.net.read().await;
+        assert!(net.relay_rtt.get(&name).is_some() && net.relay_rtt.get(&relay.to_string()).is_some());
     }
 
     /// The room relay: registered at once (sreg v1) and again by the
