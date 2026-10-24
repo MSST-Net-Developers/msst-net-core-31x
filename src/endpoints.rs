@@ -209,12 +209,27 @@ pub fn direct_candidates(endpoints: &[String]) -> Vec<SocketAddr> {
     v
 }
 
+/// The candidates this host can send to now: without an IPv6 route (e.g. a
+/// Wi-Fi without IPv6), IPv6 candidates are left out — every probe to them
+/// fails at once (`Network is unreachable`).  The stored candidates keep
+/// them, for when IPv6 comes back.
+pub fn routable_candidates(candidates: &[SocketAddr], v6_ok: bool) -> Vec<SocketAddr> {
+    candidates.iter().copied().filter(|a| v6_ok || !msst_core_state::net::relay::unmap_addr(*a).is_ipv6()).collect()
+}
+
 /// Direct-path candidates kept per peer.
 pub const MAX_CANDIDATES: usize = 16;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_candidates_are_skipped_without_an_ipv6_route() {
+        let c: Vec<SocketAddr> = ["[2001:db8::5]:21031", "1.2.3.4:40000", "192.168.1.5:21031"].iter().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(routable_candidates(&c, true), c);
+        assert_eq!(routable_candidates(&c, false), &c[1..]);
+    }
 
     #[test]
     fn endpoint_list_shape() {

@@ -327,9 +327,14 @@ async fn scheduler_tick_loop(state: Arc<CoreState>) {
         // Collect peer endpoints and relay info from NetState.
         // The scheduler tracks endpoints internally via punch_request events.
         // Here we only collect relay info for routing decisions.
+        let v6_ok = crate::ip::ipv6_available();
         let (endpoints, relay_routed, device_id) = {
             let net = state.net.read().await;
-            let ep = net.peer_endpoints.clone();
+            let ep: std::collections::HashMap<String, Vec<std::net::SocketAddr>> = net
+                .peer_endpoints
+                .iter()
+                .map(|(id, c)| (id.clone(), crate::endpoints::routable_candidates(c, v6_ok)))
+                .collect();
             // Peers with a relay route (theirs, else ours): the relay path
             // can be measured (in-tunnel probe, `crate::tunnel_probe`).
             let routed: std::collections::HashSet<String> = net
@@ -580,10 +585,17 @@ async fn coordinator_event_loop(
                 // Ensure the peer is tracked.
                 state.scheduler.lock().await.ensure_peer(&peer_id);
 
+                // Punch only what this host can reach now.
+                let punch_eps = crate::endpoints::routable_candidates(&parsed_eps, crate::ip::ipv6_available());
+                if punch_eps.is_empty() {
+                    debug!("coordinator: punch_request for {}: only IPv6 endpoints, and no IPv6 route", peer_id);
+                    continue;
+                }
+
                 // Dispatch to scheduler.
                 let actions = {
                     let mut sched = state.scheduler.lock().await;
-                    let actions = sched.handle_punch_request(&peer_id, &parsed_eps, now, now_ms);
+                    let actions = sched.handle_punch_request(&peer_id, &punch_eps, now, now_ms);
                     report_path_changes(state, &sched, &actions);
                     actions
                 };
